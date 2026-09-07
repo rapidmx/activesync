@@ -1594,6 +1594,33 @@ describe("Route:EasRouteMongo Tests", () => {
                 expect(created?.priority).toBe(TaskPriority.HIGH);
             });
 
+            it("Clears an existing reminder via a client-originated Change with ReminderSet 0 - regression for the SQL undefined-vs-null gap.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Tasks", type: FolderType.TASKS });
+                const task = await createTask(mailbox.uid, folder.uid, {
+                    reminderDate: new Date("2026-01-31T09:00:00.000Z"),
+                });
+                const syncKey = await initialSyncKey("Tasks", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Tasks", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Change", [
+                            textElement(WbxmlCodePage.AirSync, "ServerId", task.uid),
+                            element(WbxmlCodePage.AirSync, "ApplicationData", [
+                                textElement(WbxmlCodePage.Tasks, "ReminderSet", "0"),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                expect(findChild(collectionOf(response), "Responses")).toBeUndefined();
+                const updated = await taskRepo.findOne({ uid: task.uid });
+                expect(updated?.reminderDate).toBeFalsy();
+            });
+
             it("Creates a Draft via a client-originated Email Add, storing a Fetch-able MIME body.", async () => {
                 const mailbox = await createMailbox(owner.uid);
                 await provisionDevice("dev1");
@@ -2642,6 +2669,19 @@ describe("Route:EasRouteMongo Tests", () => {
             expect(childText(store, "Range")).toBe("0-0");
         });
 
+        it("Returns Range 0-0 (not the client-requested start) when a non-default Range still matches nothing.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            const response = await postWbxml("Search", "dev1", searchRequest("nobody-matches-this", "5-10"));
+
+            const store = findChild(findChild(response, "Response")!, "Store")!;
+            expect(childText(store, "Total")).toBe("0");
+            // Not "5-0" (start > end) - a naive fix that only clamped `end` would still produce this for a
+            // non-zero client-requested start.
+            expect(childText(store, "Range")).toBe("0-0");
+        });
+
         it("Honors a Range to page results, while Total still reflects the full match count.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");
@@ -3538,6 +3578,51 @@ describe("Route:EasRouteMongo Tests", () => {
                 const get = findChild(findChild(getResponse, "Oof")!, "Get")!;
                 expect(childText(get, "OofState")).toBe("0");
                 expect(findChild(get, "StartTime")).toBeUndefined();
+            });
+
+            it("Switching from a time-based window to indefinite (OofState 1) actually clears StartTime/EndTime, not just leaves them unread.", async () => {
+                // Unlike the OofState-0 test above (which clears `oofEnabled` too, short-circuiting `getOof()`'s
+                // own `timed` check regardless of whether the dates were really cleared), this keeps Oof enabled
+                // across both Sets - StartTime/EndTime clearing to null (not undefined, which TypeORM silently
+                // drops from its SQL UPDATE on the sibling backend) is the only thing that can make `timed`
+                // correctly evaluate false here.
+                await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                await postWbxml(
+                    "Settings",
+                    "dev1",
+                    element(WbxmlCodePage.Settings, "Settings", [
+                        element(WbxmlCodePage.Settings, "Oof", [
+                            element(WbxmlCodePage.Settings, "Set", [
+                                textElement(WbxmlCodePage.Settings, "OofState", "2"),
+                                textElement(WbxmlCodePage.Settings, "StartTime", "2026-06-01T00:00:00.000Z"),
+                                textElement(WbxmlCodePage.Settings, "EndTime", "2026-06-08T00:00:00.000Z"),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                await postWbxml(
+                    "Settings",
+                    "dev1",
+                    element(WbxmlCodePage.Settings, "Settings", [
+                        element(WbxmlCodePage.Settings, "Oof", [
+                            element(WbxmlCodePage.Settings, "Set", [textElement(WbxmlCodePage.Settings, "OofState", "1")]),
+                        ]),
+                    ]),
+                );
+
+                const getResponse = await postWbxml(
+                    "Settings",
+                    "dev1",
+                    element(WbxmlCodePage.Settings, "Settings", [
+                        element(WbxmlCodePage.Settings, "Oof", [element(WbxmlCodePage.Settings, "Get", [])]),
+                    ]),
+                );
+                const get = findChild(findChild(getResponse, "Oof")!, "Get")!;
+                expect(childText(get, "OofState")).toBe("1");
+                expect(findChild(get, "StartTime")).toBeUndefined();
+                expect(findChild(get, "EndTime")).toBeUndefined();
             });
         });
     });

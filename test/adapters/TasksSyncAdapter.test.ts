@@ -59,11 +59,14 @@ describe("TasksSyncAdapter Tests", () => {
             expect(adapter.fromApplicationData(el).reminderDate?.toISOString()).toBe("2026-01-01T08:00:00.000Z");
         });
 
-        it("Explicitly clears reminderDate when ReminderSet is '0' with no ReminderTime.", () => {
+        it("Explicitly clears reminderDate (to null, not undefined) when ReminderSet is '0' with no ReminderTime.", () => {
+            // null, not undefined: TypeORM silently drops an undefined-valued key from its generated SQL
+            // UPDATE, so undefined would leave a stale reminderDate in place on the SQL backend - see this
+            // adapter's own doc comment on fromApplicationData.
             const el = appData([task("ReminderSet", "0")]);
             const partial = adapter.fromApplicationData(el);
             expect("reminderDate" in partial).toBe(true);
-            expect(partial.reminderDate).toBeUndefined();
+            expect(partial.reminderDate).toBeNull();
         });
 
         it("Leaves reminderDate untouched when neither ReminderSet nor ReminderTime is present.", () => {

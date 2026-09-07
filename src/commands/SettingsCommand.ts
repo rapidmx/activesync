@@ -132,14 +132,18 @@ export abstract class SettingsCommand implements EasCommandHandler {
         const endTime = childText(setEl, "EndTime");
         const timed = oofState === "2" && startTime !== undefined && endTime !== undefined;
 
+        // `null`, not `undefined`, to clear a previously-set window when switching away from time-based Oof:
+        // TypeORM's `UpdateQueryBuilder` silently drops any `undefined`-valued key from the generated SQL `SET`
+        // clause (confirmed by reading its source), so `undefined` here would leave a stale StartTime/EndTime
+        // in place on the SQL backend while correctly clearing it on Mongo - `null` clears it on both.
         await this.mailboxRepo!.update(
             {
                 uid: mailbox.uid,
                 version: mailbox.version,
                 oofEnabled: oofState !== "0",
                 oofMessage: replyMessage,
-                oofStartTime: timed ? new Date(startTime) : undefined,
-                oofEndTime: timed ? new Date(endTime) : undefined,
+                oofStartTime: timed ? new Date(startTime) : null,
+                oofEndTime: timed ? new Date(endTime) : null,
             } as any,
             mailbox,
             { ignoreACL: true, user: ctx.user },

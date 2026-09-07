@@ -60,11 +60,14 @@ export class TasksSyncAdapter implements EasCollectionSyncAdapter<Task> {
      * Reverse of `toApplicationData`. `DateCompleted` is never parsed back - it's `task.dateModified` echoed
      * out, not an independent field this library's own `Task` model has room to store separately, so a client
      * setting `Complete` is enough on its own. `ReminderSet="0"` (with no `ReminderTime`) is treated as an
-     * explicit "clear the reminder" signal (`reminderDate: undefined` in the returned partial, which - unlike
+     * explicit "clear the reminder" signal (`reminderDate: null` in the returned partial, which - unlike
      * simply omitting the key - does override an existing reminder when merged onto `existing` for a `Change`)
      * since MS-ASTASK gives no other way to express removing a reminder; `UtcDueDate` has no equivalent
      * explicit-clear signal and so can only be set, never cleared, via `Sync` - a real, narrower gap than
-     * `reminderDate`'s, documented here rather than silently accepted.
+     * `reminderDate`'s, documented here rather than silently accepted. `null`, not `undefined`: TypeORM's
+     * `UpdateQueryBuilder` silently drops any `undefined`-valued key from the generated SQL `SET` clause
+     * (confirmed by reading its source), so `undefined` here would leave a stale `reminderDate` in place on
+     * the SQL backend while correctly clearing it on Mongo - `null` clears it on both.
      */
     public fromApplicationData(el: WbxmlElement): Partial<Task> {
         const partial: Partial<Task> = {};
@@ -89,7 +92,7 @@ export class TasksSyncAdapter implements EasCollectionSyncAdapter<Task> {
         if (reminderTime !== undefined) {
             partial.reminderDate = fromCompactDateTime(reminderTime);
         } else if (reminderSet === "0") {
-            partial.reminderDate = undefined;
+            partial.reminderDate = null as unknown as undefined;
         }
 
         const bodyEl = findChild(el, "Body");

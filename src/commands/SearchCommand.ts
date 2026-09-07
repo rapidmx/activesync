@@ -117,6 +117,12 @@ export abstract class SearchCommand implements EasCommandHandler {
         const matches: Contact[] = Array.from(byUid.values()).sort((a, b) => a.displayName.localeCompare(b.displayName));
 
         const page: Contact[] = matches.slice(start, end + 1);
+        // Both ends forced to 0 when there are no matches at all - `start` alone (from a client-requested
+        // Range like "5-10") would otherwise survive unclamped, producing a malformed "5-0" (start > end) once
+        // `end` collapses to 0. A non-empty result always has a real, in-range `start` already (see
+        // `parseRange`), so this only ever changes behavior for the zero-match case.
+        const rangeStart = matches.length === 0 ? 0 : start;
+        const rangeEnd = matches.length === 0 ? 0 : Math.min(end, matches.length - 1);
 
         return element(WbxmlCodePage.Search, "Search", [
             textElement(WbxmlCodePage.Search, "Status", "1"),
@@ -124,9 +130,7 @@ export abstract class SearchCommand implements EasCommandHandler {
                 element(WbxmlCodePage.Search, "Store", [
                     textElement(WbxmlCodePage.Search, "Status", "1"),
                     ...page.map((contact) => this.contactToResult(contact)),
-                    // Clamped to 0 (not -1) when matches is empty - `Math.min(end, matches.length - 1)` alone
-                    // would otherwise produce the malformed "0--1" a strict client parser could reject.
-                    textElement(WbxmlCodePage.Search, "Range", `${start}-${Math.max(0, Math.min(end, matches.length - 1))}`),
+                    textElement(WbxmlCodePage.Search, "Range", `${rangeStart}-${rangeEnd}`),
                     textElement(WbxmlCodePage.Search, "Total", String(matches.length)),
                 ]),
             ]),
