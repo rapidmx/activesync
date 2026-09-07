@@ -66,6 +66,8 @@ describe("Route:EasRouteMongo Tests", () => {
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
     const ownerToken = JWTUtils.createTokenSync(config.get("auth"), owner);
     const otherUser: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
+    const admin: any = { uid: uuid.v4(), roles: ["admin"], elevated: Date.now() };
+    const adminToken = JWTUtils.createTokenSync(config.get("auth"), admin);
 
     /** Seeds a real ACL grant alongside the mailbox - `Folder`'s `delete()`/`update()` rely on its own
      * record-level ACL (inherited from the owning mailbox's), so a folder created without one (as every other
@@ -520,6 +522,91 @@ describe("Route:EasRouteMongo Tests", () => {
             expect(childText(badPhase2Response, "Status")).toBe("2");
             const state = await deviceSyncStateRepo.findOne({ deviceId: "dev1" } as any);
             expect(state?.provisioned).toBe(false);
+        });
+    });
+
+    describe("RemoteWipe flow", () => {
+        it("Runs the full admin-triggered remote wipe handshake end to end.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const beforeWipe = await deviceSyncStateRepo.findOne({ mailboxUid: mailbox.uid, deviceId: "dev1" } as any);
+            expect(beforeWipe?.provisioned).toBe(true);
+
+            const wipeResult = await request(server.getApplication())
+                .post(`/mongo/device-sync-state/${beforeWipe!.uid}/remote-wipe`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({ accountOnly: true });
+            expect(wipeResult.status).toBeGreaterThanOrEqual(200);
+            expect(wipeResult.status).toBeLessThan(300);
+
+            const afterTrigger = await deviceSyncStateRepo.findOne({ mailboxUid: mailbox.uid, deviceId: "dev1" } as any);
+            expect(afterTrigger?.remoteWipeRequested).toBe(true);
+            expect(afterTrigger?.remoteWipeAccountOnly).toBe(true);
+            expect(afterTrigger?.provisioned).toBe(false);
+
+            // The device is forced back through Provision by the ordinary 449 gate before it can do anything else.
+            const gated = await request(server.getApplication())
+                .post(`${baseUrl}?Cmd=FolderSync&DeviceId=dev1`)
+                .set("Authorization", "jwt " + ownerToken);
+            expect(gated.status).toBe(449);
+
+            const wipeDirective = await postWbxml(
+                "Provision",
+                "dev1",
+                element(WbxmlCodePage.Provision, "Provision", [
+                    element(WbxmlCodePage.Provision, "Policies", [
+                        element(WbxmlCodePage.Provision, "Policy", [
+                            textElement(WbxmlCodePage.Provision, "PolicyType", "MS-EAS-Provisioning-WBXML"),
+                        ]),
+                    ]),
+                ]),
+            );
+            expect(childText(wipeDirective, "Status")).toBe("1");
+            expect(childText(findChild(wipeDirective, "RemoteWipe")!, "Status")).toBe("1");
+            expect(findChild(wipeDirective, "Policies")).toBeUndefined();
+
+            const wipeAck = await postWbxml(
+                "Provision",
+                "dev1",
+                element(WbxmlCodePage.Provision, "Provision", [
+                    element(WbxmlCodePage.Provision, "RemoteWipe", [
+                        textElement(WbxmlCodePage.Provision, "Status", "1"),
+                    ]),
+                ]),
+            );
+            expect(childText(wipeAck, "Status")).toBe("1");
+
+            const afterAck = await deviceSyncStateRepo.findOne({ mailboxUid: mailbox.uid, deviceId: "dev1" } as any);
+            expect(afterAck?.remoteWipeRequested).toBe(false);
+            expect(afterAck?.remoteWipeAcknowledgedAt).toBeTruthy();
+            // Still not provisioned - a genuine fresh handshake is required to re-add the account.
+            expect(afterAck?.provisioned).toBe(false);
+
+            await provisionDevice("dev1");
+            const afterReprovision = await deviceSyncStateRepo.findOne({ mailboxUid: mailbox.uid, deviceId: "dev1" } as any);
+            expect(afterReprovision?.provisioned).toBe(true);
+        });
+
+        it("Rejects a remote-wipe trigger from a non-admin user.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const state = await deviceSyncStateRepo.findOne({ mailboxUid: mailbox.uid, deviceId: "dev1" } as any);
+
+            const result = await request(server.getApplication())
+                .post(`/mongo/device-sync-state/${state!.uid}/remote-wipe`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({});
+
+            expect(result.status).toBe(403);
+        });
+
+        it("Returns 404 when the target DeviceSyncState does not exist.", async () => {
+            const result = await request(server.getApplication())
+                .post(`/mongo/device-sync-state/${uuid.v4()}/remote-wipe`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({});
+
+            expect(result.status).toBe(404);
         });
     });
 

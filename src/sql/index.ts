@@ -3,4 +3,5 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 export * from "./EasRouteSQL.js";
+export * from "./DeviceSyncStateRouteSQL.js";
 export * from "../commands/sql/index.js";

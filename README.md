@@ -6,7 +6,9 @@
 
 Exchange ActiveSync (EAS) protocol support for a [`@rapidmx/restapi`](https://github.com/RapidMX/restapi)-based
 mail server — covers every command a real mobile client (iOS Mail, Outlook mobile, Android/Samsung Mail) needs
-for day-to-day use: `Provision`, `FolderSync`, `Sync` (`Email`/`Contacts`/`Calendar`/`Tasks`, multiple
+for day-to-day use: `Provision` (configurable password/encryption policy, real per-device acknowledgement
+enforcement, and a full three-step `RemoteWipe` flow triggered via `BaseDeviceSyncStateRoute`'s admin-only
+`POST /:uid/remote-wipe`), `FolderSync`, `Sync` (`Email`/`Contacts`/`Calendar`/`Tasks`, multiple
 `<Collection>`s per request, client-originated `Add`/`Change`/`Delete` for every collection type including
 Email Drafts), `SendMail`/`SmartForward`/`SmartReply`, `ItemOperations`, `Ping`, `Search` (GAL),
 `MeetingResponse`, `Settings` (including `Oof`), `GetItemEstimate`, `MoveItems`, and `ResolveRecipients`.

@@ -3,4 +3,5 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 export * from "./EasRouteMongo.js";
+export * from "./DeviceSyncStateRouteMongo.js";
 export * from "../commands/mongo/index.js";

@@ -2,13 +2,17 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-// ProvisionCommand has no DI dependencies of its own (no @Config/@Init), so its edge-case branches are tested
-// directly against a hand-built EasCommandContext rather than through a full HTTP+DB server harness. The real
-// two-phase handshake (issue -> acknowledge, including the mismatched-key rejection) is already covered end to
+// ProvisionCommand's @Config fields (password/encryption policy knobs) are never actually injected in these
+// tests - `new ProvisionCommand()` bypasses ObjectFactory entirely, so each field keeps its own class-field-
+// initializer default (the same value the decorator itself would fall back to with no config set), which is
+// exactly what these tests want to assert against. The real two-phase handshake (issue -> acknowledge,
+// including the mismatched-key rejection) and the full three-step RemoteWipe flow are already covered end to
 // end in test/routes/{mongo,sql}/EasRoute.test.ts; this file covers only the malformed/absent-request shapes
-// those real-flow tests never produce (a real EAS client always sends a well-formed Policies/Policy body).
+// and edge branches those real-flow tests never produce (a real EAS client always sends a well-formed
+// Policies/Policy body, and never sends a wipe acknowledgement to a device that never requested one).
 import { ProvisionCommand } from "../../src/commands/ProvisionCommand.js";
-import { childText, findChild } from "../../src/codec/WbxmlElement.js";
+import { WbxmlCodePage } from "../../src/codec/WbxmlCodePages.js";
+import { childText, element, findChild, textElement } from "../../src/codec/WbxmlElement.js";
 import type { EasCommandContext } from "../../src/EasCommandHandler.js";
 
 function makeContext(overrides: Partial<EasCommandContext> = {}): EasCommandContext {
@@ -38,5 +42,87 @@ describe("ProvisionCommand Tests", () => {
         expect(childText(policy, "PolicyType")).toBe("MS-EAS-Provisioning-WBXML");
         expect(childText(policy, "PolicyKey")).toBeTruthy();
         expect(ctx.deviceSyncState.provisioned).toBe(false);
+    });
+
+    it("Populates the policy document from the (default) configured password/encryption requirements.", async () => {
+        const command = new ProvisionCommand();
+        const ctx = makeContext({ request: undefined });
+
+        const response = await command.handle(ctx);
+
+        const doc = findChild(
+            findChild(findChild(findChild(response!, "Policies")!, "Policy")!, "Data")!,
+            "EASProvisionDoc",
+        )!;
+        expect(childText(doc, "DevicePasswordEnabled")).toBe("1");
+        expect(childText(doc, "MinDevicePasswordLength")).toBe("4");
+        expect(childText(doc, "MaxDevicePasswordFailedAttempts")).toBe("8");
+        expect(childText(doc, "AllowSimpleDevicePassword")).toBe("0");
+        expect(childText(doc, "RequireDeviceEncryption")).toBe("1");
+    });
+
+    it("Sends a RemoteWipe directive instead of a policy document when a wipe is pending, without minting a policy key.", async () => {
+        const command = new ProvisionCommand();
+        const update = vi.fn().mockResolvedValue(undefined);
+        const ctx = makeContext({
+            request: undefined,
+            deviceSyncState: { uid: "dss-1", version: 1, policyKey: undefined, provisioned: false, remoteWipeRequested: true } as any,
+            deviceSyncStateRepo: { update } as any,
+        });
+
+        const response = await command.handle(ctx);
+
+        expect(childText(response!, "Status")).toBe("1");
+        const remoteWipe = findChild(response!, "RemoteWipe")!;
+        expect(childText(remoteWipe, "Status")).toBe("1");
+        expect(findChild(response!, "Policies")).toBeUndefined();
+        expect(update).not.toHaveBeenCalled();
+    });
+
+    it("Rejects phase 2 acknowledgement when the client's own Policy Status is not 1, without provisioning.", async () => {
+        const command = new ProvisionCommand();
+        const ctx = makeContext({
+            deviceSyncState: { uid: "dss-1", version: 1, policyKey: "abc123", provisioned: false } as any,
+            request: element(WbxmlCodePage.Provision, "Provision", [
+                element(WbxmlCodePage.Provision, "Policies", [
+                    element(WbxmlCodePage.Provision, "Policy", [
+                        textElement(WbxmlCodePage.Provision, "PolicyType", "MS-EAS-Provisioning-WBXML"),
+                        textElement(WbxmlCodePage.Provision, "PolicyKey", "abc123"),
+                        textElement(WbxmlCodePage.Provision, "Status", "2"),
+                    ]),
+                ]),
+            ]),
+        });
+
+        const response = await command.handle(ctx);
+
+        expect(childText(response!, "Status")).toBe("2");
+        expect(ctx.deviceSyncState.provisioned).toBe(false);
+    });
+
+    it("Acknowledges a device's own RemoteWipe completion, clearing the flag but leaving provisioned false.", async () => {
+        const command = new ProvisionCommand();
+        const update = vi.fn().mockResolvedValue(undefined);
+        const ctx = makeContext({
+            deviceSyncState: {
+                uid: "dss-1",
+                version: 1,
+                policyKey: "abc123",
+                provisioned: false,
+                remoteWipeRequested: true,
+            } as any,
+            deviceSyncStateRepo: { update } as any,
+            request: element(WbxmlCodePage.Provision, "Provision", [
+                element(WbxmlCodePage.Provision, "RemoteWipe", [textElement(WbxmlCodePage.Provision, "Status", "1")]),
+            ]),
+        });
+
+        const response = await command.handle(ctx);
+
+        expect(childText(response!, "Status")).toBe("1");
+        expect(findChild(response!, "Policies")).toBeUndefined();
+        expect(ctx.deviceSyncState.remoteWipeRequested).toBe(false);
+        expect(ctx.deviceSyncState.provisioned).toBe(false);
+        expect((ctx.deviceSyncState as any).remoteWipeAcknowledgedAt).toBeInstanceOf(Date);
     });
 });

@@ -3,45 +3,93 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
+import { ObjectDecorators } from "@rapidrest/core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import { persistDeviceSyncState } from "../EasSyncKeyUtils.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
+const { Config } = ObjectDecorators;
 
 const DEFAULT_POLICY_TYPE = "MS-EAS-Provisioning-WBXML";
 
 /**
  * Handles the two-request EAS `Provision` handshake (MS-ASPROV) every client must complete before any other
- * command is honored (see `BaseEasRoute`'s provisioning gate). No real MDM policy enforcement is implemented —
- * matching this library's pragmatic-subset scope elsewhere — the policy document sent back on the first
- * request is deliberately permissive (no password/encryption requirements); this handler's only real job is
- * running the handshake itself and flipping `DeviceSyncState.provisioned`.
+ * command is honored (see `BaseEasRoute`'s provisioning gate), plus the three-step `RemoteWipe` sub-flow that
+ * rides the same command.
+ *
+ * **Policy issuance/enforcement**: the password/encryption requirements sent back in request 1's policy
+ * document are sourced from `@Config("mail:eas:provision:*")` (defaults below are permissive but not
+ * `0`/`false` across the board, unlike the old hardcoded document) - a deployment can tighten them without
+ * code changes. Enforcement itself is honest but shallow: request 2 must carry back `Status: 1` on its own
+ * `Policy` (a device that reports it could *not* apply the policy, or omits `Status` entirely, is rejected
+ * without provisioning) - this library does not itself verify the device's actual password/encryption state
+ * beyond trusting that self-reported status, matching MS-ASPROV's own protocol design (the wire protocol has
+ * no way for the server to inspect device state directly either).
  *
  * - **Request 1** (no `PolicyKey` in the body): mint a new policy key, store it on `DeviceSyncState` (not yet
- * provisioned), and send back the policy document under that key.
- * - **Request 2** (client echoes the `PolicyKey` back, acknowledging the policy): if it matches what was
- * minted in request 1, mark the device provisioned and re-confirm the same key; a mismatch (a stale/replayed
- * key, or a device that never actually saw request 1's response) is rejected without provisioning.
+ * provisioned), and send back the policy document under that key. If a `RemoteWipe` was requested for this
+ * device (`DeviceSyncState.remoteWipeRequested`, set by an admin - see the remote-wipe route), skip normal
+ * policy issuance entirely and send the `RemoteWipe` directive instead.
+ * - **Request 2** (client echoes the `PolicyKey` back, acknowledging the policy): if the key matches what was
+ * minted in request 1 *and* the client's own `Status` is `1`, mark the device provisioned and re-confirm the
+ * same key; anything else (a stale/replayed key, a device that never actually saw request 1's response, or a
+ * device reporting it could not comply) is rejected without provisioning.
+ * - **RemoteWipe acknowledgement**: after wiping itself, a device sends a bare `<Provision><RemoteWipe>
+ * <Status>1</Status></RemoteWipe></Provision>` (no `Policies`). Detected first, ahead of the normal
+ * issue/acknowledge branching. Clears `remoteWipeRequested` and stamps `remoteWipeAcknowledgedAt` for audit,
+ * but deliberately leaves `provisioned` untouched (`false`, from when the wipe was requested) - the device
+ * must complete a genuine fresh Provision handshake to re-add the account, it does not fall straight back into
+ * "provisioned". `remoteWipeAccountOnly` is recorded for admin audit only; the wire directive sent to the
+ * device is identical either way (a real "wipe just this account's data" vs. "wipe the whole device"
+ * distinction would require an MDM-capable client extension this library doesn't implement).
  *
  * @author Jean-Philippe Steinmetz
  */
 export class ProvisionCommand implements EasCommandHandler {
     public readonly command = "Provision";
 
+    @Config("mail:eas:provision:password_enabled", true)
+    private passwordEnabled: boolean = true;
+
+    @Config("mail:eas:provision:min_password_length", 4)
+    private minPasswordLength: number = 4;
+
+    @Config("mail:eas:provision:max_failed_attempts", 8)
+    private maxFailedAttempts: number = 8;
+
+    @Config("mail:eas:provision:require_device_encryption", true)
+    private requireDeviceEncryption: boolean = true;
+
+    @Config("mail:eas:provision:allow_simple_password", false)
+    private allowSimplePassword: boolean = false;
+
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
+        if (ctx.request && findChild(ctx.request, "RemoteWipe")) {
+            return await this.acknowledgeRemoteWipe(ctx);
+        }
+
         const policiesEl = ctx.request ? findChild(ctx.request, "Policies") : undefined;
         const policyEl = policiesEl ? findChild(policiesEl, "Policy") : undefined;
         const policyType: string = (policyEl ? childText(policyEl, "PolicyType") : undefined) ?? DEFAULT_POLICY_TYPE;
         const clientPolicyKey: string | undefined = policyEl ? childText(policyEl, "PolicyKey") : undefined;
+        const clientStatus: string | undefined = policyEl ? childText(policyEl, "Status") : undefined;
 
         if (!clientPolicyKey) {
             return await this.issuePolicy(ctx, policyType);
         }
-        return await this.acknowledgePolicy(ctx, policyType, clientPolicyKey);
+        return await this.acknowledgePolicy(ctx, policyType, clientPolicyKey, clientStatus);
     }
 
-    /** Request 1: mint and store a new policy key, send the (permissive) policy document. */
+    /** Request 1: mint and store a new policy key, send the policy document - or, if a remote wipe is
+     * pending for this device, the `RemoteWipe` directive instead. */
     private async issuePolicy(ctx: EasCommandContext, policyType: string): Promise<WbxmlElement> {
+        if (ctx.deviceSyncState.remoteWipeRequested) {
+            return element(WbxmlCodePage.Provision, "Provision", [
+                textElement(WbxmlCodePage.Provision, "Status", "1"),
+                element(WbxmlCodePage.Provision, "RemoteWipe", [textElement(WbxmlCodePage.Provision, "Status", "1")]),
+            ]);
+        }
+
         const policyKey: string = crypto.randomBytes(8).toString("hex");
         await this.persist(ctx, { policyKey, provisioned: false });
 
@@ -54,7 +102,23 @@ export class ProvisionCommand implements EasCommandHandler {
                     textElement(WbxmlCodePage.Provision, "PolicyKey", policyKey),
                     element(WbxmlCodePage.Provision, "Data", [
                         element(WbxmlCodePage.Provision, "EASProvisionDoc", [
-                            textElement(WbxmlCodePage.Provision, "DevicePasswordEnabled", "0"),
+                            textElement(WbxmlCodePage.Provision, "DevicePasswordEnabled", this.passwordEnabled ? "1" : "0"),
+                            textElement(WbxmlCodePage.Provision, "MinDevicePasswordLength", String(this.minPasswordLength)),
+                            textElement(
+                                WbxmlCodePage.Provision,
+                                "MaxDevicePasswordFailedAttempts",
+                                String(this.maxFailedAttempts),
+                            ),
+                            textElement(
+                                WbxmlCodePage.Provision,
+                                "AllowSimpleDevicePassword",
+                                this.allowSimplePassword ? "1" : "0",
+                            ),
+                            textElement(
+                                WbxmlCodePage.Provision,
+                                "RequireDeviceEncryption",
+                                this.requireDeviceEncryption ? "1" : "0",
+                            ),
                             textElement(WbxmlCodePage.Provision, "AttachmentsEnabled", "1"),
                         ]),
                     ]),
@@ -63,16 +127,19 @@ export class ProvisionCommand implements EasCommandHandler {
         ]);
     }
 
-    /** Request 2: the client acknowledges the policy key it was handed in request 1. */
+    /** Request 2: the client acknowledges the policy key it was handed in request 1, self-reporting whether
+     * it actually applied the policy via its own `Status`. */
     private async acknowledgePolicy(
         ctx: EasCommandContext,
         policyType: string,
         clientPolicyKey: string,
+        clientStatus: string | undefined,
     ): Promise<WbxmlElement> {
-        if (clientPolicyKey !== ctx.deviceSyncState.policyKey) {
+        if (clientPolicyKey !== ctx.deviceSyncState.policyKey || clientStatus !== "1") {
             // Status 2 ("protocol error" per MS-ASPROV) - an approximation, not a byte-exact enumeration of
             // every real status code MS-ASPROV defines; this pragmatic subset only distinguishes success from
-            // "something is wrong, start over" (see this class's own doc comment on scope).
+            // "something is wrong, start over" (see this class's own doc comment on scope), and deliberately
+            // does not distinguish a key mismatch from a device self-reporting non-compliance.
             return element(WbxmlCodePage.Provision, "Provision", [textElement(WbxmlCodePage.Provision, "Status", "2")]);
         }
 
@@ -88,6 +155,16 @@ export class ProvisionCommand implements EasCommandHandler {
                 ]),
             ]),
         ]);
+    }
+
+    /** The device has wiped itself and is acknowledging - clear the pending flag but leave `provisioned`
+     * alone (still `false`, from when the wipe was requested) so a genuine re-provision is required. */
+    private async acknowledgeRemoteWipe(ctx: EasCommandContext): Promise<WbxmlElement> {
+        await persistDeviceSyncState(ctx.deviceSyncState, ctx.deviceSyncStateRepo, {
+            remoteWipeRequested: false,
+            remoteWipeAcknowledgedAt: new Date(),
+        });
+        return element(WbxmlCodePage.Provision, "Provision", [textElement(WbxmlCodePage.Provision, "Status", "1")]);
     }
 
     private async persist(ctx: EasCommandContext, changes: { policyKey: string; provisioned: boolean }): Promise<void> {

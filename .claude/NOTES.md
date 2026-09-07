@@ -89,9 +89,35 @@ commits, each keeping the 95%/100%/100%/100% coverage gate green:
 - **`MS-ASProtocolVersions` now also declares `16.0`/`16.1`** (previously withheld specifically because `Oof`
   was missing) - `RightsManagementInformation` remains unimplemented but doesn't gate the version string,
   since `MS-ASProtocolCommands` (derived live from registered handlers) is the real capability gate.
-- **Remaining before this can be called done**: `ItemOperations` still Fetch-only (no `Store`/`Options`/
-  `Move`/`EmptyFolderContents`); `Provision` still has no real policy enforcement or `RemoteWipe` handling
-  despite the new `DeviceSyncState` fields existing for it; no admin remote-wipe trigger route yet.
+- **`ItemOperations` now handles multiple `<Fetch>`es per request** (previously first-only), `Options`/
+  `BodyPreference` (`Type 4` returns raw MIME verbatim, others truncate to `TruncationSize` on a UTF-8-safe
+  boundary), rejects `Store: DocumentLibrary` with 400, and implements `EmptyFolderContents` (soft-deletes a
+  folder's messages, rejecting `DeleteSubFolders`). **Corrected a wrong assumption before writing any code**:
+  the original plan treated `Store` as a write/upload op and `ItemOperations`' own `Move` as a simple
+  per-message move - a research pass against Microsoft's published `MS-ASCMD` XSD confirmed `Store` is actually
+  just a required `Fetch` child selecting `"Mailbox"`/`"DocumentLibrary"` (a selector, not a write), and `Move`
+  here relocates an entire *conversation* via `ConversationId` (unrelated to the standalone `MoveItemsCommand`
+  above) - `ItemOperations` has no write capability at all, and conversation-`Move` stays an explicit,
+  documented gap.
+- **`Provision` now enforces real policy**: password/encryption requirements are `@Config`-driven
+  (`mail:eas:provision:*`, permissive-but-not-empty defaults), and phase-2 acknowledgement now actually reads
+  the client's own per-`Policy` `Status` - anything but `"1"` (missing included) is rejected without
+  provisioning, not just a `PolicyKey` mismatch as before.
+- **Full three-step `RemoteWipe` flow implemented**, riding the existing `DeviceSyncState.remoteWipeRequested`/
+  `remoteWipeAccountOnly`/`remoteWipeAcknowledgedAt` fields and the pre-existing 449 provisioning gate (no new
+  transport plumbing needed - a wiped device is simply forced back through `Provision` next request): admin
+  sets the flag → `ProvisionCommand.issuePolicy` sees it and sends a `RemoteWipe` directive instead of a policy
+  document → device wipes and acks with a bare `<RemoteWipe><Status>1</Status></RemoteWipe>` → flag clears but
+  `provisioned` deliberately stays `false`, requiring a genuine fresh handshake to re-add the account.
+  `remoteWipeAccountOnly` is recorded for admin audit only - the wire directive doesn't distinguish full-device
+  vs. account-only wipe, since that split needs an MDM-capable client extension out of this library's scope.
+- **New admin route**: `BaseDeviceSyncStateRoute` (`POST /:uid/remote-wipe`, `@Auth(["jwt"])` +
+  `trustedRoles`/`UserUtils.hasRoles` gating, same pattern as `restapi`'s `BaseMailboxRoute`) - lives in this
+  package rather than `restapi` since `DeviceSyncState` is protocol-internal, not a domain object `restapi`
+  otherwise exposes a route for.
+- **This closes out the practical-full-compliance roadmap** - every item from the original scoping conversation
+  has now landed (multi-collection `Sync`, Email drafts, `ItemOperations` write-adjacent behaviors, the three
+  new commands, `MeetingResponse` decline, `Settings`/`Oof`, and `Provision`/`RemoteWipe`).
 
 ### 2026-09-06 — Repo split: `@rapidrest/mail` → four RapidMX packages
 
