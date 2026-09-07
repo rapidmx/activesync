@@ -851,6 +851,160 @@ describe("Route:EasRouteMongo Tests", () => {
             expect(childText(collection, "Status")).toBe("4");
         });
 
+        describe("Multi-collection requests", () => {
+            const multiSyncRequest = function (
+                collections: { syncKey: string; collectionClass?: string; folderUid: string }[],
+            ): WbxmlElement {
+                return element(WbxmlCodePage.AirSync, "Sync", [
+                    element(
+                        WbxmlCodePage.AirSync,
+                        "Collections",
+                        collections.map((c) =>
+                            element(WbxmlCodePage.AirSync, "Collection", [
+                                ...(c.collectionClass ? [textElement(WbxmlCodePage.AirSync, "Class", c.collectionClass)] : []),
+                                textElement(WbxmlCodePage.AirSync, "SyncKey", c.syncKey),
+                                textElement(WbxmlCodePage.AirSync, "CollectionId", c.folderUid),
+                            ]),
+                        ),
+                    ),
+                ]);
+            };
+
+            it("Answers each Collection in a request independently, with its own SyncKey/Status.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const contactsFolder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+                await createMessage(mailbox.uid, inbox.uid, { subject: "Hello EAS" });
+                await createContact(mailbox.uid, contactsFolder.uid, { displayName: "Jane Doe" });
+
+                const initial = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    multiSyncRequest([
+                        { syncKey: "0", collectionClass: "Email", folderUid: inbox.uid },
+                        { syncKey: "0", collectionClass: "Contacts", folderUid: contactsFolder.uid },
+                    ]),
+                );
+                const initialCollections = findChildren(findChild(initial, "Collections")!, "Collection");
+                expect(initialCollections.length).toBe(2);
+                for (const c of initialCollections) {
+                    expect(childText(c, "Status")).toBe("1");
+                }
+                const emailKey = childText(
+                    initialCollections.find((c) => childText(c, "CollectionId") === inbox.uid)!,
+                    "SyncKey",
+                )!;
+                const contactsKey = childText(
+                    initialCollections.find((c) => childText(c, "CollectionId") === contactsFolder.uid)!,
+                    "SyncKey",
+                )!;
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    multiSyncRequest([
+                        { syncKey: emailKey, collectionClass: "Email", folderUid: inbox.uid },
+                        { syncKey: contactsKey, collectionClass: "Contacts", folderUid: contactsFolder.uid },
+                    ]),
+                );
+
+                const collections = findChildren(findChild(response, "Collections")!, "Collection");
+                expect(collections.length).toBe(2);
+                const emailCollection = collections.find((c) => childText(c, "CollectionId") === inbox.uid)!;
+                const contactsCollection = collections.find((c) => childText(c, "CollectionId") === contactsFolder.uid)!;
+                expect(childText(emailCollection, "SyncKey")).not.toBe(emailKey);
+                expect(childText(contactsCollection, "SyncKey")).not.toBe(contactsKey);
+                expect(findChild(findChild(emailCollection, "Commands")!, "Add")).toBeDefined();
+                expect(findChild(findChild(contactsCollection, "Commands")!, "Add")).toBeDefined();
+            });
+
+            it("Persists both collections' new SyncKeys, so a second round advances each independently.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const contactsFolder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+
+                const initial = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    multiSyncRequest([
+                        { syncKey: "0", collectionClass: "Email", folderUid: inbox.uid },
+                        { syncKey: "0", collectionClass: "Contacts", folderUid: contactsFolder.uid },
+                    ]),
+                );
+                const initialCollections = findChildren(findChild(initial, "Collections")!, "Collection");
+                const emailKey1 = childText(
+                    initialCollections.find((c) => childText(c, "CollectionId") === inbox.uid)!,
+                    "SyncKey",
+                )!;
+                const contactsKey1 = childText(
+                    initialCollections.find((c) => childText(c, "CollectionId") === contactsFolder.uid)!,
+                    "SyncKey",
+                )!;
+
+                // Round 2: create a message AFTER round 1's watermark, resync both collections together.
+                await createMessage(mailbox.uid, inbox.uid, { subject: "New Message" });
+                const round2 = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    multiSyncRequest([
+                        { syncKey: emailKey1, collectionClass: "Email", folderUid: inbox.uid },
+                        { syncKey: contactsKey1, collectionClass: "Contacts", folderUid: contactsFolder.uid },
+                    ]),
+                );
+                const round2Collections = findChildren(findChild(round2, "Collections")!, "Collection");
+                const emailKey2 = childText(round2Collections.find((c) => childText(c, "CollectionId") === inbox.uid)!, "SyncKey")!;
+                const contactsKey2 = childText(
+                    round2Collections.find((c) => childText(c, "CollectionId") === contactsFolder.uid)!,
+                    "SyncKey",
+                )!;
+                expect(emailKey2).not.toBe(emailKey1);
+                // Regression check for the write-batching bug (EasSyncKeyUtils.persistDeviceSyncState): before
+                // the fix, only the LAST collection processed would actually persist its new SyncKey - the
+                // other's write would silently match zero rows, leaving the OLD key stored. Sending it back
+                // here would then be rejected as stale/invalid (Status 3) rather than accepted.
+                const round3 = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    multiSyncRequest([
+                        { syncKey: emailKey2, collectionClass: "Email", folderUid: inbox.uid },
+                        { syncKey: contactsKey2, collectionClass: "Contacts", folderUid: contactsFolder.uid },
+                    ]),
+                );
+                const round3Collections = findChildren(findChild(round3, "Collections")!, "Collection");
+                for (const c of round3Collections) {
+                    expect(childText(c, "Status")).toBe("1");
+                }
+            });
+
+            it("Accepts a Collection that omits Class once it was seen on a prior request for that folder.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+
+                const initial = await postWbxml("Sync", "dev1", syncRequest("0", "Email", folder.uid));
+                const initialKey = childText(findChild(findChild(initial, "Collections")!, "Collection")!, "SyncKey")!;
+
+                const response = await postWbxml("Sync", "dev1", syncRequest(initialKey, undefined, folder.uid));
+
+                const collection = findChild(findChild(response, "Collections")!, "Collection")!;
+                expect(childText(collection, "Status")).toBe("1");
+                expect(childText(collection, "Class")).toBe("Email");
+            });
+
+            it("Returns Status 4 when Class is omitted for a folder never previously synced.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+
+                const response = await postWbxml("Sync", "dev1", syncRequest("0", undefined, folder.uid));
+
+                const collection = findChild(findChild(response, "Collections")!, "Collection")!;
+                expect(childText(collection, "Status")).toBe("4");
+            });
+        });
+
         it("Reports no Commands when nothing changed since the last sync.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");

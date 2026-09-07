@@ -34,14 +34,19 @@ export interface SyncCollectionBinding<T extends RecoverableBaseEntity> {
  * `DeviceSyncState.folderSyncKeys` (the `CollectionId` a client sends *is* the `folderUid` - this library never
  * invents a separate collection identifier).
  *
+ * **Multi-collection requests**: every `<Collection>` in a request's `<Collections>` is processed and gets its
+ * own `<Collection>` entry in the response, each with its own independent `SyncKey`/`Status` - a client
+ * syncing several folders in one round trip (the common case once the initial per-folder backlog is done)
+ * gets one response covering all of them. All per-collection `SyncKey`/remembered-`Class` writes for the whole
+ * request are batched into a single `persistDeviceSyncState` call after every collection has been processed
+ * (never one call per collection) - see `EasSyncKeyUtils.persistDeviceSyncState`'s own doc comment for why a
+ * second write to the same `DeviceSyncState` within one request must never be built off a stale copy.
+ *
+ * **`Class` is only required on a collection's first (`SyncKey "0"`) request**, per `[MS-ASCMD]` - once seen,
+ * it's remembered in `DeviceSyncState.folderCollectionClasses` (keyed by `folderUid`) so a later request may
+ * omit it; omitting it for a folder never previously synced still gets `Status 4` (nothing to fall back to).
+ *
  * **Pragmatic subset, deliberately not the full MS-ASCMD `Sync` surface**:
- * - Exactly one `<Collection>` per request is honored; a request batching several is answered only for the
- * first (real clients commonly send one collection per request anyway when working through an initial sync
- * backlog, and this mirrors `FolderSyncCommand`'s own single-hierarchy scope).
- * - `Class` must be present on every request (the spec only requires it on the first, `SyncKey "0"`, request
- * for a collection, allowing it to be omitted afterward on the assumption the server remembers it) - a
- * client that omits it on a later request is rejected with a protocol-error `Status` rather than the server
- * tracking a `folderUid -> Class` mapping of its own. A known, documented limitation, not silently dropped.
  * - **Client-originated `Add`/`Change`/`Delete` commands are accepted for `Contacts`/`Calendar`/`Tasks`** (a
  * device creating/editing/deleting an item directly - see `applyAdd`/`applyChange`/`applyDelete`). `Email`
  * only accepts `Delete` (a real, common operation - a client deleting a message locally); `Add` is rejected
@@ -89,29 +94,79 @@ export abstract class SyncCommand implements EasCommandHandler {
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
         const collections = ctx.request ? findChild(ctx.request, "Collections") : undefined;
-        const collection = collections ? findChild(collections, "Collection") : undefined;
-        if (!collection) {
+        const collectionEls = collections ? findChildren(collections, "Collection") : [];
+        if (collectionEls.length === 0) {
             return element(WbxmlCodePage.AirSync, "Sync", [textElement(WbxmlCodePage.AirSync, "Status", "3")]);
         }
 
-        const collectionClass: string | undefined = childText(collection, "Class");
-        const folderUid: string | undefined = childText(collection, "CollectionId");
-        const clientSyncKey: string | undefined = childText(collection, "SyncKey");
+        const collectionElements: WbxmlElement[] = [];
+        // Accumulated across every collection below, then written in exactly ONE persistDeviceSyncState call
+        // after the loop - never one call per collection (see this class's own doc comment on why).
+        let folderSyncKeys: Record<string, string> | undefined;
+        let folderCollectionClasses: Record<string, string> | undefined;
+
+        for (const collectionEl of collectionEls) {
+            const result = await this.processCollection(ctx, collectionEl);
+            collectionElements.push(result.collectionElement);
+            if (result.folderUid && result.newSyncKey) {
+                folderSyncKeys = {
+                    ...(folderSyncKeys ?? ctx.deviceSyncState.folderSyncKeys),
+                    [result.folderUid]: result.newSyncKey,
+                };
+            }
+            if (result.folderUid && result.rememberedClass) {
+                folderCollectionClasses = {
+                    ...(folderCollectionClasses ?? ctx.deviceSyncState.folderCollectionClasses ?? {}),
+                    [result.folderUid]: result.rememberedClass,
+                };
+            }
+        }
+
+        if (folderSyncKeys || folderCollectionClasses) {
+            await persistDeviceSyncState(ctx.deviceSyncState, ctx.deviceSyncStateRepo, {
+                ...(folderSyncKeys ? { folderSyncKeys } : {}),
+                ...(folderCollectionClasses ? { folderCollectionClasses } : {}),
+            });
+        }
+
+        return element(WbxmlCodePage.AirSync, "Sync", [
+            element(WbxmlCodePage.AirSync, "Collections", collectionElements),
+        ]);
+    }
+
+    /** Processes one `<Collection>` from the request into its own `<Collection>` response element, plus (when
+     * this round advanced anything) the `folderUid`/new `SyncKey`/remembered `Class` for `handle()` to fold
+     * into its single end-of-request `persistDeviceSyncState` call - this method itself never persists
+     * anything, so it's safe to call once per collection in a request without the write-batching hazard
+     * `EasSyncKeyUtils.persistDeviceSyncState`'s doc comment describes. */
+    private async processCollection(
+        ctx: EasCommandContext,
+        collectionEl: WbxmlElement,
+    ): Promise<{ collectionElement: WbxmlElement; folderUid?: string; newSyncKey?: string; rememberedClass?: string }> {
+        const requestedClass: string | undefined = childText(collectionEl, "Class");
+        const folderUid: string | undefined = childText(collectionEl, "CollectionId");
+        const clientSyncKey: string | undefined = childText(collectionEl, "SyncKey");
+
+        // Class is only required on a collection's first (SyncKey "0") request - see this class's own doc
+        // comment. A folder never previously synced has no remembered value to fall back to, so omitting Class
+        // there still (correctly) falls through to the "missing" branch below.
+        const collectionClass: string | undefined =
+            requestedClass ?? (folderUid ? ctx.deviceSyncState.folderCollectionClasses?.[folderUid] : undefined);
         if (!collectionClass || !folderUid) {
-            return this.collectionResponse(collectionClass, folderUid, "4", clientSyncKey);
+            return { collectionElement: this.collectionResponse(collectionClass, folderUid, "4", clientSyncKey) };
         }
 
         const binding: SyncCollectionBinding<any> | undefined = this.collectionBindings[collectionClass];
         const repo: RepoUtils<any> | undefined = this.repos.get(collectionClass);
         if (!binding || !repo) {
-            return this.collectionResponse(collectionClass, folderUid, "4", clientSyncKey);
+            return { collectionElement: this.collectionResponse(collectionClass, folderUid, "4", clientSyncKey) };
         }
 
         const storedSyncKey: string | undefined = ctx.deviceSyncState.folderSyncKeys[folderUid];
         const resolution = resolveSyncKey(clientSyncKey, storedSyncKey);
 
         if (resolution.kind === "invalid") {
-            return this.collectionResponse(collectionClass, folderUid, "3", undefined);
+            return { collectionElement: this.collectionResponse(collectionClass, folderUid, "3", undefined) };
         }
 
         if (resolution.kind === "initial") {
@@ -119,8 +174,12 @@ export abstract class SyncCommand implements EasCommandHandler {
             // request (echoing this key) is its true first full sync of this folder and must see every
             // existing item as an Add, not just ones modified after this handshake started.
             const newKey = formatSyncKey({ generation: 1, watermark: new Date(0) });
-            await this.persistSyncKey(ctx, folderUid, newKey);
-            return this.collectionResponse(collectionClass, folderUid, "1", newKey);
+            return {
+                collectionElement: this.collectionResponse(collectionClass, folderUid, "1", newKey),
+                folderUid,
+                newSyncKey: newKey,
+                rememberedClass: requestedClass,
+            };
         }
 
         // Computed against the OLD watermark, BEFORE this round's own client-originated writes below are
@@ -128,10 +187,10 @@ export abstract class SyncCommand implements EasCommandHandler {
         // as a Commands/Add|Change|Delete in this SAME response.
         const changes = await computeChanges(repo, "folderUid", folderUid, resolution.key.watermark, this.windowSize);
 
-        // Process the client's own Commands (if any) - after the read above, before persisting the new
-        // SyncKey below (which must cover these writes too, or the NEXT round would re-report them as
-        // incoming server-side changes).
-        const requestCommands = findChild(collection, "Commands");
+        // Process the client's own Commands (if any) - after the read above, before computing the new SyncKey
+        // below (which must cover these writes too, or the NEXT round would re-report them as incoming
+        // server-side changes).
+        const requestCommands = findChild(collectionEl, "Commands");
         const responseEntries: WbxmlElement[] = [];
         let maxWriteWatermark: Date | undefined;
         const note = (date: Date | undefined) => {
@@ -161,11 +220,15 @@ export abstract class SyncCommand implements EasCommandHandler {
         const newWatermark =
             maxWriteWatermark && maxWriteWatermark > changes.newWatermark ? maxWriteWatermark : changes.newWatermark;
         const newKey = formatSyncKey({ generation: resolution.key.generation + 1, watermark: newWatermark });
-        await this.persistSyncKey(ctx, folderUid, newKey);
 
         const totalChanges: number = changes.adds.length + changes.changes.length + changes.deletes.length;
         if (totalChanges === 0 && responseEntries.length === 0) {
-            return this.collectionResponse(collectionClass, folderUid, "1", newKey);
+            return {
+                collectionElement: this.collectionResponse(collectionClass, folderUid, "1", newKey),
+                folderUid,
+                newSyncKey: newKey,
+                rememberedClass: requestedClass,
+            };
         }
 
         const commandElements: WbxmlElement[] = [
@@ -176,11 +239,16 @@ export abstract class SyncCommand implements EasCommandHandler {
             ),
         ];
 
-        return this.collectionResponse(collectionClass, folderUid, "1", newKey, [
-            ...(changes.moreAvailable ? [element(WbxmlCodePage.AirSync, "MoreAvailable", [])] : []),
-            ...(commandElements.length > 0 ? [element(WbxmlCodePage.AirSync, "Commands", commandElements)] : []),
-            ...(responseEntries.length > 0 ? [element(WbxmlCodePage.AirSync, "Responses", responseEntries)] : []),
-        ]);
+        return {
+            collectionElement: this.collectionResponse(collectionClass, folderUid, "1", newKey, [
+                ...(changes.moreAvailable ? [element(WbxmlCodePage.AirSync, "MoreAvailable", [])] : []),
+                ...(commandElements.length > 0 ? [element(WbxmlCodePage.AirSync, "Commands", commandElements)] : []),
+                ...(responseEntries.length > 0 ? [element(WbxmlCodePage.AirSync, "Responses", responseEntries)] : []),
+            ]),
+            folderUid,
+            newSyncKey: newKey,
+            rememberedClass: requestedClass,
+        };
     }
 
     private itemToCommandElement(kind: "Add" | "Change", adapter: EasCollectionSyncAdapter<any>, item: RecoverableBaseEntity): WbxmlElement {
@@ -298,6 +366,8 @@ export abstract class SyncCommand implements EasCommandHandler {
         }
     }
 
+    /** Builds one `<Collection>` response element - `handle()` collects one of these per request `<Collection>`
+     * and wraps the whole set in a single `<Sync><Collections>`. */
     private collectionResponse(
         collectionClass: string | undefined,
         folderUid: string | undefined,
@@ -305,21 +375,12 @@ export abstract class SyncCommand implements EasCommandHandler {
         syncKey: string | undefined,
         extra: WbxmlElement[] = [],
     ): WbxmlElement {
-        return element(WbxmlCodePage.AirSync, "Sync", [
-            element(WbxmlCodePage.AirSync, "Collections", [
-                element(WbxmlCodePage.AirSync, "Collection", [
-                    ...(collectionClass ? [textElement(WbxmlCodePage.AirSync, "Class", collectionClass)] : []),
-                    ...(syncKey ? [textElement(WbxmlCodePage.AirSync, "SyncKey", syncKey)] : []),
-                    ...(folderUid ? [textElement(WbxmlCodePage.AirSync, "CollectionId", folderUid)] : []),
-                    textElement(WbxmlCodePage.AirSync, "Status", status),
-                    ...extra,
-                ]),
-            ]),
+        return element(WbxmlCodePage.AirSync, "Collection", [
+            ...(collectionClass ? [textElement(WbxmlCodePage.AirSync, "Class", collectionClass)] : []),
+            ...(syncKey ? [textElement(WbxmlCodePage.AirSync, "SyncKey", syncKey)] : []),
+            ...(folderUid ? [textElement(WbxmlCodePage.AirSync, "CollectionId", folderUid)] : []),
+            textElement(WbxmlCodePage.AirSync, "Status", status),
+            ...extra,
         ]);
-    }
-
-    private async persistSyncKey(ctx: EasCommandContext, folderUid: string, newKey: string): Promise<void> {
-        const folderSyncKeys = { ...ctx.deviceSyncState.folderSyncKeys, [folderUid]: newKey };
-        await persistDeviceSyncState(ctx.deviceSyncState, ctx.deviceSyncStateRepo, { folderSyncKeys });
     }
 }
