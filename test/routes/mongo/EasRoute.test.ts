@@ -319,15 +319,14 @@ describe("Route:EasRouteMongo Tests", () => {
     });
 
     describe("OPTIONS", () => {
-        // See BaseEasRoute's own "KNOWN LIMITATION" doc comment: Server.ts's global CORS middleware
-        // unconditionally intercepts every OPTIONS request with a bare 204 before an app route ever runs, so
-        // there is no EAS-specific MS-ASProtocolVersions/MS-ASProtocolCommands discovery response to test
-        // here - this documents that actual, verified behavior rather than asserting a response this route
-        // can never produce.
-        it("Is answered by the framework's generic CORS preflight handler, not by this route.", async () => {
+        // Now that @rapidrest/service-core >=1.5.0's global CORS middleware consults
+        // `IHttpRouter.hasExplicitOptionsRoute()` before its blanket preflight 204 (see BaseEasRoute's own doc
+        // comment), this route's `options()` handler actually runs for a real client's capability probe.
+        it("Answers with MS-ASProtocolVersions/MS-ASProtocolCommands rather than the generic CORS preflight 204.", async () => {
             const result = await request(server.getApplication()).options(baseUrl);
-            expect(result.status).toBe(204);
-            expect(result.headers["ms-asprotocolversions"]).toBeUndefined();
+            expect(result.status).toBe(200);
+            expect(result.headers["ms-asprotocolversions"]).toBe("14.0,14.1");
+            expect(result.headers["ms-asprotocolcommands"]).toContain("FolderSync");
         });
     });
 

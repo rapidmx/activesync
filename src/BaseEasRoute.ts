@@ -64,11 +64,10 @@ function firstQueryValue(value: string | string[] | undefined): string | undefin
  *
  * **`OPTIONS` protocol discovery**: real EAS clients conventionally probe `OPTIONS` before their first `POST`
  * to read `MS-ASProtocolVersions`/`MS-ASProtocolCommands` and learn what the server supports - see `options()`
- * below. This only actually runs on a `@rapidrest/service-core` version whose global CORS middleware consults
- * `IHttpRouter.hasExplicitOptionsRoute()` before its blanket preflight `204` (added upstream alongside this
- * handler); on an older `service-core` the CORS middleware still intercepts every `OPTIONS` request
- * unconditionally and this method is unreachable dead code, exactly as before - confirmed by reading
- * `Server.ts` directly, not assumed.
+ * below. This requires `@rapidrest/service-core` >=1.5.0, whose global CORS middleware consults
+ * `IHttpRouter.hasExplicitOptionsRoute()` before its blanket preflight `204` - confirmed live end to end
+ * against a real `service-core` 1.5.0 install (`test/routes/{mongo,sql}/EasRoute.test.ts`'s `OPTIONS`
+ * describe block), not assumed.
  *
  * `deviceSyncStateClass`/`mailboxClass` are supplied by the Mongo/SQL concrete subclasses, following the exact
  * one-line-per-backend pattern used throughout this library's other routes/jobs.

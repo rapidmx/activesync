@@ -294,10 +294,11 @@ describe("Route:EasRouteSQL Tests", () => {
 
     describe("OPTIONS", () => {
         // See the identical note in test/routes/mongo/EasRoute.test.ts.
-        it("Is answered by the framework's generic CORS preflight handler, not by this route.", async () => {
+        it("Answers with MS-ASProtocolVersions/MS-ASProtocolCommands rather than the generic CORS preflight 204.", async () => {
             const result = await request(server.getApplication()).options(baseUrl);
-            expect(result.status).toBe(204);
-            expect(result.headers["ms-asprotocolversions"]).toBeUndefined();
+            expect(result.status).toBe(200);
+            expect(result.headers["ms-asprotocolversions"]).toBe("14.0,14.1");
+            expect(result.headers["ms-asprotocolcommands"]).toContain("FolderSync");
         });
     });
 

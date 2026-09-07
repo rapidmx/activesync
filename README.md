@@ -23,11 +23,11 @@ package's endpoint from just an email address.
 
 Responds to a client's `OPTIONS` capability probe with real `MS-ASProtocolVersions`/`MS-ASProtocolCommands`
 headers (versions `14.0`/`14.1`, matching the MIME-based `SendMail`/`SmartForward`/`SmartReply` this package
-actually implements). **This requires `@rapidrest/service-core` to include the `hasExplicitOptionsRoute()`
-fix** (so its global CORS middleware lets this route's own `OPTIONS` handler run instead of always answering
-with a blanket preflight `204`) — check that package's own changelog for the version that introduced it; on an
-older `service-core`, `OPTIONS` still always gets the bare `204` and a client falls back to just trying its
-first `POST` directly.
+actually implements). This requires `@rapidrest/service-core` >=1.5.0 (the version that added
+`hasExplicitOptionsRoute()`, letting this route's own `OPTIONS` handler run instead of the framework's global
+CORS middleware always answering with a blanket preflight `204`) — this package's own `peerDependencies`
+doesn't hard-pin that minimum since every other command still works fine on an older `service-core`, it just
+means `OPTIONS` falls back to the bare `204` and a client falls back to trying its first `POST` directly.
 
 ## Usage
 
