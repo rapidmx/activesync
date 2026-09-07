@@ -6,7 +6,7 @@ import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
-import { computeChanges, formatSyncKey, resolveSyncKey } from "../EasSyncKeyUtils.js";
+import { computeChanges, formatSyncKey, persistDeviceSyncState, resolveSyncKey } from "../EasSyncKeyUtils.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 import { Folder, FolderType } from "@rapidmx/restapi";
 const { Config, Init } = ObjectDecorators;
@@ -152,11 +152,6 @@ export abstract class FolderSyncCommand<F extends Folder> implements EasCommandH
 
     private async persistSyncKey(ctx: EasCommandContext, newKey: string): Promise<void> {
         const folderSyncKeys = { ...ctx.deviceSyncState.folderSyncKeys, [FOLDER_HIERARCHY_CURSOR_KEY]: newKey };
-        ctx.deviceSyncState.folderSyncKeys = folderSyncKeys;
-        await ctx.deviceSyncStateRepo.update(
-            { uid: ctx.deviceSyncState.uid, version: (ctx.deviceSyncState as any).version, folderSyncKeys } as any,
-            ctx.deviceSyncState,
-            { ignoreACL: true, skipPush: true },
-        );
+        await persistDeviceSyncState(ctx.deviceSyncState, ctx.deviceSyncStateRepo, { folderSyncKeys });
     }
 }

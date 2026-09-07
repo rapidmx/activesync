@@ -5,6 +5,7 @@
 import * as crypto from "crypto";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
+import { persistDeviceSyncState } from "../EasSyncKeyUtils.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 
 const DEFAULT_POLICY_TYPE = "MS-EAS-Provisioning-WBXML";
@@ -90,17 +91,6 @@ export class ProvisionCommand implements EasCommandHandler {
     }
 
     private async persist(ctx: EasCommandContext, changes: { policyKey: string; provisioned: boolean }): Promise<void> {
-        ctx.deviceSyncState.policyKey = changes.policyKey;
-        ctx.deviceSyncState.provisioned = changes.provisioned;
-        await ctx.deviceSyncStateRepo.update(
-            {
-                uid: ctx.deviceSyncState.uid,
-                version: (ctx.deviceSyncState as any).version,
-                policyKey: changes.policyKey,
-                provisioned: changes.provisioned,
-            } as any,
-            ctx.deviceSyncState,
-            { ignoreACL: true, skipPush: true },
-        );
+        await persistDeviceSyncState(ctx.deviceSyncState, ctx.deviceSyncStateRepo, changes);
     }
 }

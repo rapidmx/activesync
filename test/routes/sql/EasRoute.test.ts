@@ -406,6 +406,18 @@ describe("Route:EasRouteSQL Tests", () => {
             const all = await deviceSyncStateRepo.find({ where: { mailboxUid: mailbox.uid, deviceId: "dev1" } });
             expect(all.length).toBe(1);
         });
+
+        it("Persists lastSyncAt even when the handler itself also writes DeviceSyncState in the same request (regression: RepoUtils.update() never mutates its `existing` argument, so a second write built off a stale in-memory version used to silently match zero rows).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+
+            // Provision's own phase-2 request both flips `provisioned`/`policyKey` itself (one write) and then
+            // triggers BaseEasRoute.dispatch()'s trailing `lastSyncAt` write (a second write, same request) -
+            // exactly the two-write-per-request scenario the bug silently broke.
+            await provisionDevice("dev1");
+
+            const found = await deviceSyncStateRepo.findOne({ where: { mailboxUid: mailbox.uid, deviceId: "dev1" } });
+            expect(found?.lastSyncAt).toBeInstanceOf(Date);
+        });
     });
 
     describe("Provision command", () => {

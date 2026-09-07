@@ -8,7 +8,7 @@
 // here against a hand-built fake repo so its comparator actually runs across more than one pair of rows -
 // something the existing FolderSync integration tests never produce because each real test round only ever
 // creates a single change of any one kind.
-import { computeChanges, formatSyncKey, parseSyncKey, resolveSyncKey } from "../src/EasSyncKeyUtils.js";
+import { computeChanges, formatSyncKey, parseSyncKey, persistDeviceSyncState, resolveSyncKey } from "../src/EasSyncKeyUtils.js";
 
 describe("EasSyncKeyUtils Tests", () => {
     describe("formatSyncKey/parseSyncKey", () => {
@@ -58,6 +58,69 @@ describe("EasSyncKeyUtils Tests", () => {
                 kind: "valid",
                 key: { generation: 2, watermark: new Date("2026-09-04T12:00:00.000Z") },
             });
+        });
+    });
+
+    describe("persistDeviceSyncState", () => {
+        // `update`'s mock captures a *shallow copy* of its arguments at call time, not the live references -
+        // `deviceSyncState` is the same object throughout this function (mutated again after the awaited call
+        // resolves), so asserting against `vi.fn()`'s recorded call args directly would observe the object's
+        // *final* state instead of what was actually sent on the wire at call time.
+        function capturingUpdate(result: any): { update: any; calls: { query: any; existing: any }[] } {
+            const calls: { query: any; existing: any }[] = [];
+            const update = vi.fn().mockImplementation(async (query: any, existing: any) => {
+                calls.push({ query: { ...query }, existing: { ...existing } });
+                return result;
+            });
+            return { update, calls };
+        }
+
+        it("Applies the patch to the in-memory object and pulls the repo's returned version back onto it.", async () => {
+            // Models RepoUtils.update()'s real contract: it never mutates its `existing` argument, it only
+            // returns a freshly-fetched instance reflecting the write (with `version` bumped) - see this
+            // function's own doc comment for why blindly discarding that return value is the bug being fixed.
+            const deviceSyncState: any = { uid: "dss-1", version: 1, provisioned: false };
+            const { update, calls } = capturingUpdate({ uid: "dss-1", version: 2, provisioned: true });
+            const repo: any = { update };
+
+            await persistDeviceSyncState(deviceSyncState, repo, { provisioned: true });
+
+            expect(update).toHaveBeenCalledTimes(1);
+            expect(calls[0].query).toEqual({ uid: "dss-1", version: 1, provisioned: true });
+            expect(calls[0].existing).toEqual({ uid: "dss-1", version: 1, provisioned: true });
+            expect(update.mock.calls[0][2]).toEqual({ ignoreACL: true, skipPush: true });
+            expect(deviceSyncState).toEqual({ uid: "dss-1", version: 2, provisioned: true });
+        });
+
+        it("Keeps the patch applied even when the repo call resolves undefined (e.g. a bare test double).", async () => {
+            const deviceSyncState: any = { uid: "dss-1", version: 1, provisioned: false };
+            const repo: any = { update: vi.fn().mockResolvedValue(undefined) };
+
+            await persistDeviceSyncState(deviceSyncState, repo, { provisioned: true });
+
+            expect(deviceSyncState).toEqual({ uid: "dss-1", version: 1, provisioned: true });
+        });
+
+        it("Lets a second call in the same request build its patch off the version the first call returned.", async () => {
+            const deviceSyncState: any = { uid: "dss-1", version: 1 };
+            const calls: { query: any; existing: any }[] = [];
+            const results = [
+                { uid: "dss-1", version: 2, a: "first" },
+                { uid: "dss-1", version: 3, a: "first", b: "second" },
+            ];
+            const update = vi.fn().mockImplementation(async (query: any, existing: any) => {
+                calls.push({ query: { ...query }, existing: { ...existing } });
+                return results[calls.length - 1];
+            });
+            const repo: any = { update };
+
+            await persistDeviceSyncState(deviceSyncState, repo, { a: "first" });
+            await persistDeviceSyncState(deviceSyncState, repo, { b: "second" });
+
+            // The second call's query must carry version 2 (what the first call left on deviceSyncState), not
+            // the original stale version 1 - this is exactly the scenario that silently no-oped before the fix.
+            expect(calls[1].query).toEqual({ uid: "dss-1", version: 2, b: "second" });
+            expect(calls[1].existing).toEqual({ uid: "dss-1", version: 2, a: "first", b: "second" });
         });
     });
 

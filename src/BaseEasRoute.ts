@@ -16,6 +16,7 @@ import { WbxmlDecoder } from "./codec/WbxmlDecoder.js";
 import { WbxmlEncoder } from "./codec/WbxmlEncoder.js";
 import type { WbxmlElement } from "./codec/WbxmlElement.js";
 import type { EasCommandHandler } from "./EasCommandHandler.js";
+import { persistDeviceSyncState } from "./EasSyncKeyUtils.js";
 import { DeviceSyncState, Mailbox, resolveCallerMailboxUid } from "@rapidmx/restapi";
 const { Init, Logger } = ObjectDecorators;
 const { Auth, Options, Post, Request, Response, User: AuthUser } = RouteDecorators;
@@ -180,11 +181,7 @@ export abstract class BaseEasRoute<D extends DeviceSyncState, M extends Mailbox 
             req,
         });
 
-        await this.deviceSyncStateRepo.update(
-            { uid: deviceSyncState.uid, version: (deviceSyncState as any).version, lastSyncAt: new Date() } as any,
-            deviceSyncState,
-            { ignoreACL: true, skipPush: true },
-        );
+        await persistDeviceSyncState(deviceSyncState, this.deviceSyncStateRepo, { lastSyncAt: new Date() });
 
         if (!response) {
             res.status(200).send();

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { RecoverableBaseEntity, RepoUtils } from "@rapidrest/service-core";
+import type { DeviceSyncState } from "@rapidmx/restapi";
 
 /**
  * A parsed EAS `SyncKey`. The wire value is opaque to the client per spec, so this library encodes it as
@@ -63,6 +64,37 @@ export function resolveSyncKey(clientValue: string | undefined, storedValue: str
     }
     const parsed = parseSyncKey(storedValue);
     return parsed ? { kind: "valid", key: parsed } : { kind: "invalid" };
+}
+
+/**
+ * Applies `patch` to `deviceSyncState` and persists it - the one correct way any EAS command handler (or
+ * `BaseEasRoute` itself) should ever write to a `DeviceSyncState`, replacing the inline
+ * `deviceSyncStateRepo.update(...)` calls `ProvisionCommand`/`FolderSyncCommand`/`SyncCommand` used to each
+ * repeat individually.
+ *
+ * This exists because `RepoUtils.update()` does **not** mutate the `existing` object passed to it - confirmed
+ * by reading its implementation directly - it only returns a freshly-fetched instance reflecting the write,
+ * leaving the caller's in-memory copy (including its optimistic-concurrency `version`) stale. A single write
+ * per request is harmless (nothing re-reads the stale copy), but a *second* write to the same `deviceSyncState`
+ * later in the same request - e.g. `BaseEasRoute.dispatch()`'s own trailing `lastSyncAt` update, or a second
+ * collection's SyncKey in a multi-collection `Sync` - would build its own patch's `version` off that stale
+ * value. `RepoUtils.update()` filters its underlying write by exactly that `version`, so the write silently
+ * matches zero rows instead of throwing - a silent no-op, not a visible error. Copying `update()`'s own
+ * returned result back onto `deviceSyncState` (last line below) keeps every field, including `version`, current
+ * for whatever writes this same request still has left to make.
+ */
+export async function persistDeviceSyncState(
+    deviceSyncState: DeviceSyncState,
+    deviceSyncStateRepo: RepoUtils<any>,
+    patch: Record<string, unknown>,
+): Promise<void> {
+    Object.assign(deviceSyncState, patch);
+    const updated = await deviceSyncStateRepo.update(
+        { uid: deviceSyncState.uid, version: (deviceSyncState as any).version, ...patch } as any,
+        deviceSyncState,
+        { ignoreACL: true, skipPush: true },
+    );
+    Object.assign(deviceSyncState, updated);
 }
 
 /** One page of enumerated changes for a `RecoverableBaseEntity` collection scoped by a single field (e.g.
