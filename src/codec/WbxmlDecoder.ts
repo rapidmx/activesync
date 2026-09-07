@@ -14,6 +14,14 @@ const CONTENT_FLAG = 0x40;
 const ATTR_FLAG = 0x80;
 const TAG_CODE_MASK = 0x3f;
 
+/** Caps `readTagElement`/`readContentUntilEnd`'s mutual recursion depth - unlike every length-prefixed field in
+ * this format, element nesting has no size-based bound at all, and costs as little as ~2 bytes of wire format
+ * per level (a content-flagged tag byte immediately followed by its own `END`), so an unbounded decoder lets a
+ * tiny crafted request drive the recursion deep enough to exhaust the call stack. No real EAS document (the
+ * deepest legitimate shape here is roughly `Sync > Collections > Collection > Commands > Add > ApplicationData
+ * > Body > ...`, well under 20 levels) comes anywhere close to this limit. */
+const MAX_NESTING_DEPTH = 200;
+
 /**
  * Decodes a WBXML byte stream (an EAS request/response body) back into a `WbxmlElement` tree — the exact
  * inverse of `WbxmlEncoder`. Reads the fixed EAS document header, skips its (always-empty, in real
@@ -31,11 +39,13 @@ export class WbxmlDecoder {
     private buf: Buffer = Buffer.alloc(0);
     private pos = 0;
     private currentPage = 0;
+    private depth = 0;
 
     public decode(data: Buffer): WbxmlElement {
         this.buf = data;
         this.pos = 0;
         this.currentPage = 0;
+        this.depth = 0;
 
         this.readByte(); // version - not validated; every ActiveSync client/server variant this library
         // targets sends 0x03 (WBXML 1.3), but nothing here depends on that specific value.
@@ -89,17 +99,24 @@ export class WbxmlDecoder {
     }
 
     private readTagElement(): WbxmlElement {
-        const byte = this.readByte();
-        if ((byte & ATTR_FLAG) !== 0) {
-            throw new Error("WbxmlDecoder: attributes are not supported (ActiveSync's WBXML profile never uses them)");
+        if (++this.depth > MAX_NESTING_DEPTH) {
+            throw new Error(`WbxmlDecoder: exceeded maximum nesting depth of ${MAX_NESTING_DEPTH}`);
         }
-        const page = this.currentPage;
-        const tag = tagNameForCode(page, byte & TAG_CODE_MASK);
-        if ((byte & CONTENT_FLAG) === 0) {
-            return { page, tag, children: [] };
+        try {
+            const byte = this.readByte();
+            if ((byte & ATTR_FLAG) !== 0) {
+                throw new Error("WbxmlDecoder: attributes are not supported (ActiveSync's WBXML profile never uses them)");
+            }
+            const page = this.currentPage;
+            const tag = tagNameForCode(page, byte & TAG_CODE_MASK);
+            if ((byte & CONTENT_FLAG) === 0) {
+                return { page, tag, children: [] };
+            }
+            const { children, text, opaque } = this.readContentUntilEnd();
+            return { page, tag, children, text, opaque };
+        } finally {
+            this.depth--;
         }
-        const { children, text, opaque } = this.readContentUntilEnd();
-        return { page, tag, children, text, opaque };
     }
 
     /** Reads a mixed sequence of child tag elements / an inline string / opaque binary content, up to (and

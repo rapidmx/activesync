@@ -250,6 +250,19 @@ describe("WBXML codec Tests", () => {
         it("codeForTagName() throws for an unregistered tag/page pair.", () => {
             expect(() => codeForTagName(WbxmlCodePage.AirSync, "DoesNotExist")).toThrow(/no token registered/);
         });
+
+        it("Throws a bounded 'maximum nesting depth' error rather than a raw stack overflow for pathologically deep nesting.", () => {
+            // header + 250 content-flagged Sync tag bytes (each ~2 bytes of wire format), then 250 matching
+            // ENDs to close them all - a crafted request could reach this depth in well under a kilobyte,
+            // exercising the exact DoS surface the depth cap exists to close off.
+            const depth = 250;
+            const header = Buffer.from([0x03, 0x01, 0x6a, 0x00]);
+            const opens = Buffer.alloc(depth, 0x05 | 0x40);
+            const closes = Buffer.alloc(depth, 0x01);
+            const bytes = Buffer.concat([header, opens, closes]);
+
+            expect(() => new WbxmlDecoder().decode(bytes)).toThrow(/exceeded maximum nesting depth/);
+        });
     });
 
     describe("WbxmlElement helpers", () => {
