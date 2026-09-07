@@ -15,8 +15,14 @@ Keep entries terse — this is a reference, not a transcript.
   from a downstream, untrusted HTTP client hitting a service built on this package (anonymous or
   low-privilege caller). Do NOT flag developer-only footguns or purely theoretical races with no
   concrete external trigger path.
-- **Commit discipline.** Don't `git commit` unless explicitly asked, even after a full
-  review-and-fix cycle with passing tests. Leave changes staged/unstaged and say so.
+- **Commit discipline.** Don't `git commit` unless explicitly asked for *that specific piece of
+  work*. An autonomous-execution/"commit as you go" approval given for one approved plan (e.g. via
+  plan mode) is scoped to that plan only — it does not carry forward to later, separate requests in
+  the same session, even ones that look similar in kind (a follow-up review-and-fix pass, a
+  refactor, a new feature), and even after a full review-and-fix cycle with passing tests. Default
+  to leaving changes staged/unstaged and saying so; only commit automatically within the exact
+  scope of a plan that was explicitly approved as autonomous. If unsure whether new work falls
+  inside that scope, treat it as outside and ask.
 - **Commit message style: concise, one line per task/bug/feature — no verbose prose.** A commit
   message is a short list of one-line bullets, one per item. This mirrors JP's standing convention
   across his other repos.
@@ -118,6 +124,46 @@ commits, each keeping the 95%/100%/100%/100% coverage gate green:
 - **This closes out the practical-full-compliance roadmap** - every item from the original scoping conversation
   has now landed (multi-collection `Sync`, Email drafts, `ItemOperations` write-adjacent behaviors, the three
   new commands, `MeetingResponse` decline, `Settings`/`Oof`, and `Provision`/`RemoteWipe`).
+
+### 2026-09-07 — Adversarial two-agent code review, 7 confirmed findings fixed
+
+JP asked for a full code review via two adversarial agents (one security-lens, one correctness-lens),
+reviewing all of `src/` independently in parallel, followed by manual verification of every claim against the
+actual source before trusting it (two low-confidence agent claims didn't survive verification and were
+dropped). Then fixed the whole confirmed list, one commit per finding/theme:
+
+- **CRITICAL, fixed**: `SyncCommand.applyChange`/`applyDelete` resolved a client-supplied `ServerId` via
+  `repo.findOne(ignoreACL:true)` and mutated/deleted it with **no ACL check and no ownership verification at
+  all** - a device could target another mailbox's item by uid. `computeChanges()` had the identical gap for
+  reads (a crafted `CollectionId` belonging to another mailbox's folder returned that folder's full content).
+  This was the one place in the codebase that dropped the "ACL-check after an `ignoreACL` lookup" pattern every
+  sibling command (`ItemOperationsCommand`, `MoveItemsCommand`) already used consistently - not a new pattern
+  invented for the fix, a restored one. Now requires `READ` on the folder before touching anything in
+  `processCollection()`, `CREATE`/`UPDATE`/`DELETE` respectively in `applyAdd`/`applyChange`/`applyDelete`, and
+  `applyChange`/`applyDelete` re-verify the resolved item's own `folderUid` matches (treated as "not found",
+  never distinguishable from a genuinely missing item).
+- **HIGH, fixed**: `GetItemEstimateCommand` had the identical missing-ownership-check root cause for its own
+  `CollectionId` - smaller blast radius (a count leak, not content).
+- **MEDIUM, fixed**: `EmailSyncAdapter.buildPlainTextMime()` interpolated client-supplied Subject/To/Cc
+  directly into RFC 5322 header lines with no CRLF sanitization - `WbxmlDecoder.readCString()` only stops at a
+  NUL byte, so literal `\r\n` bytes in a decoded string survive untouched, enabling header injection into a
+  stored Draft's MIME (and whatever gets sent later, if that draft is sent for real).
+  Fixed with a `sanitizeHeaderValue()` fold-to-single-line helper at the actual interpolation sink.
+- **MEDIUM, fixed**: `ItemOperationsCommand.fetchMessage()` computed `EstimatedDataSize` from the body *after*
+  truncation, contrary to MS-ASAIRSYNCBASE (should be the pre-truncation size) - captured before truncation now.
+- **LOW/moderate DoS, fixed**: `WbxmlDecoder`'s `readTagElement`/`readContentUntilEnd` recursed with no depth
+  cap (unlike every length-prefixed field in the format) - ~2 bytes of wire format per nesting level could
+  drive a stack-overflow `RangeError` from a tiny request. Added `MAX_NESTING_DEPTH = 200`.
+- **LOW, fixed**: `SearchCommand`'s `Range` element built `${start}-${Math.min(end, matches.length - 1)}`,
+  producing the malformed `"0--1"` when a GAL search matched zero contacts. Clamped to 0.
+- **LOW, fixed**: `SyncCommand.applyDelete` captured its watermark via `new Date()` *before* the actual
+  `repo.delete()` call - moved to after the write resolves, so the persisted SyncKey watermark can no longer
+  understate the delete's real effective time (was causing occasional harmless duplicate Delete redelivery).
+- **Two agent claims did NOT survive verification** and were dropped rather than reported: a "narrow duplicate
+  Add" race in `EasSyncKeyUtils.computeChanges()`'s 1-second newly-created tolerance window (requires two writes
+  within ~100ms of each other spanning two sync rounds - real but practically unreachable), and a claim that
+  `EasCommandContext.policyKey` being unchecked was a live vulnerability (it's already self-documented in that
+  interface's own doc comment as a deferred, known gap - re-flagging your own documented TODO isn't a finding).
 
 ### 2026-09-06 — Repo split: `@rapidrest/mail` → four RapidMX packages
 
