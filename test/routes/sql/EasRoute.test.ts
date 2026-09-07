@@ -375,7 +375,7 @@ describe("Route:EasRouteSQL Tests", () => {
             expect(result.status).toBeLessThan(300);
         });
 
-        it("Returns 501 for a recognized-but-deferred command (ResolveRecipients) once the device is already provisioned.", async () => {
+        it("Returns 501 for a recognized-but-deferred command (ValidateCert) once the device is already provisioned.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await deviceSyncStateRepo.save(
                 new DeviceSyncStateSQL({
@@ -388,7 +388,7 @@ describe("Route:EasRouteSQL Tests", () => {
             );
 
             const result = await request(server.getApplication())
-                .post(`${baseUrl}?Cmd=ResolveRecipients&DeviceId=dev1`)
+                .post(`${baseUrl}?Cmd=ValidateCert&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken);
 
             expect(result.status).toBe(501);
@@ -2565,6 +2565,413 @@ describe("Route:EasRouteSQL Tests", () => {
                 );
 
             expect(result.status).toBe(403);
+        });
+    });
+
+    describe("GetItemEstimate command", () => {
+        /** Minimal single-collection Sync request, for seeding a real SyncKey to estimate against - a local
+         * copy of the "Sync command" describe block's own `syncRequest` helper, which isn't in scope here. */
+        const basicSyncRequest = function (syncKey: string, collectionClass: string, folderUid: string): WbxmlElement {
+            return element(WbxmlCodePage.AirSync, "Sync", [
+                element(WbxmlCodePage.AirSync, "Collections", [
+                    element(WbxmlCodePage.AirSync, "Collection", [
+                        textElement(WbxmlCodePage.AirSync, "Class", collectionClass),
+                        textElement(WbxmlCodePage.AirSync, "SyncKey", syncKey),
+                        textElement(WbxmlCodePage.AirSync, "CollectionId", folderUid),
+                    ]),
+                ]),
+            ]);
+        };
+
+        const estimateRequest = function (collections: { syncKey: string; collectionClass: string; folderUid: string }[]): WbxmlElement {
+            return element(WbxmlCodePage.ItemEstimate, "GetItemEstimate", [
+                element(
+                    WbxmlCodePage.AirSync,
+                    "Collections",
+                    collections.map((c) =>
+                        element(WbxmlCodePage.AirSync, "Collection", [
+                            textElement(WbxmlCodePage.AirSync, "Class", c.collectionClass),
+                            textElement(WbxmlCodePage.AirSync, "SyncKey", c.syncKey),
+                            textElement(WbxmlCodePage.AirSync, "CollectionId", c.folderUid),
+                        ]),
+                    ),
+                ),
+            ]);
+        };
+
+        it("Reports the folder's total live item count on an initial (SyncKey 0) estimate.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            await createMessage(mailbox.uid, folder.uid);
+            await createMessage(mailbox.uid, folder.uid);
+
+            const response = await postWbxml(
+                "GetItemEstimate",
+                "dev1",
+                estimateRequest([{ syncKey: "0", collectionClass: "Email", folderUid: folder.uid }]),
+            );
+
+            const resp = findChild(response, "Response")!;
+            expect(childText(resp, "Status")).toBe("1");
+            const collection = findChild(resp, "Collection")!;
+            expect(childText(collection, "CollectionId")).toBe(folder.uid);
+            expect(childText(collection, "Estimate")).toBe("2");
+        });
+
+        it("Reports the count of changes pending since an already-synced SyncKey.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+
+            const initial = await postWbxml("Sync", "dev1", basicSyncRequest("0", "Email", folder.uid));
+            const initialKey = childText(findChild(findChild(initial, "Collections")!, "Collection")!, "SyncKey")!;
+
+            await createMessage(mailbox.uid, folder.uid);
+            await createMessage(mailbox.uid, folder.uid);
+
+            const response = await postWbxml(
+                "GetItemEstimate",
+                "dev1",
+                estimateRequest([{ syncKey: initialKey, collectionClass: "Email", folderUid: folder.uid }]),
+            );
+
+            const collection = findChild(findChild(response, "Response")!, "Collection")!;
+            expect(childText(collection, "Estimate")).toBe("2");
+
+            // Read-only: GetItemEstimate must not have advanced the folder's own SyncKey - a real Sync round
+            // afterward still reports the same items as Adds.
+            const syncResponse = await postWbxml("Sync", "dev1", basicSyncRequest(initialKey, "Email", folder.uid));
+            const syncCollection = findChild(findChild(syncResponse, "Collections")!, "Collection")!;
+            expect(findChildren(findChild(syncCollection, "Commands")!, "Add").length).toBe(2);
+        });
+
+        it("Returns Status 2 for a CollectionId this device has never synced.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+
+            const response = await postWbxml(
+                "GetItemEstimate",
+                "dev1",
+                estimateRequest([{ syncKey: "999:2020-01-01T00:00:00.000Z", collectionClass: "Email", folderUid: folder.uid }]),
+            );
+
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("2");
+        });
+
+        it("Handles multiple collections in one request independently.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const contactsFolder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+            await createMessage(mailbox.uid, inbox.uid);
+            await createContact(mailbox.uid, contactsFolder.uid);
+            await createContact(mailbox.uid, contactsFolder.uid);
+
+            const response = await postWbxml(
+                "GetItemEstimate",
+                "dev1",
+                estimateRequest([
+                    { syncKey: "0", collectionClass: "Email", folderUid: inbox.uid },
+                    { syncKey: "0", collectionClass: "Contacts", folderUid: contactsFolder.uid },
+                ]),
+            );
+
+            const responses = findChildren(response, "Response");
+            expect(responses.length).toBe(2);
+            const emailEstimate = findChild(
+                responses.find((r) => childText(findChild(r, "Collection")!, "CollectionId") === inbox.uid)!,
+                "Collection",
+            )!;
+            const contactsEstimate = findChild(
+                responses.find((r) => childText(findChild(r, "Collection")!, "CollectionId") === contactsFolder.uid)!,
+                "Collection",
+            )!;
+            expect(childText(emailEstimate, "Estimate")).toBe("1");
+            expect(childText(contactsEstimate, "Estimate")).toBe("2");
+        });
+
+        it("Returns a top-level Status 2 Response when the request has no Collection at all.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            const response = await postWbxml(
+                "GetItemEstimate",
+                "dev1",
+                element(WbxmlCodePage.ItemEstimate, "GetItemEstimate", [
+                    element(WbxmlCodePage.AirSync, "Collections", []),
+                ]),
+            );
+
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("2");
+        });
+
+        it("Returns Status 2 for a Collection with an unsupported Class.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Notes", type: FolderType.NOTES });
+
+            const response = await postWbxml(
+                "GetItemEstimate",
+                "dev1",
+                estimateRequest([{ syncKey: "0", collectionClass: "Notes", folderUid: folder.uid }]),
+            );
+
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("2");
+        });
+
+        it("Returns a top-level Status 2 Response when the request has no WBXML body at all.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            const response = await postWbxml("GetItemEstimate", "dev1");
+
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("2");
+        });
+
+        it("Returns Status 2 for a Collection missing both Class and CollectionId.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            const response = await postWbxml(
+                "GetItemEstimate",
+                "dev1",
+                element(WbxmlCodePage.ItemEstimate, "GetItemEstimate", [
+                    element(WbxmlCodePage.AirSync, "Collections", [
+                        element(WbxmlCodePage.AirSync, "Collection", [textElement(WbxmlCodePage.AirSync, "SyncKey", "0")]),
+                    ]),
+                ]),
+            );
+
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("2");
+        });
+    });
+
+    describe("MoveItems command", () => {
+        const moveRequest = function (moves: { srcMsgId: string; srcFldId: string; dstFldId: string }[]): WbxmlElement {
+            return element(
+                WbxmlCodePage.Move,
+                "MoveItems",
+                moves.map((m) =>
+                    element(WbxmlCodePage.Move, "Move", [
+                        textElement(WbxmlCodePage.Move, "SrcMsgId", m.srcMsgId),
+                        textElement(WbxmlCodePage.Move, "SrcFldId", m.srcFldId),
+                        textElement(WbxmlCodePage.Move, "DstFldId", m.dstFldId),
+                    ]),
+                ),
+            );
+        };
+
+        it("Moves a message to another folder, reporting Status 1 and the same DstMsgId.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const archive = await createFolderWithAcl(mailbox.uid, { name: "Archive", type: FolderType.USER });
+            const message = await createMessage(mailbox.uid, inbox.uid);
+
+            const response = await postWbxml(
+                "MoveItems",
+                "dev1",
+                moveRequest([{ srcMsgId: message.uid, srcFldId: inbox.uid, dstFldId: archive.uid }]),
+            );
+
+            const resp = findChild(response, "Response")!;
+            expect(childText(resp, "Status")).toBe("1");
+            expect(childText(resp, "SrcMsgId")).toBe(message.uid);
+            expect(childText(resp, "DstMsgId")).toBe(message.uid);
+
+            const moved = await messageRepo.findOne({ where: { uid: message.uid } });
+            expect(moved?.folderUid).toBe(archive.uid);
+        });
+
+        it("Reports Status 3 when SrcFldId doesn't match the message's actual folder.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const archive = await createFolderWithAcl(mailbox.uid, { name: "Archive", type: FolderType.USER });
+            const otherFolder = await createFolderWithAcl(mailbox.uid, { name: "Other", type: FolderType.USER });
+            const message = await createMessage(mailbox.uid, inbox.uid);
+
+            const response = await postWbxml(
+                "MoveItems",
+                "dev1",
+                moveRequest([{ srcMsgId: message.uid, srcFldId: otherFolder.uid, dstFldId: archive.uid }]),
+            );
+
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("3");
+            const unchanged = await messageRepo.findOne({ where: { uid: message.uid } });
+            expect(unchanged?.folderUid).toBe(inbox.uid);
+        });
+
+        it("Reports Status 3 when the destination folder doesn't belong to the caller's own mailbox.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const otherMailbox = await createMailbox(otherUser.uid);
+            await provisionDevice("dev1");
+            const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const otherFolder = await createFolderWithAcl(otherMailbox.uid, { name: "Other", type: FolderType.USER });
+            const message = await createMessage(mailbox.uid, inbox.uid);
+
+            const response = await postWbxml(
+                "MoveItems",
+                "dev1",
+                moveRequest([{ srcMsgId: message.uid, srcFldId: inbox.uid, dstFldId: otherFolder.uid }]),
+            );
+
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("3");
+        });
+
+        it("Reports Status 3 for a nonexistent SrcMsgId.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const archive = await createFolderWithAcl(mailbox.uid, { name: "Archive", type: FolderType.USER });
+
+            const response = await postWbxml(
+                "MoveItems",
+                "dev1",
+                moveRequest([{ srcMsgId: "does-not-exist", srcFldId: inbox.uid, dstFldId: archive.uid }]),
+            );
+
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("3");
+        });
+
+        it("Reports Status 3 when a Move is missing a required field.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            const response = await postWbxml(
+                "MoveItems",
+                "dev1",
+                moveRequest([{ srcMsgId: "some-uid", srcFldId: "some-folder", dstFldId: "" }]),
+            );
+
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("3");
+        });
+
+        it("Reports Status 3 when the destination folder's ACL grants access but the Folder record itself is gone.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const archive = await createFolderWithAcl(mailbox.uid, { name: "Archive", type: FolderType.USER });
+            const message = await createMessage(mailbox.uid, inbox.uid);
+            // Hard-deletes only the Folder record, leaving its ACL grant in place - models a real (if rare)
+            // race between the ACL check passing and the folder record itself having vanished, distinct from
+            // "no permission at all" (already covered by the cross-mailbox test above).
+            await folderRepo.delete({ uid: archive.uid });
+
+            const response = await postWbxml(
+                "MoveItems",
+                "dev1",
+                moveRequest([{ srcMsgId: message.uid, srcFldId: inbox.uid, dstFldId: archive.uid }]),
+            );
+
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("3");
+        });
+    });
+
+    describe("ResolveRecipients command", () => {
+        const resolveRequest = function (toValues: string[]): WbxmlElement {
+            return element(
+                WbxmlCodePage.ResolveRecipients,
+                "ResolveRecipients",
+                toValues.map((v) => textElement(WbxmlCodePage.ResolveRecipients, "To", v)),
+            );
+        };
+
+        it("Echoes back a value that already looks like an email address as an exact match.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            const response = await postWbxml("ResolveRecipients", "dev1", resolveRequest(["jane@example.com"]));
+
+            const resp = findChild(response, "Response")!;
+            expect(childText(resp, "Status")).toBe("1");
+            expect(childText(resp, "To")).toBe("jane@example.com");
+            const recipient = findChild(resp, "Recipient")!;
+            expect(childText(recipient, "EmailAddress")).toBe("jane@example.com");
+        });
+
+        it("Resolves a partial display name against the mailbox's own Contacts (GAL).", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+            await createContact(mailbox.uid, folder.uid, {
+                displayName: "Jane Doe",
+                emails: [{ address: "new@example.com", type: ContactAddressKind.OTHER }],
+            });
+
+            const response = await postWbxml("ResolveRecipients", "dev1", resolveRequest(["Jane"]));
+
+            const resp = findChild(response, "Response")!;
+            expect(childText(resp, "Status")).toBe("1");
+            const recipient = findChild(resp, "Recipient")!;
+            expect(childText(recipient, "DisplayName")).toBe("Jane Doe");
+            expect(childText(recipient, "EmailAddress")).toBe("new@example.com");
+        });
+
+        it("Reports Status 4 when no Contact matches and the value doesn't look like an email address.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            const response = await postWbxml("ResolveRecipients", "dev1", resolveRequest(["Nobody Here"]));
+
+            const resp = findChild(response, "Response")!;
+            expect(childText(resp, "Status")).toBe("4");
+            expect(findChild(resp, "Recipient")).toBeUndefined();
+        });
+
+        it("Resolves multiple To values in one request independently.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+            await createContact(mailbox.uid, folder.uid, {
+                displayName: "Jane Doe",
+                emails: [{ address: "new@example.com", type: ContactAddressKind.OTHER }],
+            });
+
+            const response = await postWbxml("ResolveRecipients", "dev1", resolveRequest(["Jane", "unknown@example.com"]));
+
+            const responses = findChildren(response, "Response");
+            expect(responses.length).toBe(2);
+            expect(childText(responses[0], "Status")).toBe("1");
+            expect(childText(responses[1], "Status")).toBe("1");
+            expect(childText(responses[1], "To")).toBe("unknown@example.com");
+        });
+
+        it("Returns a bare Status 1 with no Response entries when the request has no To values at all.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            const response = await postWbxml("ResolveRecipients", "dev1", resolveRequest([]));
+
+            expect(childText(response, "Status")).toBe("1");
+            expect(findChild(response, "Response")).toBeUndefined();
+        });
+
+        it("Returns a bare Status 1 with no Response entries when the request has no WBXML body at all.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            const response = await postWbxml("ResolveRecipients", "dev1");
+
+            expect(childText(response, "Status")).toBe("1");
+            expect(findChild(response, "Response")).toBeUndefined();
+        });
+
+        it("Treats a To element with no text content as an empty query, reporting Status 4.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            const response = await postWbxml(
+                "ResolveRecipients",
+                "dev1",
+                element(WbxmlCodePage.ResolveRecipients, "ResolveRecipients", [
+                    element(WbxmlCodePage.ResolveRecipients, "To", []),
+                ]),
+            );
+
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("4");
         });
     });
 

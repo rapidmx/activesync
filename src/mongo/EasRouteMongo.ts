@@ -15,6 +15,9 @@ import { ItemOperationsCommandMongo } from "../commands/mongo/ItemOperationsComm
 import { SearchCommandMongo } from "../commands/mongo/SearchCommandMongo.js";
 import { MeetingResponseCommandMongo } from "../commands/mongo/MeetingResponseCommandMongo.js";
 import { SettingsCommandMongo } from "../commands/mongo/SettingsCommandMongo.js";
+import { GetItemEstimateCommandMongo } from "../commands/mongo/GetItemEstimateCommandMongo.js";
+import { MoveItemsCommandMongo } from "../commands/mongo/MoveItemsCommandMongo.js";
+import { ResolveRecipientsCommandMongo } from "../commands/mongo/ResolveRecipientsCommandMongo.js";
 
 /**
  * Mongo-backed concrete `BaseEasRoute`. A deployment mounts this at the well-known EAS path via its own
@@ -38,5 +41,8 @@ export class EasRouteMongo extends BaseEasRoute<DeviceSyncStateMongo, MailboxMon
         MeetingResponseCommandMongo,
         SettingsCommandMongo,
         PingCommand,
+        GetItemEstimateCommandMongo,
+        MoveItemsCommandMongo,
+        ResolveRecipientsCommandMongo,
     ];
 }

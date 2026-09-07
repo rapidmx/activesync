@@ -15,6 +15,9 @@ import { ItemOperationsCommandSQL } from "../commands/sql/ItemOperationsCommandS
 import { SearchCommandSQL } from "../commands/sql/SearchCommandSQL.js";
 import { MeetingResponseCommandSQL } from "../commands/sql/MeetingResponseCommandSQL.js";
 import { SettingsCommandSQL } from "../commands/sql/SettingsCommandSQL.js";
+import { GetItemEstimateCommandSQL } from "../commands/sql/GetItemEstimateCommandSQL.js";
+import { MoveItemsCommandSQL } from "../commands/sql/MoveItemsCommandSQL.js";
+import { ResolveRecipientsCommandSQL } from "../commands/sql/ResolveRecipientsCommandSQL.js";
 
 /**
  * SQL-backed concrete `BaseEasRoute`. See `EasRouteMongo.ts`'s doc comment - the same mounting pattern
@@ -37,5 +40,8 @@ export class EasRouteSQL extends BaseEasRoute<DeviceSyncStateSQL, MailboxSQL> {
         MeetingResponseCommandSQL,
         SettingsCommandSQL,
         PingCommand,
+        GetItemEstimateCommandSQL,
+        MoveItemsCommandSQL,
+        ResolveRecipientsCommandSQL,
     ];
 }
