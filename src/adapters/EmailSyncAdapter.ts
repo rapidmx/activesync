@@ -170,6 +170,17 @@ function parseAddressList(value: string, type: RecipientType): Recipient[] {
         });
 }
 
+/** Strips CR/LF from a value about to be interpolated into a single RFC 5322 header line. `Subject`/`To`/`Cc`
+ * arrive from client-controlled WBXML inline strings (`WbxmlDecoder.readCString()`, which terminates only on a
+ * NUL byte - literal `\r`/`\n` bytes pass through untouched), so without this a crafted value like
+ * `"Hi\r\nBcc: attacker@evil.com"` would inject an arbitrary extra header line (or, via a blank line, a forged
+ * second message) into the constructed MIME below. Folds onto a single line rather than rejecting outright -
+ * a real device is never expected to send this, but a header value silently losing its embedded newlines is
+ * safer than the request failing outright over what a client will never notice either way. */
+function sanitizeHeaderValue(value: string): string {
+    return value.replace(/[\r\n]+/g, " ");
+}
+
 /** Builds a minimal, valid RFC 5322 plain-text message - just enough structure for `simpleParser` (used by
  * `ItemOperationsCommand.fetchMessage`) to read it back correctly. No multipart/HTML/attachments - matches this
  * adapter's own documented pragmatic-subset scope. */
@@ -177,10 +188,10 @@ function buildPlainTextMime(parts: { subject: string; from?: Recipient; recipien
     const to = parts.recipients.filter((r) => r.type === RecipientType.TO).map((r) => formatAddress(r.address, r.displayName));
     const cc = parts.recipients.filter((r) => r.type === RecipientType.CC).map((r) => formatAddress(r.address, r.displayName));
     const headers = [
-        ...(parts.from ? [`From: ${formatAddress(parts.from.address, parts.from.displayName)}`] : []),
-        ...(to.length > 0 ? [`To: ${to.join(", ")}`] : []),
-        ...(cc.length > 0 ? [`Cc: ${cc.join(", ")}`] : []),
-        `Subject: ${parts.subject}`,
+        ...(parts.from ? [`From: ${sanitizeHeaderValue(formatAddress(parts.from.address, parts.from.displayName))}`] : []),
+        ...(to.length > 0 ? [`To: ${sanitizeHeaderValue(to.join(", "))}`] : []),
+        ...(cc.length > 0 ? [`Cc: ${sanitizeHeaderValue(cc.join(", "))}`] : []),
+        `Subject: ${sanitizeHeaderValue(parts.subject)}`,
         `Date: ${parts.date.toUTCString()}`,
         "MIME-Version: 1.0",
         "Content-Type: text/plain; charset=utf-8",

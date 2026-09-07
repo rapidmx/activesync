@@ -154,6 +154,30 @@ describe("EmailSyncAdapter Tests", () => {
             expect(mime).toContain("Body text");
         });
 
+        it("Strips embedded CR/LF from Subject/To before building MIME headers, rather than letting them inject extra header lines.", async () => {
+            const { adapter, put } = buildAdapter();
+            await adapter.fromApplicationData(
+                appData([
+                    textElement(WbxmlCodePage.Email, "Subject", "Hi\r\nBcc: attacker@evil.com\r\nX-Injected: yes"),
+                    textElement(WbxmlCodePage.Email, "To", "victim@example.com"),
+                    element(WbxmlCodePage.AirSyncBase, "Body", [
+                        textElement(WbxmlCodePage.AirSyncBase, "Type", "1"),
+                        textElement(WbxmlCodePage.AirSyncBase, "Data", "Body text"),
+                    ]),
+                ]),
+            );
+
+            const mime = (put.mock.calls[0][1] as Buffer).toString("utf-8");
+            // Exactly one Subject line, folded onto itself - no separate Bcc/X-Injected header line anywhere.
+            expect(mime).toContain("Subject: Hi Bcc: attacker@evil.com X-Injected: yes");
+            expect(mime).not.toMatch(/^Bcc:/m);
+            expect(mime).not.toMatch(/^X-Injected:/m);
+            // The header block still ends with exactly one blank line before the real body - a smuggled blank
+            // line inside Subject would otherwise have terminated the headers early.
+            expect(mime.split("\r\n\r\n").length).toBe(2);
+            expect(mime.endsWith("Body text")).toBe(true);
+        });
+
         it("Omits the To header and includes only Cc when a Draft has Cc but no To recipients.", async () => {
             const { adapter, put } = buildAdapter();
             const partial = await adapter.fromApplicationData(
