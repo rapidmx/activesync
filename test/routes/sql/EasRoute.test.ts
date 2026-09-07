@@ -2220,6 +2220,248 @@ describe("Route:EasRouteSQL Tests", () => {
 
             expect(result.status).toBe(403);
         });
+
+        it("Handles multiple Fetch elements in one request independently.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const messageA = await createMessage(mailbox.uid, folder.uid, { sanitizedHtmlBlobKey: undefined });
+            const messageB = await createMessage(mailbox.uid, folder.uid, { sanitizedHtmlBlobKey: undefined });
+            for (const m of [messageA, messageB]) {
+                await blobStore().put(m.bodyBlobKey, Buffer.from(`Subject: X\r\n\r\nBody for ${m.uid}`), {
+                    contentType: "message/rfc822",
+                });
+            }
+
+            const response = await postWbxml(
+                "ItemOperations",
+                "dev1",
+                element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                    element(WbxmlCodePage.ItemOperations, "Fetch", [
+                        textElement(WbxmlCodePage.ItemOperations, "Store", "Mailbox"),
+                        textElement(WbxmlCodePage.AirSync, "ServerId", messageA.uid),
+                    ]),
+                    element(WbxmlCodePage.ItemOperations, "Fetch", [
+                        textElement(WbxmlCodePage.ItemOperations, "Store", "Mailbox"),
+                        textElement(WbxmlCodePage.AirSync, "ServerId", messageB.uid),
+                    ]),
+                ]),
+            );
+
+            const fetches = findChildren(findChild(response, "Response")!, "Fetch");
+            expect(fetches.length).toBe(2);
+            expect(fetches.map((f) => childText(f, "ServerId")).sort()).toEqual([messageA.uid, messageB.uid].sort());
+        });
+
+        it("Returns the raw MIME source verbatim when BodyPreference Type is 4.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const message = await createMessage(mailbox.uid, folder.uid, { sanitizedHtmlBlobKey: "some/html/key" });
+            const rawMime = "Subject: Raw\r\n\r\nRaw MIME body.";
+            await blobStore().put(message.bodyBlobKey, Buffer.from(rawMime), { contentType: "message/rfc822" });
+
+            const response = await postWbxml(
+                "ItemOperations",
+                "dev1",
+                element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                    element(WbxmlCodePage.ItemOperations, "Fetch", [
+                        textElement(WbxmlCodePage.ItemOperations, "Store", "Mailbox"),
+                        textElement(WbxmlCodePage.AirSync, "ServerId", message.uid),
+                        element(WbxmlCodePage.ItemOperations, "Options", [
+                            element(WbxmlCodePage.AirSyncBase, "BodyPreference", [
+                                textElement(WbxmlCodePage.AirSyncBase, "Type", "4"),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            );
+
+            const fetch = findChild(findChild(response, "Response")!, "Fetch")!;
+            const body = findChild(findChild(fetch, "Properties")!, "Body")!;
+            expect(childText(body, "Type")).toBe("4");
+            expect(childText(body, "Data")).toBe(rawMime);
+        });
+
+        it("Truncates the body to TruncationSize and sets Truncated when the body exceeds it.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const sanitizedHtmlBlobKey = `sanitized/${uuid.v4()}`;
+            await blobStore().put(sanitizedHtmlBlobKey, Buffer.from("0123456789"), { contentType: "text/html" });
+            const message = await createMessage(mailbox.uid, folder.uid, { sanitizedHtmlBlobKey });
+
+            const response = await postWbxml(
+                "ItemOperations",
+                "dev1",
+                element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                    element(WbxmlCodePage.ItemOperations, "Fetch", [
+                        textElement(WbxmlCodePage.ItemOperations, "Store", "Mailbox"),
+                        textElement(WbxmlCodePage.AirSync, "ServerId", message.uid),
+                        element(WbxmlCodePage.ItemOperations, "Options", [
+                            element(WbxmlCodePage.AirSyncBase, "BodyPreference", [
+                                textElement(WbxmlCodePage.AirSyncBase, "Type", "2"),
+                                textElement(WbxmlCodePage.AirSyncBase, "TruncationSize", "4"),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            );
+
+            const fetch = findChild(findChild(response, "Response")!, "Fetch")!;
+            const body = findChild(findChild(fetch, "Properties")!, "Body")!;
+            expect(childText(body, "Data")).toBe("0123");
+            expect(childText(body, "Truncated")).toBe("1");
+        });
+
+        it("Backs off a truncation boundary that would otherwise split a multi-byte UTF-8 character.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const sanitizedHtmlBlobKey = `sanitized/${uuid.v4()}`;
+            // "é" is 2 UTF-8 bytes (0xC3 0xA9) - truncating to 2 bytes total (after the leading "a") would
+            // otherwise land exactly on its trailing continuation byte.
+            await blobStore().put(sanitizedHtmlBlobKey, Buffer.from("aé"), { contentType: "text/html" });
+            const message = await createMessage(mailbox.uid, folder.uid, { sanitizedHtmlBlobKey });
+
+            const response = await postWbxml(
+                "ItemOperations",
+                "dev1",
+                element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                    element(WbxmlCodePage.ItemOperations, "Fetch", [
+                        textElement(WbxmlCodePage.ItemOperations, "Store", "Mailbox"),
+                        textElement(WbxmlCodePage.AirSync, "ServerId", message.uid),
+                        element(WbxmlCodePage.ItemOperations, "Options", [
+                            element(WbxmlCodePage.AirSyncBase, "BodyPreference", [
+                                textElement(WbxmlCodePage.AirSyncBase, "Type", "2"),
+                                textElement(WbxmlCodePage.AirSyncBase, "TruncationSize", "2"),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            );
+
+            const fetch = findChild(findChild(response, "Response")!, "Fetch")!;
+            const body = findChild(findChild(fetch, "Properties")!, "Body")!;
+            expect(childText(body, "Data")).toBe("a");
+            expect(childText(body, "Truncated")).toBe("1");
+        });
+
+        it("Returns 400 for a Fetch with Store DocumentLibrary.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
+                .set("Authorization", "jwt " + ownerToken)
+                .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                .send(
+                    new WbxmlEncoder().encode(
+                        element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                            element(WbxmlCodePage.ItemOperations, "Fetch", [
+                                textElement(WbxmlCodePage.ItemOperations, "Store", "DocumentLibrary"),
+                            ]),
+                        ]),
+                    ),
+                );
+
+            expect(result.status).toBe(400);
+        });
+
+        describe("EmptyFolderContents", () => {
+            it("Soft-deletes every Message in the folder.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Deleted Items", type: FolderType.DELETED_ITEMS });
+                const messageA = await createMessage(mailbox.uid, folder.uid);
+                const messageB = await createMessage(mailbox.uid, folder.uid);
+
+                const response = await postWbxml(
+                    "ItemOperations",
+                    "dev1",
+                    element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                        element(WbxmlCodePage.ItemOperations, "EmptyFolderContents", [
+                            textElement(WbxmlCodePage.AirSync, "CollectionId", folder.uid),
+                        ]),
+                    ]),
+                );
+
+                const empty = findChild(findChild(response, "Response")!, "EmptyFolderContents")!;
+                expect(childText(empty, "Status")).toBe("1");
+
+                const remaining = await messageRepo.findOne({ where: { uid: messageA.uid } });
+                expect(remaining?.deleted).toBe(true);
+                const remainingB = await messageRepo.findOne({ where: { uid: messageB.uid } });
+                expect(remainingB?.deleted).toBe(true);
+            });
+
+            it("Returns 400 when DeleteSubFolders is requested.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Deleted Items", type: FolderType.DELETED_ITEMS });
+
+                const result = await request(server.getApplication())
+                    .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                    .send(
+                        new WbxmlEncoder().encode(
+                            element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                                element(WbxmlCodePage.ItemOperations, "EmptyFolderContents", [
+                                    textElement(WbxmlCodePage.AirSync, "CollectionId", folder.uid),
+                                    element(WbxmlCodePage.ItemOperations, "Options", [
+                                        element(WbxmlCodePage.ItemOperations, "DeleteSubFolders", []),
+                                    ]),
+                                ]),
+                            ]),
+                        ),
+                    );
+
+                expect(result.status).toBe(400);
+            });
+
+            it("Returns 400 when FolderId is missing.", async () => {
+                await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+
+                const result = await request(server.getApplication())
+                    .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                    .send(
+                        new WbxmlEncoder().encode(
+                            element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                                element(WbxmlCodePage.ItemOperations, "EmptyFolderContents", []),
+                            ]),
+                        ),
+                    );
+
+                expect(result.status).toBe(400);
+            });
+
+            it("Returns 403 when the caller has no permission on the folder.", async () => {
+                await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const otherMailbox = await createMailbox(otherUser.uid);
+                const otherFolder = await createFolderWithAcl(otherMailbox.uid, { name: "Other", type: FolderType.USER });
+
+                const result = await request(server.getApplication())
+                    .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                    .send(
+                        new WbxmlEncoder().encode(
+                            element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                                element(WbxmlCodePage.ItemOperations, "EmptyFolderContents", [
+                                    textElement(WbxmlCodePage.AirSync, "CollectionId", otherFolder.uid),
+                                ]),
+                            ]),
+                        ),
+                    );
+
+                expect(result.status).toBe(403);
+            });
+        });
     });
 
     describe("Search command", () => {
