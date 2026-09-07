@@ -18,6 +18,14 @@ follow-up in `@rapidrest/auth`, not this package.
 A [`@rapidmx/autodiscover`](https://github.com/RapidMX/autodiscover) mount lets real clients find this
 package's endpoint from just an email address.
 
+Responds to a client's `OPTIONS` capability probe with real `MS-ASProtocolVersions`/`MS-ASProtocolCommands`
+headers (versions `14.0`/`14.1`, matching the MIME-based `SendMail`/`SmartForward`/`SmartReply` this package
+actually implements). **This requires `@rapidrest/service-core` to include the `hasExplicitOptionsRoute()`
+fix** (so its global CORS middleware lets this route's own `OPTIONS` handler run instead of always answering
+with a blanket preflight `204`) — check that package's own changelog for the version that introduced it; on an
+older `service-core`, `OPTIONS` still always gets the bare `204` and a client falls back to just trying its
+first `POST` directly.
+
 ## Usage
 
 Mount `EasRouteMongo`/`EasRouteSQL` (from `@rapidmx/activesync/mongo` or `/sql`) at the protocol's well-known

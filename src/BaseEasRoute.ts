@@ -18,13 +18,20 @@ import type { WbxmlElement } from "./codec/WbxmlElement.js";
 import type { EasCommandHandler } from "./EasCommandHandler.js";
 import { DeviceSyncState, Mailbox, resolveCallerMailboxUid } from "@rapidmx/restapi";
 const { Init, Logger } = ObjectDecorators;
-const { Auth, Post, Request, Response, User: AuthUser } = RouteDecorators;
+const { Auth, Options, Post, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** HTTP 449 ("Retry With") is not a standard HTTP status, but is the long-established Exchange ActiveSync
  * convention a real client recognizes as "you must successfully complete `Provision` before this command will
  * be honored" - simpler than constructing a command-specific WBXML error body for every possible command a
  * client might send before it's provisioned. */
 const HTTP_STATUS_RETRY_WITH = 449;
+
+/** `MS-ASProtocolVersions` value this library actually implements against: confirmed via `[MS-ASHTTP]` that
+ * "14.0"/"14.1" are the versions whose `ComposeMail`/`Email2` WBXML code pages cover MIME-based
+ * `SendMail`/`SmartForward`/`SmartReply` (what `ComposeMailCommand` actually sends) - not 12.x (which predates
+ * MIME-based compose) and not 16.0/16.1 (whose `Oof`/`RightsManagementInformation` additions this library's
+ * `SettingsCommand` doesn't implement). Ascending, matching the order Microsoft's own spec lists them in. */
+const MS_AS_PROTOCOL_VERSIONS = "14.0,14.1";
 
 function firstQueryValue(value: string | string[] | undefined): string | undefined {
     return Array.isArray(value) ? value[0] : value;
@@ -54,17 +61,13 @@ function firstQueryValue(value: string | string[] | undefined): string | undefin
  * `@Init` via `ObjectFactory`, so a handler can `@Inject` its own dependencies like any other DI-managed class
  * in this library.
  *
- * **KNOWN LIMITATION - no `OPTIONS` protocol discovery**: real EAS clients conventionally probe `OPTIONS`
- * before their first `POST` to read `MS-ASProtocolVersions`/`MS-ASProtocolCommands` and learn what the server
- * supports. This class deliberately does not implement that: `Server.ts`'s global CORS middleware
- * unconditionally intercepts every `OPTIONS` request (any method, any path) with a bare `204` before request
- * handling ever reaches an app-registered route — confirmed by reading `Server.ts` and by a real HTTP-level
- * test against this exact route, not assumed — so an app-level `@Options()` handler here would be genuine
- * dead code, never actually invoked. Fixing this properly belongs in `service-core`'s CORS middleware (e.g.
- * only short-circuiting when no matching route registers its own `OPTIONS` handler), a cross-cutting change
- * affecting every app on this framework, not something to work around locally in one route. Real-device
- * testing (this phase's own next milestone gate) will show whether a client actually depends on this
- * discovery step or tolerates a manually-configured server address without it.
+ * **`OPTIONS` protocol discovery**: real EAS clients conventionally probe `OPTIONS` before their first `POST`
+ * to read `MS-ASProtocolVersions`/`MS-ASProtocolCommands` and learn what the server supports - see `options()`
+ * below. This only actually runs on a `@rapidrest/service-core` version whose global CORS middleware consults
+ * `IHttpRouter.hasExplicitOptionsRoute()` before its blanket preflight `204` (added upstream alongside this
+ * handler); on an older `service-core` the CORS middleware still intercepts every `OPTIONS` request
+ * unconditionally and this method is unreachable dead code, exactly as before - confirmed by reading
+ * `Server.ts` directly, not assumed.
  *
  * `deviceSyncStateClass`/`mailboxClass` are supplied by the Mongo/SQL concrete subclasses, following the exact
  * one-line-per-backend pattern used throughout this library's other routes/jobs.
@@ -104,6 +107,22 @@ export abstract class BaseEasRoute<D extends DeviceSyncState, M extends Mailbox 
             const handler: EasCommandHandler = await this._objectFactory!.newInstance(HandlerClass);
             this.handlers.set(handler.command, handler);
         }
+    }
+
+    /**
+     * Answers a real client's pre-flight `MS-ASProtocolVersions`/`MS-ASProtocolCommands` capability probe -
+     * see this class's own doc comment for the `service-core` version dependency this needs to actually run.
+     * Deliberately unauthenticated (no `@Auth`): this is capability discovery, not mailbox access, and a real
+     * Exchange server answers it the same way regardless of credentials. `MS-ASProtocolCommands` is built from
+     * `this.handlers`, not a separately-maintained list, so it can never drift out of sync with the commands a
+     * concrete subclass actually registered via `commandHandlerClasses`.
+     */
+    @Options()
+    public async options(@Response res: HttpResponse): Promise<void> {
+        res.setHeader("MS-ASProtocolVersions", MS_AS_PROTOCOL_VERSIONS)
+            .setHeader("MS-ASProtocolCommands", Array.from(this.handlers.keys()).join(","))
+            .status(200)
+            .send();
     }
 
     @Auth(["jwt"])

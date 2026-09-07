@@ -30,9 +30,10 @@ Keep entries terse — this is a reference, not a transcript.
   there, moved to this repo's own root (not nested under an `eas/` folder).
 - Depends on [`@rapidmx/restapi`](https://github.com/RapidMX/restapi) for the mailbox/folder/message/
   contact/calendar/task models, `resolveCallerMailboxUid`/`RecoverableRepoUtils`/`sendComposedMime`
-  REST-layer helpers, `BlobStore`, and the scan pipeline. Linked locally via Yarn Berry's
-  `portal:../restapi` (both repos are expected to live as siblings under `d:\github\rapidmx\`) until
-  this package is actually published, at which point the `peerDependencies` semver range takes over.
+  REST-layer helpers, `BlobStore`, and the scan pipeline. Originally linked locally via Yarn Berry's
+  `portal:../restapi`; switched to the real published `^0.1.0` once JP published it to npm - see the
+  very next bullet for exactly why the portal approach was a real problem, not just a temporary
+  convenience.
 - **Mechanical migration gotcha** (same one hit in the `autodiscover` split, see that repo's notes
   for the fuller writeup): several distinct old import targets collapse onto the same new
   `@rapidmx/restapi` specifier, producing duplicate-import lint errors that needed hand-merging in
@@ -66,3 +67,47 @@ Keep entries terse — this is a reference, not a transcript.
   per-command `EasCollectionSyncAdapter`s, and every other decision baked into this code, see the
   monolith's own `.claude/NOTES.md` (`d:\github\rapidrest\mail`) — that history wasn't duplicated
   here since it predates this repo's existence.
+
+### 2026-09-07 — Spec-compliance audit: real `OPTIONS` discovery added; Sync gap clarified
+
+- **JP asked whether this package is fully `MS-ASCMD`-compliant or a partial subset.** Answer: partial,
+  deliberately. Real gaps beyond the ones already documented in `README.md`/source comments, confirmed
+  by reading the actual handler code (not recalled from memory):
+  - `SyncCommand.handle()` never reads the request's own `<Commands>` element at all - no
+    `findChild(collection, "Commands")` anywhere in the file. A real client's device-originated
+    `Add`/`Change`/`Delete` (e.g. creating a new Contact/Calendar event/Task directly in the phone's
+    native app, or saving a Drafts-folder item) is silently dropped - not rejected, not erred, just
+    never looked at. `SendMail`/`SmartForward`/`SmartReply` are unaffected (separate commands, already
+    fully working) - only Contacts/Calendar/Tasks/Drafts creation-on-device is the real gap.
+  - No `OPTIONS` capability discovery (now fixed, see below).
+  - Auth (`@Auth(["jwt"])`, no OAuth Authorization Server of its own) - JP confirmed this is **already**
+    solved at the deployment level: `@rapidrest/auth`/`@rapidrest/auth-server` mint the JWT, and
+    `auth.mydomain.com`/`mail.mydomain.com` sharing one parent domain means the browser/OS hands that
+    JWT to this package via a domain-level cookie automatically. Not a gap in practice for that
+    deployment shape - the `README.md` wording ("tracked as a follow-up in `@rapidrest/auth`") stays
+    accurate as written (it correctly says the piece lives outside this package), just worth recording
+    that it's not an open problem for JP's own actual deployment.
+- **Fixed the `OPTIONS` discovery gap for real**, across two repos:
+  1. `@rapidrest/service-core` (`d:\github\rapidrest\service-core`, a sibling checkout - not one of the
+     four split packages): added `IHttpRouter.hasExplicitOptionsRoute(path)` (implemented in both
+     `HttpRouter`/uWS and `BunRouter`/Bun, tracking literal non-`/*` paths registered via `.options()`,
+     normalized for a trailing-slash mismatch either side), and changed `Server.ts`'s global CORS
+     middleware to skip its blanket preflight `204` when that returns `true` for the request path -
+     letting an app's own `@Options()` handler run instead. Verified via the full existing suite
+     (1153/1153 passing) plus new unit tests on both routers and a new end-to-end `Server.test.ts` case
+     (a fixture `@Options("capabilities")` route now actually answers with its own JSON body, while an
+     unregistered path still gets the old blanket `204`). **Left uncommitted in that repo** - it's JP's
+     own separate project, not something to commit without being asked there specifically.
+  2. This repo: `BaseEasRoute.ts` gained a real `@Options()` handler (deliberately unauthenticated,
+     matching real Exchange's own posture - capability discovery isn't mailbox access) answering
+     `MS-ASProtocolVersions: 14.0,14.1` (confirmed via `[MS-ASHTTP]`/`[MS-ASWBXML]` research - 14.0 is
+     the floor for the MIME-based `ComposeMail` code page this package's `SendMail`/`SmartForward`/
+     `SmartReply` actually use; 16.0/16.1's `Oof`/`RightsManagementInformation` aren't implemented, so
+     not claimed) and `MS-ASProtocolCommands` built dynamically from `this.handlers.keys()` (never a
+     separately-maintained list that could drift from what a concrete subclass actually registers).
+     **This only takes effect once the app's `@rapidrest/service-core` dependency actually includes the
+     fix above** - on today's currently-published `service-core`, the CORS middleware still always
+     answers `OPTIONS` with a bare `204` before this handler is ever reached. Tested via a direct
+     method call in `test/routes/BaseEasRoute.test.ts` (proving the handler's own header-building logic
+     is correct) rather than a real HTTP round trip, since the currently-pinned published `service-core`
+     wouldn't exercise the new code path at all yet.
