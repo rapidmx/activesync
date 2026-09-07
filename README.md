@@ -22,7 +22,7 @@ A [`@rapidmx/autodiscover`](https://github.com/RapidMX/autodiscover) mount lets 
 package's endpoint from just an email address.
 
 Responds to a client's `OPTIONS` capability probe with real `MS-ASProtocolVersions`/`MS-ASProtocolCommands`
-headers (versions `14.0`/`14.1`, matching the MIME-based `SendMail`/`SmartForward`/`SmartReply` this package
+headers (versions `14.0`/`14.1`/`16.0`/`16.1`, matching the MIME-based `SendMail`/`SmartForward`/`SmartReply` this package
 actually implements). This requires `@rapidrest/service-core` >=1.5.0 (the version that added
 `hasExplicitOptionsRoute()`, letting this route's own `OPTIONS` handler run instead of the framework's global
 CORS middleware always answering with a blanket preflight `204`) — this package's own `peerDependencies`

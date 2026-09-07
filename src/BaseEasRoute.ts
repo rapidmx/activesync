@@ -30,9 +30,14 @@ const HTTP_STATUS_RETRY_WITH = 449;
 /** `MS-ASProtocolVersions` value this library actually implements against: confirmed via `[MS-ASHTTP]` that
  * "14.0"/"14.1" are the versions whose `ComposeMail`/`Email2` WBXML code pages cover MIME-based
  * `SendMail`/`SmartForward`/`SmartReply` (what `ComposeMailCommand` actually sends) - not 12.x (which predates
- * MIME-based compose) and not 16.0/16.1 (whose `Oof`/`RightsManagementInformation` additions this library's
- * `SettingsCommand` doesn't implement). Ascending, matching the order Microsoft's own spec lists them in. */
-const MS_AS_PROTOCOL_VERSIONS = "14.0,14.1";
+ * MIME-based compose). `16.0`/`16.1` are now included too, now that `SettingsCommand` implements `Oof` (their
+ * other headline addition, `RightsManagementInformation`, remains unimplemented, but that alone doesn't gate
+ * the version string - `MS-ASProtocolCommands` below is the real capability gate, derived live from
+ * `this.handlers`, so a client probing capabilities correctly sees any specific unsupported command regardless
+ * of which protocol versions are declared, exactly as it already does for `GetItemEstimate`/`MoveItems`/
+ * `ResolveRecipients`). No MS-ASCMD `Sync`/`FolderSync`/`Provision` schema element became newly mandatory
+ * between 14.1 and 16.1 outside `Oof`/IRM. Ascending, matching the order Microsoft's own spec lists them in. */
+const MS_AS_PROTOCOL_VERSIONS = "14.0,14.1,16.0,16.1";
 
 function firstQueryValue(value: string | string[] | undefined): string | undefined {
     return Array.isArray(value) ? value[0] : value;

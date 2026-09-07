@@ -5,22 +5,29 @@
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
-import { element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
+import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 import type { Mailbox } from "@rapidmx/restapi";
 const { Init } = ObjectDecorators;
 
 /**
  * Handles EAS `Settings`: the first-run/general-purpose device<->server settings exchange. This pragmatic
- * subset supports only the two sub-elements every real client actually depends on to finish account setup:
+ * subset supports the sub-elements every real client actually depends on:
  *
  * - `UserInformation`/`Get`: returns the mailbox's `primarySmtpAddress`/`aliasAddresses` as `EmailAddresses`.
  * - `DeviceInformation`/`Set`: acknowledged with `Status 1` but not persisted anywhere - `DeviceSyncState` has
  * no fields for a device's model/IMEI/OS/friendly name, and nothing else in this library currently consumes
  * them. A real client only requires the acknowledgement to proceed past first-run setup, not that the values
  * are retrievable later.
- * - `Oof` (out-of-office) and `RightsManagementInformation` are not implemented - deferred, matching this
- * library's "pragmatic subset" precedent elsewhere (e.g. `ComposeMailCommand`'s own documented gaps).
+ * - `Oof`/`Get` and `Oof`/`Set`: reads/writes `Mailbox.oofEnabled`/`oofMessage`/`oofStartTime`/`oofEndTime`.
+ * `StartTime`/`EndTime` use MS-ASDTYPE's plain `dateTime` type (`Date.prototype.toISOString()`), not Compact
+ * DateTime - confirmed against MS-ASSETTINGS directly, unlike `Calendar`/`Tasks`' timestamp fields (see
+ * `CompactDateTime.ts`'s own doc comment on that exact distinction). A single combined reply message is stored
+ * rather than the spec's three audience-specific `OofMessage` variants (internal/external-known/
+ * external-unknown) - matches this codebase's existing "one thing, not three" simplification precedent (e.g.
+ * `ContactsSyncAdapter`'s single-slot phone/email handling).
+ * - `RightsManagementInformation` is not implemented - deferred, matching this library's "pragmatic subset"
+ * precedent elsewhere (e.g. `ComposeMailCommand`'s own documented gaps).
  *
  * `mailboxClass` is supplied by the Mongo/SQL concrete subclasses.
  *
@@ -73,6 +80,74 @@ export abstract class SettingsCommand implements EasCommandHandler {
             );
         }
 
+        const oofEl = ctx.request ? findChild(ctx.request, "Oof") : undefined;
+        if (oofEl) {
+            const mailbox: (Mailbox & { uid: string; version: number }) | undefined = await this.mailboxRepo.findOne(
+                ctx.mailboxUid,
+                { ignoreACL: true },
+            );
+            if (!mailbox) {
+                throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+            }
+            const setEl = findChild(oofEl, "Set");
+            children.push(setEl ? await this.setOof(ctx, mailbox, setEl) : this.getOof(mailbox));
+        }
+
         return element(WbxmlCodePage.Settings, "Settings", children);
+    }
+
+    /** `OofState`: `0`=disabled, `1`=enabled indefinitely, `2`=time-based (only while now is within
+     * `StartTime`/`EndTime`). */
+    private getOof(mailbox: Mailbox): WbxmlElement {
+        const timed = mailbox.oofEnabled && !!mailbox.oofStartTime && !!mailbox.oofEndTime;
+        return element(WbxmlCodePage.Settings, "Oof", [
+            textElement(WbxmlCodePage.Settings, "Status", "1"),
+            element(WbxmlCodePage.Settings, "Get", [
+                textElement(WbxmlCodePage.Settings, "OofState", mailbox.oofEnabled ? (timed ? "2" : "1") : "0"),
+                ...(timed
+                    ? [
+                          textElement(WbxmlCodePage.Settings, "StartTime", mailbox.oofStartTime!.toISOString()),
+                          textElement(WbxmlCodePage.Settings, "EndTime", mailbox.oofEndTime!.toISOString()),
+                      ]
+                    : []),
+                element(WbxmlCodePage.Settings, "OofMessage", [
+                    element(WbxmlCodePage.Settings, "AppliesToInternal", []),
+                    textElement(WbxmlCodePage.Settings, "Enabled", mailbox.oofEnabled ? "1" : "0"),
+                    textElement(WbxmlCodePage.Settings, "ReplyMessage", mailbox.oofMessage),
+                    textElement(WbxmlCodePage.Settings, "BodyType", "Text"),
+                ]),
+            ]),
+        ]);
+    }
+
+    private async setOof(
+        ctx: EasCommandContext,
+        mailbox: Mailbox & { uid: string; version: number },
+        setEl: WbxmlElement,
+    ): Promise<WbxmlElement> {
+        const oofState = childText(setEl, "OofState") ?? "0";
+        const oofMessageEl = findChild(setEl, "OofMessage");
+        const replyMessage = oofMessageEl ? (childText(oofMessageEl, "ReplyMessage") ?? "") : "";
+        const startTime = childText(setEl, "StartTime");
+        const endTime = childText(setEl, "EndTime");
+        const timed = oofState === "2" && startTime !== undefined && endTime !== undefined;
+
+        await this.mailboxRepo!.update(
+            {
+                uid: mailbox.uid,
+                version: mailbox.version,
+                oofEnabled: oofState !== "0",
+                oofMessage: replyMessage,
+                oofStartTime: timed ? new Date(startTime) : undefined,
+                oofEndTime: timed ? new Date(endTime) : undefined,
+            } as any,
+            mailbox,
+            { ignoreACL: true, user: ctx.user },
+        );
+
+        return element(WbxmlCodePage.Settings, "Oof", [
+            textElement(WbxmlCodePage.Settings, "Status", "1"),
+            element(WbxmlCodePage.Settings, "Set", [textElement(WbxmlCodePage.Settings, "Status", "1")]),
+        ]);
     }
 }

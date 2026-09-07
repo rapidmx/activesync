@@ -22,7 +22,7 @@ describe("SettingsCommand Tests (guard clauses only)", () => {
         await expect(command.handle({})).rejects.toThrow(/internal error/i);
     });
 
-    it("handle() throws NOT_FOUND when the caller's own mailbox has vanished since being resolved.", async () => {
+    it("handle() throws NOT_FOUND when the caller's own mailbox has vanished since being resolved (UserInformation).", async () => {
         const objectFactory = new ObjectFactory(config, Logger());
         const command = objectFactory.newInstance<SettingsCommandMongo>(SettingsCommandMongo, { initialize: false });
         (command as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue(undefined) };
@@ -31,6 +31,21 @@ describe("SettingsCommand Tests (guard clauses only)", () => {
             mailboxUid: "mbx-1",
             request: element(WbxmlCodePage.Settings, "Settings", [
                 element(WbxmlCodePage.Settings, "UserInformation", [element(WbxmlCodePage.Settings, "Get", [])]),
+            ]),
+        } as unknown as EasCommandContext;
+
+        await expect(command.handle(ctx)).rejects.toThrow(/no resource could be found/i);
+    });
+
+    it("handle() throws NOT_FOUND when the caller's own mailbox has vanished since being resolved (Oof).", async () => {
+        const objectFactory = new ObjectFactory(config, Logger());
+        const command = objectFactory.newInstance<SettingsCommandMongo>(SettingsCommandMongo, { initialize: false });
+        (command as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue(undefined) };
+
+        const ctx = {
+            mailboxUid: "mbx-1",
+            request: element(WbxmlCodePage.Settings, "Settings", [
+                element(WbxmlCodePage.Settings, "Oof", [element(WbxmlCodePage.Settings, "Get", [])]),
             ]),
         } as unknown as EasCommandContext;
 

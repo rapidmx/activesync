@@ -94,7 +94,7 @@ describe("BaseEasRoute Tests (guard clauses only)", () => {
         const res = makeRes();
         await route.options(res);
 
-        expect(res.setHeader).toHaveBeenCalledWith("MS-ASProtocolVersions", "14.0,14.1");
+        expect(res.setHeader).toHaveBeenCalledWith("MS-ASProtocolVersions", "14.0,14.1,16.0,16.1");
         expect(res.setHeader).toHaveBeenCalledWith("MS-ASProtocolCommands", "FolderSync,Sync");
         expect(res.status).toHaveBeenCalledWith(200);
         expect(res.send).toHaveBeenCalledWith();

@@ -325,7 +325,7 @@ describe("Route:EasRouteMongo Tests", () => {
         it("Answers with MS-ASProtocolVersions/MS-ASProtocolCommands rather than the generic CORS preflight 204.", async () => {
             const result = await request(server.getApplication()).options(baseUrl);
             expect(result.status).toBe(200);
-            expect(result.headers["ms-asprotocolversions"]).toBe("14.0,14.1");
+            expect(result.headers["ms-asprotocolversions"]).toBe("14.0,14.1,16.0,16.1");
             expect(result.headers["ms-asprotocolcommands"]).toContain("FolderSync");
         });
     });
@@ -2643,6 +2643,142 @@ describe("Route:EasRouteMongo Tests", () => {
             const deviceInfo = findChild(response, "DeviceInformation")!;
             expect(childText(deviceInfo, "Status")).toBe("1");
             expect(findChild(response, "UserInformation")).toBeUndefined();
+        });
+
+        describe("Oof", () => {
+            it("Get returns OofState 0 with an empty ReplyMessage before Oof has ever been configured.", async () => {
+                await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+
+                const response = await postWbxml(
+                    "Settings",
+                    "dev1",
+                    element(WbxmlCodePage.Settings, "Settings", [
+                        element(WbxmlCodePage.Settings, "Oof", [element(WbxmlCodePage.Settings, "Get", [])]),
+                    ]),
+                );
+
+                const oof = findChild(response, "Oof")!;
+                expect(childText(oof, "Status")).toBe("1");
+                const get = findChild(oof, "Get")!;
+                expect(childText(get, "OofState")).toBe("0");
+                expect(findChild(get, "StartTime")).toBeUndefined();
+                const oofMessage = findChild(get, "OofMessage")!;
+                expect(childText(oofMessage, "Enabled")).toBe("0");
+                expect(childText(oofMessage, "ReplyMessage")).toBe("");
+            });
+
+            it("Set enables Oof indefinitely, and a subsequent Get reflects it.", async () => {
+                await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+
+                const setResponse = await postWbxml(
+                    "Settings",
+                    "dev1",
+                    element(WbxmlCodePage.Settings, "Settings", [
+                        element(WbxmlCodePage.Settings, "Oof", [
+                            element(WbxmlCodePage.Settings, "Set", [
+                                textElement(WbxmlCodePage.Settings, "OofState", "1"),
+                                element(WbxmlCodePage.Settings, "OofMessage", [
+                                    textElement(WbxmlCodePage.Settings, "ReplyMessage", "I am out of office."),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                );
+                const setOof = findChild(setResponse, "Oof")!;
+                expect(childText(setOof, "Status")).toBe("1");
+                expect(childText(findChild(setOof, "Set")!, "Status")).toBe("1");
+
+                const getResponse = await postWbxml(
+                    "Settings",
+                    "dev1",
+                    element(WbxmlCodePage.Settings, "Settings", [
+                        element(WbxmlCodePage.Settings, "Oof", [element(WbxmlCodePage.Settings, "Get", [])]),
+                    ]),
+                );
+                const get = findChild(findChild(getResponse, "Oof")!, "Get")!;
+                expect(childText(get, "OofState")).toBe("1");
+                expect(findChild(get, "StartTime")).toBeUndefined();
+                const oofMessage = findChild(get, "OofMessage")!;
+                expect(childText(oofMessage, "Enabled")).toBe("1");
+                expect(childText(oofMessage, "ReplyMessage")).toBe("I am out of office.");
+            });
+
+            it("Set with OofState 2 stores a time-based window, and a subsequent Get reports StartTime/EndTime.", async () => {
+                await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const startTime = new Date("2026-06-01T00:00:00.000Z");
+                const endTime = new Date("2026-06-08T00:00:00.000Z");
+
+                await postWbxml(
+                    "Settings",
+                    "dev1",
+                    element(WbxmlCodePage.Settings, "Settings", [
+                        element(WbxmlCodePage.Settings, "Oof", [
+                            element(WbxmlCodePage.Settings, "Set", [
+                                textElement(WbxmlCodePage.Settings, "OofState", "2"),
+                                textElement(WbxmlCodePage.Settings, "StartTime", startTime.toISOString()),
+                                textElement(WbxmlCodePage.Settings, "EndTime", endTime.toISOString()),
+                                element(WbxmlCodePage.Settings, "OofMessage", [
+                                    textElement(WbxmlCodePage.Settings, "ReplyMessage", "Back next week."),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                const getResponse = await postWbxml(
+                    "Settings",
+                    "dev1",
+                    element(WbxmlCodePage.Settings, "Settings", [
+                        element(WbxmlCodePage.Settings, "Oof", [element(WbxmlCodePage.Settings, "Get", [])]),
+                    ]),
+                );
+                const get = findChild(findChild(getResponse, "Oof")!, "Get")!;
+                expect(childText(get, "OofState")).toBe("2");
+                expect(childText(get, "StartTime")).toBe(startTime.toISOString());
+                expect(childText(get, "EndTime")).toBe(endTime.toISOString());
+            });
+
+            it("Set with OofState 0 disables Oof, clearing any previously stored time window.", async () => {
+                await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                await postWbxml(
+                    "Settings",
+                    "dev1",
+                    element(WbxmlCodePage.Settings, "Settings", [
+                        element(WbxmlCodePage.Settings, "Oof", [
+                            element(WbxmlCodePage.Settings, "Set", [
+                                textElement(WbxmlCodePage.Settings, "OofState", "2"),
+                                textElement(WbxmlCodePage.Settings, "StartTime", "2026-06-01T00:00:00.000Z"),
+                                textElement(WbxmlCodePage.Settings, "EndTime", "2026-06-08T00:00:00.000Z"),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                await postWbxml(
+                    "Settings",
+                    "dev1",
+                    element(WbxmlCodePage.Settings, "Settings", [
+                        element(WbxmlCodePage.Settings, "Oof", [
+                            element(WbxmlCodePage.Settings, "Set", [textElement(WbxmlCodePage.Settings, "OofState", "0")]),
+                        ]),
+                    ]),
+                );
+
+                const getResponse = await postWbxml(
+                    "Settings",
+                    "dev1",
+                    element(WbxmlCodePage.Settings, "Settings", [
+                        element(WbxmlCodePage.Settings, "Oof", [element(WbxmlCodePage.Settings, "Get", [])]),
+                    ]),
+                );
+                const get = findChild(findChild(getResponse, "Oof")!, "Get")!;
+                expect(childText(get, "OofState")).toBe("0");
+                expect(findChild(get, "StartTime")).toBeUndefined();
+            });
         });
     });
 });
