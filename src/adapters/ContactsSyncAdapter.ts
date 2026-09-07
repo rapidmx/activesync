@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
-import { element, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
+import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCollectionSyncAdapter } from "./EasCollectionSyncAdapter.js";
 import { type Contact, type ContactPostalAddress, ContactAddressKind } from "@rapidmx/restapi";
 
@@ -89,5 +89,78 @@ export class ContactsSyncAdapter implements EasCollectionSyncAdapter<Contact> {
         return parts
             .filter((part): part is [string, string] => part[1] !== undefined)
             .map(([tag, value]) => textElement(WbxmlCodePage.Contacts, tag, value));
+    }
+
+    /**
+     * Reverse of `toApplicationData`. Scalar fields (`FileAs`/`FirstName`/.../`JobTitle`, and the `Body`
+     * `notes`) are properly ghosted - a field's own tag missing from `el` leaves that `Contact` field
+     * untouched. `emails`/`phones`/`addresses` are ghosted only as a **whole group**, not per slot: if *none*
+     * of a group's tags are present the group is left untouched, but if *any* one is, the entire group is
+     * rebuilt from just what's present in `el` (a real client's own Contacts edit UI typically resends every
+     * field it manages anyway, so this only under-preserves data for a client that deliberately sends a
+     * single-slot partial update within one of these groups - a documented simplification, not silent data
+     * loss for the common case). Emails lose their original `type` on any round trip through a `Change`
+     * (rebuilt as `ContactAddressKind.OTHER`) since EAS's own `Email1/2/3Address` tags carry no kind at all,
+     * matching `toApplicationData`'s own already-documented encode-side loss of the same information.
+     */
+    public fromApplicationData(el: WbxmlElement): Partial<Contact> {
+        const partial: Partial<Contact> = {};
+
+        const fileAs = childText(el, "FileAs");
+        if (fileAs !== undefined) partial.displayName = fileAs;
+        const firstName = childText(el, "FirstName");
+        if (firstName !== undefined) partial.givenName = firstName;
+        const lastName = childText(el, "LastName");
+        if (lastName !== undefined) partial.surname = lastName;
+        const companyName = childText(el, "CompanyName");
+        if (companyName !== undefined) partial.company = companyName;
+        const jobTitle = childText(el, "JobTitle");
+        if (jobTitle !== undefined) partial.jobTitle = jobTitle;
+
+        if (EMAIL_TAGS.some((tag) => findChild(el, tag))) {
+            partial.emails = EMAIL_TAGS.map((tag) => childText(el, tag))
+                .filter((address): address is string => !!address)
+                .map((address) => ({ address, type: ContactAddressKind.OTHER }));
+        }
+
+        const phoneEntries = Object.entries(PHONE_TAG) as [ContactAddressKind, string][];
+        if (phoneEntries.some(([, tag]) => findChild(el, tag))) {
+            partial.phones = phoneEntries
+                .map(([type, tag]) => ({ type, phoneNumber: childText(el, tag) }))
+                .filter((phone): phone is { type: ContactAddressKind; phoneNumber: string } => !!phone.phoneNumber);
+        }
+
+        const addressKinds = Object.values(ContactAddressKind);
+        const touchedKinds = addressKinds.filter((kind) => this.addressTags(kind).some((tag) => findChild(el, tag)));
+        if (touchedKinds.length > 0) {
+            partial.addresses = touchedKinds
+                .map((kind) => this.parseAddress(el, kind))
+                .filter((address): address is ContactPostalAddress => address !== undefined);
+        }
+
+        const bodyEl = findChild(el, "Body");
+        const notes = bodyEl ? childText(bodyEl, "Data") : undefined;
+        if (notes !== undefined) partial.notes = notes;
+
+        return partial;
+    }
+
+    private addressTags(kind: ContactAddressKind): string[] {
+        const prefix = ADDRESS_PREFIX[kind];
+        return [`${prefix}Street`, `${prefix}City`, `${prefix}State`, `${prefix}PostalCode`, `${prefix}Country`];
+    }
+
+    private parseAddress(el: WbxmlElement, kind: ContactAddressKind): ContactPostalAddress | undefined {
+        const prefix = ADDRESS_PREFIX[kind];
+        const address: ContactPostalAddress = {
+            type: kind,
+            street: childText(el, `${prefix}Street`),
+            city: childText(el, `${prefix}City`),
+            state: childText(el, `${prefix}State`),
+            postalCode: childText(el, `${prefix}PostalCode`),
+            country: childText(el, `${prefix}Country`),
+        };
+        const hasAnyField = address.street || address.city || address.state || address.postalCode || address.country;
+        return hasAnyField ? address : undefined;
     }
 }

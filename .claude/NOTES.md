@@ -111,3 +111,57 @@ Keep entries terse — this is a reference, not a transcript.
      method call in `test/routes/BaseEasRoute.test.ts` (proving the handler's own header-building logic
      is correct) rather than a real HTTP round trip, since the currently-pinned published `service-core`
      wouldn't exercise the new code path at all yet.
+
+### 2026-09-06 — Closed the client-originated Sync `Commands` gap (audit item #4)
+
+- **JP confirmed this specific gap (not `SendMail`, already working) should be fixed now.** `SyncCommand`
+  now reads the request's own `<Commands>` element and applies `Add`/`Change`/`Delete` for
+  `Contacts`/`Calendar`/`Tasks` - a device creating/editing/deleting an item directly (the normal way a
+  phone's native Contacts/Calendar/Tasks apps behave against an EAS account) now actually persists.
+  `Email` accepts `Delete` only - `Add`/`Change` still answered with Status `6`, since `[MS-ASCMD]` itself
+  disallows non-draft email `Add` and this pragmatic subset doesn't implement Drafts-via-`Add` or
+  Read/Flagged-via-`Change` (composing/sending goes through `SendMailCommand` instead) - a documented gap,
+  not silently dropped, same as before.
+- Verified the exact `Responses`-element inclusion rule from `[MS-ASCMD]`'s own "Add (Sync)"/"Sync" spec
+  pages rather than assuming it: `Add` always gets a `Responses/Add` entry (must report the assigned
+  `ServerId`); `Change`/`Delete` only get one on **failure** - a silent response means "assume it worked."
+  Status codes used: `1` success, `6` client/server conversion error (malformed item, or no adapter support
+  at all for that collection/operation), `7` conflict (optimistic-concurrency version mismatch), `8` object
+  not found.
+- `EasCollectionSyncAdapter` gained two **optional** interface members - optional is the deliberate
+  capability-gate mechanism, not a separate flag that could drift out of sync with what an adapter actually
+  implements:
+  - `fromApplicationData(el, existing?)`: the reverse of each adapter's existing `toApplicationData`,
+    implemented for `Contacts`/`Calendar`/`Tasks` (not `Email`). Ghosts per MS-ASCMD's own rule - a field's
+    tag missing from the request means "leave it unchanged," not "clear it" - so the same method serves
+    both `Add` (partial merged onto a fresh entity) and `Change` (partial merged onto `existing`).
+  - `newEntityDefaults()`: supplies defaults a brand-new entity needs regardless of what the client sent.
+    Only `CalendarSyncAdapter` implements it (`icalUid`/`sequence`) - EAS's own `Add` has no wire
+    representation for either, and the model's own constructor default of `icalUid: ""` for every
+    Sync-created event would violate RFC 5545's uniqueness expectation for `UID`. Mirrors MAPI's identical
+    `RopSaveChangesMessageHandler` pattern (`${crypto.randomUUID()}@mapi`), `@eas` suffix instead.
+- `SyncCommand`'s own `@Init` now builds `RecoverableRepoUtils` (from `@rapidmx/restapi`) instead of plain
+  `RepoUtils` - the exact same fix `BaseMapiEmsmdbRoute.ts` already needed for MAPI, necessary here because
+  `SyncCommand` now originates its own soft-deletes via `applyDelete` (plain `RepoUtils.delete()` doesn't
+  bump `dateModified`/`version`, which would silently break this same class's own watermark-based deletion
+  detection for anything deleted via `Sync` instead of the REST API).
+- Watermark advancement: computed the outgoing `changes` (server-side Adds/Changes/Deletes to report)
+  against the *old* watermark, *before* applying this round's own incoming `Commands` - otherwise a
+  client's own fresh write would echo straight back as a `Commands` entry in the very same response. After
+  applying, the persisted watermark only ever extends forward past what `computeChanges()` itself already
+  found (`Math.max` against the actual `dateModified` of successful writes) - never jumps straight to "now"
+  unconditionally, which would silently skip not-yet-enumerated pending changes whenever
+  `changes.moreAvailable` is `true`.
+- **Testing split**: real version-conflict (Status `7`) and several malformed-item/no-adapter branches
+  can't be reached through a real single-request HTTP+DB round trip by construction (`SyncCommand` always
+  echoes back the `version` it just read in the same request, so `applyChange`'s own optimistic-concurrency
+  check can only fail from a genuine concurrent write racing between its `findOne()` and `update()` calls -
+  not reproducible deterministically over real HTTP). Added a new isolated `test/commands/SyncCommand.test.ts`
+  (fake repo/adapter doubles, same "poke a private field, mirror `MeetingResponseCommand.test.ts`'s own
+  precedent for an unreproducible race" pattern already used elsewhere in this repo) for those branches,
+  alongside real HTTP+DB round-trip tests in both `test/routes/{mongo,sql}/EasRoute.test.ts` for the
+  reachable happy/not-found paths (Contacts/Calendar/Tasks Add creating a real persisted record, Calendar
+  Add's `icalUid`/`sequence` defaults, Contacts Change/Delete against a real record, Email Add rejected,
+  Email Delete accepted) and new `fromApplicationData` unit tests per adapter
+  (`test/adapters/{Contacts,Calendar,Tasks}SyncAdapter.test.ts`, new files - ghosting/error-path edge cases
+  are far more precise to verify directly than by threading malformed WBXML through a full round trip).

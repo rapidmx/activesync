@@ -1192,6 +1192,289 @@ describe("Route:EasRouteMongo Tests", () => {
             expect(findChild(appData, "ReminderTime")).toBeUndefined();
             expect(findChild(appData, "Body")).toBeUndefined();
         });
+
+        const collectionOf = function (response: WbxmlElement): WbxmlElement {
+            return findChild(findChild(response, "Collections")!, "Collection")!;
+        };
+
+        const syncRequestWithCommands = function (
+            syncKey: string,
+            collectionClass: string,
+            folderUid: string,
+            commandsChildren: WbxmlElement[],
+        ): WbxmlElement {
+            return element(WbxmlCodePage.AirSync, "Sync", [
+                element(WbxmlCodePage.AirSync, "Collections", [
+                    element(WbxmlCodePage.AirSync, "Collection", [
+                        textElement(WbxmlCodePage.AirSync, "Class", collectionClass),
+                        textElement(WbxmlCodePage.AirSync, "SyncKey", syncKey),
+                        textElement(WbxmlCodePage.AirSync, "CollectionId", folderUid),
+                        element(WbxmlCodePage.AirSync, "Commands", commandsChildren),
+                    ]),
+                ]),
+            ]);
+        };
+
+        /** Runs the initial (SyncKey "0") handshake for one collection/folder and returns the key the client
+         * would echo back on its first real sync round - shared setup for every client-originated Commands test
+         * below, none of which care about the initial response's own contents. */
+        const initialSyncKey = async function (collectionClass: string, folderUid: string): Promise<string> {
+            const initial = await postWbxml("Sync", "dev1", syncRequest("0", collectionClass, folderUid));
+            return childText(collectionOf(initial), "SyncKey")!;
+        };
+
+        describe("Client-originated Add/Change/Delete", () => {
+            it("Creates a contact via a client-originated Add, reporting Status 1 with the assigned ServerId.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+                const syncKey = await initialSyncKey("Contacts", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Contacts", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Add", [
+                            textElement(WbxmlCodePage.AirSync, "ClientId", "client-1"),
+                            element(WbxmlCodePage.AirSync, "ApplicationData", [
+                                textElement(WbxmlCodePage.Contacts, "FileAs", "New Contact"),
+                                textElement(WbxmlCodePage.Contacts, "Email1Address", "new@example.com"),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                const add = findChild(findChild(collectionOf(response), "Responses")!, "Add")!;
+                expect(childText(add, "ClientId")).toBe("client-1");
+                expect(childText(add, "Status")).toBe("1");
+                const serverId = childText(add, "ServerId")!;
+                expect(serverId).toBeTruthy();
+
+                const created = await contactRepo.findOne({ uid: serverId });
+                expect(created?.displayName).toBe("New Contact");
+                expect(created?.emails).toEqual([{ address: "new@example.com", type: ContactAddressKind.OTHER }]);
+                expect(created?.mailboxUid).toBe(mailbox.uid);
+                expect(created?.folderUid).toBe(folder.uid);
+            });
+
+            it("Creates a calendar event via a client-originated Add, assigning a unique icalUid and sequence 0.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Calendar", type: FolderType.CALENDAR });
+                const syncKey = await initialSyncKey("Calendar", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Calendar", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Add", [
+                            textElement(WbxmlCodePage.AirSync, "ClientId", "client-1"),
+                            element(WbxmlCodePage.AirSync, "ApplicationData", [
+                                textElement(WbxmlCodePage.Calendar, "Subject", "New Meeting"),
+                                textElement(WbxmlCodePage.Calendar, "StartTime", "20260301T090000Z"),
+                                textElement(WbxmlCodePage.Calendar, "EndTime", "20260301T093000Z"),
+                                textElement(WbxmlCodePage.Calendar, "OrganizerEmail", "owner@example.com"),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                const add = findChild(findChild(collectionOf(response), "Responses")!, "Add")!;
+                expect(childText(add, "Status")).toBe("1");
+                const serverId = childText(add, "ServerId")!;
+
+                const created = await calendarEventRepo.findOne({ uid: serverId });
+                expect(created?.title).toBe("New Meeting");
+                expect(created?.sequence).toBe(0);
+                expect(created?.icalUid).toMatch(/^[0-9a-f-]{36}@eas$/);
+            });
+
+            it("Rejects a client-originated Calendar Add with Status 6 when a required field is malformed.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Calendar", type: FolderType.CALENDAR });
+                const syncKey = await initialSyncKey("Calendar", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Calendar", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Add", [
+                            textElement(WbxmlCodePage.AirSync, "ClientId", "client-1"),
+                            element(WbxmlCodePage.AirSync, "ApplicationData", [
+                                textElement(WbxmlCodePage.Calendar, "Subject", "Bad Event"),
+                                textElement(WbxmlCodePage.Calendar, "BusyStatus", "99"),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                const add = findChild(findChild(collectionOf(response), "Responses")!, "Add")!;
+                expect(childText(add, "ClientId")).toBe("client-1");
+                expect(childText(add, "Status")).toBe("6");
+                expect(findChild(add, "ServerId")).toBeUndefined();
+            });
+
+            it("Creates a task via a client-originated Add.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Tasks", type: FolderType.TASKS });
+                const syncKey = await initialSyncKey("Tasks", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Tasks", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Add", [
+                            textElement(WbxmlCodePage.AirSync, "ClientId", "client-1"),
+                            element(WbxmlCodePage.AirSync, "ApplicationData", [
+                                textElement(WbxmlCodePage.Tasks, "Subject", "New Task"),
+                                textElement(WbxmlCodePage.Tasks, "Importance", "2"),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                const add = findChild(findChild(collectionOf(response), "Responses")!, "Add")!;
+                expect(childText(add, "Status")).toBe("1");
+                const created = await taskRepo.findOne({ uid: childText(add, "ServerId") });
+                expect(created?.title).toBe("New Task");
+                expect(created?.priority).toBe(TaskPriority.HIGH);
+            });
+
+            it("Rejects a client-originated Email Add with Status 6, per [MS-ASCMD]'s own non-draft-email rule.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const syncKey = await initialSyncKey("Email", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Email", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Add", [
+                            textElement(WbxmlCodePage.AirSync, "ClientId", "client-1"),
+                            element(WbxmlCodePage.AirSync, "ApplicationData", []),
+                        ]),
+                    ]),
+                );
+
+                const add = findChild(findChild(collectionOf(response), "Responses")!, "Add")!;
+                expect(childText(add, "ClientId")).toBe("client-1");
+                expect(childText(add, "Status")).toBe("6");
+            });
+
+            it("Updates a contact via a client-originated Change silently (no Responses entry), and persists it.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+                const contact = await createContact(mailbox.uid, folder.uid, { displayName: "Original Name" });
+                const syncKey = await initialSyncKey("Contacts", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Contacts", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Change", [
+                            textElement(WbxmlCodePage.AirSync, "ServerId", contact.uid),
+                            element(WbxmlCodePage.AirSync, "ApplicationData", [
+                                textElement(WbxmlCodePage.Contacts, "FileAs", "Renamed Contact"),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                expect(findChild(collectionOf(response), "Responses")).toBeUndefined();
+                const updated = await contactRepo.findOne({ uid: contact.uid });
+                expect(updated?.displayName).toBe("Renamed Contact");
+            });
+
+            it("Reports Status 8 when a Change targets a ServerId that doesn't exist.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+                const syncKey = await initialSyncKey("Contacts", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Contacts", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Change", [
+                            textElement(WbxmlCodePage.AirSync, "ServerId", "does-not-exist"),
+                            element(WbxmlCodePage.AirSync, "ApplicationData", [
+                                textElement(WbxmlCodePage.Contacts, "FileAs", "Doesn't matter"),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                const change = findChild(findChild(collectionOf(response), "Responses")!, "Change")!;
+                expect(childText(change, "ServerId")).toBe("does-not-exist");
+                expect(childText(change, "Status")).toBe("8");
+            });
+
+            it("Deletes a contact via a client-originated Delete silently (no Responses entry), soft-deleting it.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+                const contact = await createContact(mailbox.uid, folder.uid);
+                const syncKey = await initialSyncKey("Contacts", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Contacts", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", contact.uid)]),
+                    ]),
+                );
+
+                expect(findChild(collectionOf(response), "Responses")).toBeUndefined();
+                const deleted = await contactRepo.findOne({ uid: contact.uid });
+                // RecoverableRepoUtils.delete() soft-deletes: the record still exists but is flagged `deleted`,
+                // with a bumped `version`/`dateModified` - the exact fix SyncCommand's own @Init needed (see its
+                // doc comment) so this watermark-based deletion is actually detectable on a later sync round.
+                expect(deleted?.deleted).toBe(true);
+            });
+
+            it("Reports Status 8 when a Delete targets a ServerId that doesn't exist.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+                const syncKey = await initialSyncKey("Contacts", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Contacts", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", "does-not-exist")]),
+                    ]),
+                );
+
+                const del = findChild(findChild(collectionOf(response), "Responses")!, "Delete")!;
+                expect(childText(del, "ServerId")).toBe("does-not-exist");
+                expect(childText(del, "Status")).toBe("8");
+            });
+
+            it("Accepts a client-originated Email Delete silently, soft-deleting the message.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const message = await createMessage(mailbox.uid, folder.uid);
+                const syncKey = await initialSyncKey("Email", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Email", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", message.uid)]),
+                    ]),
+                );
+
+                expect(findChild(collectionOf(response), "Responses")).toBeUndefined();
+                const deleted = await messageRepo.findOne({ uid: message.uid });
+                expect(deleted?.deleted).toBe(true);
+            });
+        });
     });
 
     describe("SendMail/SmartForward/SmartReply commands", () => {

@@ -25,3 +25,25 @@ export function toCompactDateTime(date: Date | string): string {
         `T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}Z`
     );
 }
+
+/** Anchored strictly to `toCompactDateTime`'s own output shape (`YYYYMMDDTHHMMSSZ`) - a client sending
+ * anything else has sent a malformed item, which the caller (an `EasCollectionSyncAdapter.fromApplicationData`
+ * implementation) should treat as `Status 6` rather than silently guessing. */
+const COMPACT_DATE_TIME_PATTERN = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/;
+
+/**
+ * Parses MS-ASDTYPE's "Compact DateTime" (`YYYYMMDDTHHMMSSZ`) back into a `Date` - the reverse of
+ * `toCompactDateTime`, needed for `Sync`'s client-originated `Add`/`Change` commands on `Calendar`/`Tasks`.
+ * Throws (rather than returning an unvalidated `Date` that would silently carry `NaN`s) for anything not
+ * matching the exact expected shape.
+ */
+export function fromCompactDateTime(value: string): Date {
+    const match = COMPACT_DATE_TIME_PATTERN.exec(value);
+    if (!match) {
+        throw new Error(`Not a valid Compact DateTime value: '${value}'`);
+    }
+    const [, year, month, day, hour, minute, second] = match;
+    return new Date(
+        Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)),
+    );
+}

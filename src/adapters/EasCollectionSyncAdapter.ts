@@ -12,10 +12,10 @@ import type { WbxmlElement } from "../codec/WbxmlElement.js";
  * fields go in `ApplicationData`, on which code pages) lives in one adapter per collection type, keyed by the
  * MS-ASCMD `Class` value (`"Email"`, `"Contacts"`, `"Calendar"`, `"Tasks"`) it answers to.
  *
- * Only reading (`toApplicationData`) is defined so far - `SyncCommand`'s pragmatic subset (see its own doc
- * comment) doesn't yet accept client-originated `Add`/`Change` commands for these collections (composing mail
- * goes through `SendMailCommand` instead; editing a synced item from the device is deferred, matching this
- * library's "pragmatic subset" precedent elsewhere).
+ * `fromApplicationData` is deliberately optional: `EmailSyncAdapter` doesn't implement it (client-originated
+ * `Add`/`Change` isn't supported for `Email` - see `SyncCommand`'s own doc comment for why), and `SyncCommand`
+ * uses its absence as the capability check, answering Status `6` for those operations rather than needing a
+ * separate flag that could drift out of sync with which adapters actually implement it.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -25,4 +25,30 @@ export interface EasCollectionSyncAdapter<T extends RecoverableBaseEntity> {
 
     /** Builds the `<ApplicationData>` element for one `Add`/`Change` command reporting `item`. */
     toApplicationData(item: T): WbxmlElement;
+
+    /**
+     * Parses one client-originated `Add`/`Change` command's `<ApplicationData>` element (`el`) into a partial
+     * entity update. Only fields actually present in `el` are included in the result - an omitted field means
+     * "unchanged" (MS-ASCMD's own "ghosted property" rule - see `SyncCommand`'s doc comment), never "clear this
+     * field" - which is what lets the same method serve both `Add` (the partial is merged onto a fresh
+     * `{mailboxUid, folderUid}` baseline) and `Change` (the partial is merged onto `existing`).
+     *
+     * @param el The command's `<ApplicationData>` element.
+     * @param existing The item being changed, for a `Change` command; `undefined` for `Add`. Adapters that
+     * need to know the item's current field values to correctly interpret a partial update (none do today)
+     * would use this; it's threaded through mainly so a future adapter can without an interface change.
+     */
+    fromApplicationData?(el: WbxmlElement, existing?: T): Partial<T>;
+
+    /**
+     * Supplies default field values for a brand-new entity created via a client-originated `Add`, applied
+     * *before* `fromApplicationData`'s own partial is merged on top (so anything the client actually sent
+     * always wins). For defaults a fresh entity needs regardless of what the client sent - `CalendarSyncAdapter`
+     * uses this for `icalUid`/`sequence`, since EAS's own `Add` command has no wire representation for either
+     * (a device doesn't know or send an iCalendar UID) but a stored default of `""` for every Sync-created
+     * event (this model's own fallback, see `CalendarEventMongo`'s constructor) would violate RFC 5545's own
+     * uniqueness expectation for `UID`. Optional; only implemented where a collection actually needs it - most
+     * adapters have no such gap.
+     */
+    newEntityDefaults?(): Partial<T>;
 }

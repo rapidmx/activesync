@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
-import { element, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
-import { toCompactDateTime } from "../CompactDateTime.js";
+import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
+import { fromCompactDateTime, toCompactDateTime } from "../CompactDateTime.js";
 import type { EasCollectionSyncAdapter } from "./EasCollectionSyncAdapter.js";
 import { type Task, TaskPriority } from "@rapidmx/restapi";
 
@@ -15,6 +15,10 @@ const IMPORTANCE_CODES: Record<TaskPriority, string> = {
     [TaskPriority.NORMAL]: "1",
     [TaskPriority.HIGH]: "2",
 };
+
+const IMPORTANCE_FROM_CODE: Record<string, TaskPriority> = Object.fromEntries(
+    Object.entries(IMPORTANCE_CODES).map(([k, v]) => [v, k as TaskPriority]),
+);
 
 /**
  * Maps `Task` to/from the EAS `Sync` `Tasks` collection class (MS-ASTASK).
@@ -50,5 +54,48 @@ export class TasksSyncAdapter implements EasCollectionSyncAdapter<Task> {
                   ]
                 : []),
         ]);
+    }
+
+    /**
+     * Reverse of `toApplicationData`. `DateCompleted` is never parsed back - it's `task.dateModified` echoed
+     * out, not an independent field this library's own `Task` model has room to store separately, so a client
+     * setting `Complete` is enough on its own. `ReminderSet="0"` (with no `ReminderTime`) is treated as an
+     * explicit "clear the reminder" signal (`reminderDate: undefined` in the returned partial, which - unlike
+     * simply omitting the key - does override an existing reminder when merged onto `existing` for a `Change`)
+     * since MS-ASTASK gives no other way to express removing a reminder; `UtcDueDate` has no equivalent
+     * explicit-clear signal and so can only be set, never cleared, via `Sync` - a real, narrower gap than
+     * `reminderDate`'s, documented here rather than silently accepted.
+     */
+    public fromApplicationData(el: WbxmlElement): Partial<Task> {
+        const partial: Partial<Task> = {};
+
+        const subject = childText(el, "Subject");
+        if (subject !== undefined) partial.title = subject;
+        const complete = childText(el, "Complete");
+        if (complete !== undefined) partial.completed = complete === "1";
+        const utcDueDate = childText(el, "UtcDueDate");
+        if (utcDueDate !== undefined) partial.dueDate = fromCompactDateTime(utcDueDate);
+        const importance = childText(el, "Importance");
+        if (importance !== undefined) {
+            const mapped = IMPORTANCE_FROM_CODE[importance];
+            if (!mapped) {
+                throw new Error(`Unrecognized Importance value: '${importance}'`);
+            }
+            partial.priority = mapped;
+        }
+
+        const reminderSet = childText(el, "ReminderSet");
+        const reminderTime = childText(el, "ReminderTime");
+        if (reminderTime !== undefined) {
+            partial.reminderDate = fromCompactDateTime(reminderTime);
+        } else if (reminderSet === "0") {
+            partial.reminderDate = undefined;
+        }
+
+        const bodyEl = findChild(el, "Body");
+        const body = bodyEl ? childText(bodyEl, "Data") : undefined;
+        if (body !== undefined) partial.body = body;
+
+        return partial;
     }
 }

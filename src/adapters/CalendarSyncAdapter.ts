@@ -2,9 +2,10 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import * as crypto from "crypto";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
-import { element, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
-import { toCompactDateTime } from "../CompactDateTime.js";
+import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
+import { fromCompactDateTime, toCompactDateTime } from "../CompactDateTime.js";
 import type { EasCollectionSyncAdapter } from "./EasCollectionSyncAdapter.js";
 import {
     AttendeeResponseStatus,
@@ -13,7 +14,14 @@ import {
     type CalendarEvent,
     type RecurrenceRule,
     RecurrenceFrequency,
+    RecipientType,
+    type Attendee,
 } from "@rapidmx/restapi";
+
+/** Builds the reverse of a forward code-table once at module load, rather than re-deriving it per call. */
+function invert<K extends string>(table: Record<K, string>): Record<string, K> {
+    return Object.fromEntries(Object.entries(table).map(([k, v]) => [v, k])) as Record<string, K>;
+}
 
 /** MS-ASCAL `BusyStatus`: 0=Free, 1=Tentative, 2=Busy, 3=Out of Office. Confirmed against the published
  * MS-ASCAL spec, not assumed - note the value order does not match this library's own `BusyStatus` enum
@@ -57,6 +65,11 @@ const RECURRENCE_TYPE_CODES: Record<RecurrenceFrequency, string> = {
  * Saturday=64 - summed when a recurrence applies to more than one day. `RecurrenceRule.byDay` uses RFC 5545's
  * two-letter day codes. */
 const DAY_OF_WEEK_BITS: Record<string, number> = { SU: 1, MO: 2, TU: 4, WE: 8, TH: 16, FR: 32, SA: 64 };
+
+const BUSY_STATUS_FROM_CODE = invert(BUSY_STATUS_CODES);
+const ATTENDEE_STATUS_FROM_CODE = invert(ATTENDEE_STATUS_CODES);
+const ATTENDEE_TYPE_FROM_CODE = invert(ATTENDEE_TYPE_CODES);
+const RECURRENCE_FREQUENCY_FROM_CODE = invert(RECURRENCE_TYPE_CODES);
 
 /**
  * Maps `CalendarEvent` to/from the EAS `Sync` `Calendar` collection class (MS-ASCAL).
@@ -144,5 +157,129 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
             // See the identical `!= null` reasoning on `reminderMinutesBeforeStart` above.
             ...(rule.count != null ? [textElement(WbxmlCodePage.Calendar, "Occurrences", String(rule.count))] : []),
         ]);
+    }
+
+    /**
+     * Reverse of `toApplicationData`. `timezone`/`status`/`sequence`/`icalUid` have no wire representation at
+     * all (see this class's own "pragmatic subset" doc comment for `timezone`; the other three are purely
+     * server-managed identifiers/state a client was never sent in the first place) and are never included in
+     * the returned partial - `newEntityDefaults()` below supplies `icalUid`/`sequence` for a brand new event
+     * (`status`/`timezone` are left at the model's own constructor defaults), and `applyChange` leaves all four
+     * untouched by construction (merging onto `existing`).
+     *
+     * `OrganizerEmail` is required for a new event (there is nowhere else to default it from - this adapter
+     * has no mailbox context of its own) - a real calendar client always sends it regardless, since it already
+     * knows its own account's address. Omitting it on an `Add` throws, which `SyncCommand.applyAdd` turns into
+     * Status `6` ("client has sent a malformed or invalid item"), the spec's own designated code for exactly
+     * this case.
+     *
+     * `Attendees`/`Recurrence` are ghosted as a whole element, like `ContactsSyncAdapter`'s arrays: present at
+     * all -> rebuilt entirely from what's there; absent -> left untouched on a `Change`.
+     */
+    public fromApplicationData(el: WbxmlElement): Partial<CalendarEvent> {
+        const partial: Partial<CalendarEvent> = {};
+
+        const subject = childText(el, "Subject");
+        if (subject !== undefined) partial.title = subject;
+        const location = childText(el, "Location");
+        if (location !== undefined) partial.location = location;
+        const startTime = childText(el, "StartTime");
+        if (startTime !== undefined) partial.startDate = fromCompactDateTime(startTime);
+        const endTime = childText(el, "EndTime");
+        if (endTime !== undefined) partial.endDate = fromCompactDateTime(endTime);
+        const allDayEvent = childText(el, "AllDayEvent");
+        if (allDayEvent !== undefined) partial.allDay = allDayEvent === "1";
+        const busyStatus = childText(el, "BusyStatus");
+        if (busyStatus !== undefined) {
+            const mapped = BUSY_STATUS_FROM_CODE[busyStatus];
+            if (!mapped) {
+                throw new Error(`Unrecognized BusyStatus value: '${busyStatus}'`);
+            }
+            partial.busyStatus = mapped;
+        }
+
+        const organizerEmail = childText(el, "OrganizerEmail");
+        if (organizerEmail !== undefined) {
+            partial.organizer = {
+                address: organizerEmail,
+                displayName: childText(el, "OrganizerName"),
+                type: RecipientType.TO,
+            };
+        }
+
+        const reminder = childText(el, "Reminder");
+        if (reminder !== undefined) partial.reminderMinutesBeforeStart = Number(reminder);
+
+        const attendeesEl = findChild(el, "Attendees");
+        if (attendeesEl) {
+            partial.attendees = attendeesEl.children
+                .filter((child) => child.tag === "Attendee")
+                .map((attendeeEl) => this.attendeeFromElement(attendeeEl));
+        }
+
+        const recurrenceEl = findChild(el, "Recurrence");
+        if (recurrenceEl) {
+            partial.recurrenceRule = this.recurrenceRuleFromElement(recurrenceEl);
+        }
+
+        return partial;
+    }
+
+    /** `icalUid`/`sequence` have no wire representation on `Add` (see `fromApplicationData`'s own doc comment)
+     * - without this, every Sync-created event would fall back to `CalendarEventMongo`/`CalendarEventSQL`'s own
+     * constructor default of `icalUid: ""`, violating RFC 5545's uniqueness expectation for `UID`. Mirrors
+     * MAPI's identical `RopSaveChangesMessageHandler` pattern (`${crypto.randomUUID()}@mapi`), `@eas` suffix
+     * instead. */
+    public newEntityDefaults(): Partial<CalendarEvent> {
+        return { icalUid: `${crypto.randomUUID()}@eas`, sequence: 0 };
+    }
+
+    private attendeeFromElement(el: WbxmlElement): Attendee {
+        const address = childText(el, "Email");
+        if (!address) {
+            throw new Error("Attendee element is missing its required Email child.");
+        }
+        const attendeeType = childText(el, "AttendeeType");
+        const attendeeStatus = childText(el, "AttendeeStatus");
+        return {
+            address,
+            displayName: childText(el, "Name"),
+            role: (attendeeType && ATTENDEE_TYPE_FROM_CODE[attendeeType]) || AttendeeRole.REQUIRED,
+            responseStatus: (attendeeStatus && ATTENDEE_STATUS_FROM_CODE[attendeeStatus]) || AttendeeResponseStatus.NEEDS_ACTION,
+            isOrganizer: false,
+        };
+    }
+
+    private recurrenceRuleFromElement(el: WbxmlElement): RecurrenceRule {
+        const type = childText(el, "Type");
+        const freq = type && RECURRENCE_FREQUENCY_FROM_CODE[type];
+        if (!freq) {
+            throw new Error(`Unrecognized or unsupported Recurrence Type value: '${type}'`);
+        }
+        const interval = childText(el, "Interval");
+        const dayOfWeek = childText(el, "DayOfWeek");
+        const dayOfMonth = childText(el, "DayOfMonth");
+        const monthOfYear = childText(el, "MonthOfYear");
+        const until = childText(el, "Until");
+        const occurrences = childText(el, "Occurrences");
+
+        const byDay: string[] = [];
+        if (dayOfWeek !== undefined) {
+            const bits = Number(dayOfWeek);
+            for (const [code, bit] of Object.entries(DAY_OF_WEEK_BITS)) {
+                if ((bits & bit) !== 0) byDay.push(code);
+            }
+        }
+
+        return {
+            freq,
+            interval: interval !== undefined ? Number(interval) : 1,
+            ...(byDay.length > 0 ? { byDay } : {}),
+            ...(dayOfMonth !== undefined ? { byMonthDay: [Number(dayOfMonth)] } : {}),
+            ...(monthOfYear !== undefined ? { byMonth: [Number(monthOfYear)] } : {}),
+            ...(until !== undefined ? { until: fromCompactDateTime(until) } : {}),
+            ...(occurrences !== undefined ? { count: Number(occurrences) } : {}),
+            exceptions: [],
+        };
     }
 }
