@@ -65,7 +65,7 @@ function syncRequest(collectionClass: string, commandsChildren: WbxmlElement[]):
  * entirely - mirrors MeetingResponseCommand.test.ts's own established pattern for isolating a command's logic
  * from real DI/DB wiring. `mailboxRepo` is a bare fake resolving a minimal `Mailbox` - only exercised by the
  * one test whose adapter implements `newEntityDefaults` (mailbox-dependent defaults). */
-async function buildCommand(collectionClass: string, adapter: EasCollectionSyncAdapter<any>, repo: any): Promise<SyncCommandMongo> {
+async function buildCommand(collectionClass: string, adapter: EasCollectionSyncAdapter<any>, repo: any, aclUtils?: any): Promise<SyncCommandMongo> {
     const objectFactory = new ObjectFactory(config, Logger());
     const command = await objectFactory.newInstance<SyncCommandMongo>(SyncCommandMongo, { initialize: false });
     (command as any).collectionBindings = { [collectionClass]: { entityClass: class {}, adapterClass: class {} } };
@@ -73,6 +73,10 @@ async function buildCommand(collectionClass: string, adapter: EasCollectionSyncA
     (command as any).adapters = new Map([[collectionClass, adapter]]);
     (command as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue({ uid: "mbx-1", primarySmtpAddress: "owner@example.com", displayName: "Owner" }) };
     (command as any).windowSize = 100;
+    // Every permission granted by default - every test not specifically about ACL/ownership enforcement wants
+    // this out of the way entirely, mirroring EmailSyncAdapter.test.ts's own precedent of manually poking a DI
+    // field rather than routing through ObjectFactory's real injection (skipped here via `initialize: false`).
+    (command as any).aclUtils = aclUtils ?? { hasPermission: vi.fn().mockResolvedValue(true) };
     return command;
 }
 
@@ -95,7 +99,130 @@ function collection(response: WbxmlElement): WbxmlElement {
     return findChild(findChild(response, "Collections")!, "Collection")!;
 }
 
+describe("SyncCommand Tests (guard clause only)", () => {
+    it("handle() throws INTERNAL_ERROR when a required dependency is not set.", async () => {
+        const objectFactory = new ObjectFactory(config, Logger());
+        const command = objectFactory.newInstance<SyncCommandMongo>(SyncCommandMongo, { initialize: false });
+
+        await expect(command.handle({})).rejects.toThrow(/internal error/i);
+    });
+});
+
 describe("SyncCommand Tests (client-originated Commands, isolated)", () => {
+    describe("ACL/ownership enforcement (IDOR regression coverage)", () => {
+        it("Reports Status 4 for the whole collection when the caller lacks READ on the folder, without touching computeChanges.", async () => {
+            const repo = fakeRepo();
+            const adapter = fakeAdapter();
+            const aclUtils = { hasPermission: vi.fn().mockResolvedValue(false) };
+            const command = await buildCommand("Fake", adapter, repo, aclUtils);
+            const request = syncRequest("Fake", []);
+            const { ctx } = buildContext(request);
+
+            const response = await command.handle(ctx);
+
+            expect(childText(collection(response!), "Status")).toBe("4");
+            expect(aclUtils.hasPermission).toHaveBeenCalledWith(ctx.user, FOLDER_UID, "read");
+            expect(repo.find).not.toHaveBeenCalled();
+        });
+
+        it("Add: reports Status 6 without creating anything when the caller lacks CREATE on the folder.", async () => {
+            const repo = fakeRepo();
+            const adapter = fakeAdapter({ fromApplicationData: () => ({ title: "New Item" }) });
+            const aclUtils = { hasPermission: vi.fn().mockImplementation((_u: any, _f: any, action: string) => Promise.resolve(action !== "create")) };
+            const command = await buildCommand("Fake", adapter, repo, aclUtils);
+            const request = syncRequest("Fake", [
+                element(WbxmlCodePage.AirSync, "Add", [element(WbxmlCodePage.AirSync, "ApplicationData", [])]),
+            ]);
+            const { ctx } = buildContext(request);
+
+            const response = await command.handle(ctx);
+
+            const add = findChild(findChild(collection(response!), "Responses")!, "Add")!;
+            expect(childText(add, "Status")).toBe("6");
+            expect(repo.create).not.toHaveBeenCalled();
+        });
+
+        it("Change: reports Status 8 (not 6) when the resolved item actually lives in a different folder/mailbox than the synced CollectionId - the cross-mailbox IDOR case.", async () => {
+            // The ServerId resolves to a REAL item (repo.findOne succeeds) but its own folderUid doesn't match
+            // the CollectionId this Sync request claims to be operating on - e.g. a client supplying another
+            // mailbox's item uid as ServerId while declaring its own folder's CollectionId. Must look identical
+            // to "doesn't exist" (Status 8), never distinguishable from a genuinely missing ServerId.
+            const existing = { uid: "item-1", version: 1, folderUid: "someone-elses-folder" };
+            const repo = fakeRepo({ findOne: vi.fn().mockResolvedValue(existing) });
+            const adapter = fakeAdapter({ fromApplicationData: () => ({ title: "Updated" }) });
+            const command = await buildCommand("Fake", adapter, repo);
+            const request = syncRequest("Fake", [
+                element(WbxmlCodePage.AirSync, "Change", [
+                    textElement(WbxmlCodePage.AirSync, "ServerId", "item-1"),
+                    element(WbxmlCodePage.AirSync, "ApplicationData", []),
+                ]),
+            ]);
+            const { ctx } = buildContext(request);
+
+            const response = await command.handle(ctx);
+
+            const change = findChild(findChild(collection(response!), "Responses")!, "Change")!;
+            expect(childText(change, "Status")).toBe("8");
+            expect(repo.update).not.toHaveBeenCalled();
+        });
+
+        it("Change: reports Status 6 without updating anything when the caller lacks UPDATE on the folder.", async () => {
+            const existing = { uid: "item-1", version: 1, folderUid: FOLDER_UID };
+            const repo = fakeRepo({ findOne: vi.fn().mockResolvedValue(existing) });
+            const adapter = fakeAdapter({ fromApplicationData: () => ({ title: "Updated" }) });
+            const aclUtils = { hasPermission: vi.fn().mockImplementation((_u: any, _f: any, action: string) => Promise.resolve(action !== "update")) };
+            const command = await buildCommand("Fake", adapter, repo, aclUtils);
+            const request = syncRequest("Fake", [
+                element(WbxmlCodePage.AirSync, "Change", [
+                    textElement(WbxmlCodePage.AirSync, "ServerId", "item-1"),
+                    element(WbxmlCodePage.AirSync, "ApplicationData", []),
+                ]),
+            ]);
+            const { ctx } = buildContext(request);
+
+            const response = await command.handle(ctx);
+
+            const change = findChild(findChild(collection(response!), "Responses")!, "Change")!;
+            expect(childText(change, "Status")).toBe("6");
+            expect(repo.update).not.toHaveBeenCalled();
+        });
+
+        it("Delete: reports Status 8 (not 6) when the resolved item actually lives in a different folder/mailbox than the synced CollectionId.", async () => {
+            const existing = { uid: "item-1", version: 1, folderUid: "someone-elses-folder" };
+            const repo = fakeRepo({ findOne: vi.fn().mockResolvedValue(existing) });
+            const adapter = fakeAdapter();
+            const command = await buildCommand("Fake", adapter, repo);
+            const request = syncRequest("Fake", [
+                element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", "item-1")]),
+            ]);
+            const { ctx } = buildContext(request);
+
+            const response = await command.handle(ctx);
+
+            const del = findChild(findChild(collection(response!), "Responses")!, "Delete")!;
+            expect(childText(del, "Status")).toBe("8");
+            expect(repo.delete).not.toHaveBeenCalled();
+        });
+
+        it("Delete: reports Status 6 without deleting anything when the caller lacks DELETE on the folder.", async () => {
+            const existing = { uid: "item-1", version: 1, folderUid: FOLDER_UID };
+            const repo = fakeRepo({ findOne: vi.fn().mockResolvedValue(existing) });
+            const adapter = fakeAdapter();
+            const aclUtils = { hasPermission: vi.fn().mockImplementation((_u: any, _f: any, action: string) => Promise.resolve(action !== "delete")) };
+            const command = await buildCommand("Fake", adapter, repo, aclUtils);
+            const request = syncRequest("Fake", [
+                element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", "item-1")]),
+            ]);
+            const { ctx } = buildContext(request);
+
+            const response = await command.handle(ctx);
+
+            const del = findChild(findChild(collection(response!), "Responses")!, "Delete")!;
+            expect(childText(del, "Status")).toBe("6");
+            expect(repo.delete).not.toHaveBeenCalled();
+        });
+    });
+
     describe("Add", () => {
         it("Creates a new item and reports Status 1 with the assigned ServerId.", async () => {
             const created = { uid: "new-uid", dateModified: new Date("2026-01-02T00:00:00.000Z") };
@@ -240,7 +367,7 @@ describe("SyncCommand Tests (client-originated Commands, isolated)", () => {
 
     describe("Change", () => {
         it("Succeeds silently (no Responses entry) and advances the persisted watermark past the write.", async () => {
-            const existing = { uid: "item-1", version: 1 };
+            const existing = { uid: "item-1", version: 1, folderUid: FOLDER_UID };
             const updated = { uid: "item-1", version: 2, dateModified: new Date("2026-02-01T00:00:00.000Z") };
             const repo = fakeRepo({
                 findOne: vi.fn().mockResolvedValue(existing),
@@ -308,7 +435,7 @@ describe("SyncCommand Tests (client-originated Commands, isolated)", () => {
         });
 
         it("Reports Status 6 when ApplicationData is missing entirely.", async () => {
-            const repo = fakeRepo({ findOne: vi.fn().mockResolvedValue({ uid: "item-1", version: 1 }) });
+            const repo = fakeRepo({ findOne: vi.fn().mockResolvedValue({ uid: "item-1", version: 1, folderUid: FOLDER_UID }) });
             const adapter = fakeAdapter({ fromApplicationData: () => ({}) });
             const command = await buildCommand("Fake", adapter, repo);
             const request = syncRequest("Fake", [
@@ -329,7 +456,7 @@ describe("SyncCommand Tests (client-originated Commands, isolated)", () => {
             // syncing the same item at the same moment), not reproducible deterministically over real HTTP.
             // Injected directly here instead, matching MeetingResponseCommand.test.ts's own precedent for an
             // unreproducible-race branch.
-            const existing = { uid: "item-1", version: 1 };
+            const existing = { uid: "item-1", version: 1, folderUid: FOLDER_UID };
             const repo = fakeRepo({
                 findOne: vi.fn().mockResolvedValue(existing),
                 update: vi.fn().mockRejectedValue(new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "Version conflict")),
@@ -352,7 +479,7 @@ describe("SyncCommand Tests (client-originated Commands, isolated)", () => {
         });
 
         it("Reports Status 6 when repo.update() rejects with a non-conflict error.", async () => {
-            const existing = { uid: "item-1", version: 1 };
+            const existing = { uid: "item-1", version: 1, folderUid: FOLDER_UID };
             const repo = fakeRepo({
                 findOne: vi.fn().mockResolvedValue(existing),
                 update: vi.fn().mockRejectedValue(new Error("db error")),
@@ -391,7 +518,7 @@ describe("SyncCommand Tests (client-originated Commands, isolated)", () => {
 
     describe("Delete", () => {
         it("Succeeds silently (no Responses entry) for an existing item.", async () => {
-            const existing = { uid: "item-1", version: 1 };
+            const existing = { uid: "item-1", version: 1, folderUid: FOLDER_UID };
             const repo = fakeRepo({ findOne: vi.fn().mockResolvedValue(existing), delete: vi.fn().mockResolvedValue(undefined) });
             const adapter = fakeAdapter();
             const command = await buildCommand("Fake", adapter, repo);
@@ -423,7 +550,7 @@ describe("SyncCommand Tests (client-originated Commands, isolated)", () => {
         });
 
         it("Reports Status 6 when repo.delete() itself throws.", async () => {
-            const existing = { uid: "item-1", version: 1 };
+            const existing = { uid: "item-1", version: 1, folderUid: FOLDER_UID };
             const repo = fakeRepo({
                 findOne: vi.fn().mockResolvedValue(existing),
                 delete: vi.fn().mockRejectedValue(new Error("db error")),
@@ -456,7 +583,7 @@ describe("SyncCommand Tests (client-originated Commands, isolated)", () => {
     });
 
     it("Persists the new SyncKey via deviceSyncStateRepo.update() exactly once per request.", async () => {
-        const repo = fakeRepo({ delete: vi.fn().mockResolvedValue(undefined), findOne: vi.fn().mockResolvedValue({ uid: "item-1", version: 1 }) });
+        const repo = fakeRepo({ delete: vi.fn().mockResolvedValue(undefined), findOne: vi.fn().mockResolvedValue({ uid: "item-1", version: 1, folderUid: FOLDER_UID }) });
         const adapter = fakeAdapter();
         const command = await buildCommand("Fake", adapter, repo);
         const request = syncRequest("Fake", [

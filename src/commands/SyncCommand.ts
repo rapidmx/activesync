@@ -3,14 +3,22 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
-import { ApiErrors, ObjectFactory, RepoUtils, type RecoverableBaseEntity } from "@rapidrest/service-core";
+import {
+    ACLAction,
+    ACLUtils,
+    ApiErrorMessages,
+    ApiErrors,
+    ObjectFactory,
+    RepoUtils,
+    type RecoverableBaseEntity,
+} from "@rapidrest/service-core";
 import { RecoverableRepoUtils, type Mailbox } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import { computeChanges, formatSyncKey, persistDeviceSyncState, resolveSyncKey } from "../EasSyncKeyUtils.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 import type { EasCollectionSyncAdapter } from "../adapters/EasCollectionSyncAdapter.js";
-const { Config, Init } = ObjectDecorators;
+const { Config, Init, Inject } = ObjectDecorators;
 
 /** Caps how many item changes are enumerated per `Sync` round - a real device-visible "MoreAvailable" trigger
  * for a busy folder, not a real-world binding constraint (unlike `FolderSyncCommand`'s much smaller folder
@@ -49,13 +57,24 @@ export interface SyncCollectionBinding<T extends RecoverableBaseEntity> {
  * it's remembered in `DeviceSyncState.folderCollectionClasses` (keyed by `folderUid`) so a later request may
  * omit it; omitting it for a folder never previously synced still gets `Status 4` (nothing to fall back to).
  *
+ * **Every `CollectionId` is ACL-checked against the caller before it's touched**: `processCollection()` requires
+ * `ACLAction.READ` on the folder before enumerating or accepting any Commands for it at all (a folder the caller
+ * can't read is reported the same as an unrecognized collection - Status `4` - rather than leaking whether it
+ * exists); `applyAdd`/`applyChange`/`applyDelete` additionally require `CREATE`/`UPDATE`/`DELETE` respectively,
+ * and `applyChange`/`applyDelete` re-verify the resolved item's own `folderUid` actually matches the collection
+ * being synced (treating a mismatch identically to "not found" - Status `8` - never revealing that the
+ * `ServerId` resolves to something real elsewhere). Without this, a client could supply any other mailbox's
+ * folder/item uid as its own `CollectionId`/`ServerId` and read or mutate that mailbox's data directly - the
+ * same ownership-verification-after-an-`ignoreACL`-lookup pattern `ItemOperationsCommand`/`MoveItemsCommand`
+ * already use, applied consistently here too.
+ *
  * **Pragmatic subset, deliberately not the full MS-ASCMD `Sync` surface**:
  * - **Client-originated `Add`/`Change`/`Delete` commands are accepted for every collection type**, including
  * `Email` (a device creating/editing a Draft, or deleting a message locally - see `applyAdd`/`applyChange`/
  * `applyDelete`). `[MS-ASCMD]` itself disallows `Add`/`Change` for any *non-draft* `Email` item - this library
- * doesn't verify a Sync `Email` Add/Change actually targets the caller's own Drafts folder specifically
- * (matching how Contacts/Calendar/Tasks folder targeting is equally unchecked elsewhere - the client is
- * trusted to only Add/Change within its own collection). A collection whose adapter has no
+ * doesn't verify a Sync `Email` Add/Change actually targets the caller's own Drafts folder *specifically*
+ * (only that it's a folder the caller actually owns/can write to - see above), matching how Contacts/Calendar/
+ * Tasks folder targeting is equally unchecked beyond ownership elsewhere. A collection whose adapter has no
  * `fromApplicationData` at all would get Status `6` for `Add`/`Change` instead, but every adapter today
  * implements it. Per `[MS-ASCMD]`'s own "Add (Sync)"/"Status (Sync)" pages: `Add` always gets a `Responses`
  * entry (it must report the assigned `ServerId`); `Change`/`Delete` only get one on **failure** - a silent
@@ -81,6 +100,9 @@ export abstract class SyncCommand implements EasCommandHandler {
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
+
+    @Inject(ACLUtils)
+    private aclUtils?: ACLUtils;
 
     private repos = new Map<string, RepoUtils<any>>();
     private adapters = new Map<string, EasCollectionSyncAdapter<any>>();
@@ -124,6 +146,9 @@ export abstract class SyncCommand implements EasCommandHandler {
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
+        if (!this.aclUtils) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
         const collections = ctx.request ? findChild(ctx.request, "Collections") : undefined;
         const collectionEls = collections ? findChildren(collections, "Collection") : [];
         if (collectionEls.length === 0) {
@@ -195,6 +220,14 @@ export abstract class SyncCommand implements EasCommandHandler {
             return { collectionElement: this.collectionResponse(collectionClass, folderUid, "4", clientSyncKey) };
         }
 
+        // A folder the caller can't even read is reported identically to an unrecognized collection - never
+        // reveal whether a client-supplied CollectionId belonging to someone else's mailbox actually exists.
+        // See this class's own doc comment for why this check (and the matching ones in applyAdd/applyChange/
+        // applyDelete below) is required, not optional.
+        if (!(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.READ))) {
+            return { collectionElement: this.collectionResponse(collectionClass, folderUid, "4", clientSyncKey) };
+        }
+
         const storedSyncKey: string | undefined = ctx.deviceSyncState.folderSyncKeys[folderUid];
         const resolution = resolveSyncKey(clientSyncKey, storedSyncKey);
 
@@ -231,17 +264,17 @@ export abstract class SyncCommand implements EasCommandHandler {
         };
         if (requestCommands) {
             for (const el of findChildren(requestCommands, "Add")) {
-                const outcome = await this.applyAdd(adapter, repo, ctx.mailboxUid, folderUid, el, getMailbox);
+                const outcome = await this.applyAdd(ctx, adapter, repo, folderUid, el, getMailbox);
                 if (outcome.response) responseEntries.push(outcome.response);
                 note(outcome.writtenAt);
             }
             for (const el of findChildren(requestCommands, "Change")) {
-                const outcome = await this.applyChange(adapter, repo, el);
+                const outcome = await this.applyChange(ctx, adapter, repo, folderUid, el);
                 if (outcome.response) responseEntries.push(outcome.response);
                 note(outcome.writtenAt);
             }
             for (const el of findChildren(requestCommands, "Delete")) {
-                const outcome = await this.applyDelete(repo, el);
+                const outcome = await this.applyDelete(ctx, repo, folderUid, el);
                 if (outcome.response) responseEntries.push(outcome.response);
                 note(outcome.writtenAt);
             }
@@ -311,9 +344,9 @@ export abstract class SyncCommand implements EasCommandHandler {
     }
 
     private async applyAdd(
+        ctx: EasCommandContext,
         adapter: EasCollectionSyncAdapter<any>,
         repo: RepoUtils<any>,
-        mailboxUid: string,
         folderUid: string,
         el: WbxmlElement,
         getMailbox: () => Promise<Mailbox>,
@@ -326,10 +359,18 @@ export abstract class SyncCommand implements EasCommandHandler {
         if (!adapter.fromApplicationData || !appData) {
             return { response: this.addResponseElement(clientId, undefined, "6") };
         }
+        // The top-level per-collection READ check (processCollection) only proves the caller can see this
+        // folder - a shared/read-only folder still needs its own CREATE check before anything is written into it.
+        if (!(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.CREATE))) {
+            return { response: this.addResponseElement(clientId, undefined, "6") };
+        }
         try {
             const defaults = adapter.newEntityDefaults ? adapter.newEntityDefaults(await getMailbox()) : {};
             const partial = await adapter.fromApplicationData(appData);
-            const created = await repo.create({ ...defaults, ...partial, mailboxUid, folderUid } as any, { ignoreACL: true });
+            const created = await repo.create(
+                { ...defaults, ...partial, mailboxUid: ctx.mailboxUid, folderUid } as any,
+                { ignoreACL: true },
+            );
             return {
                 response: this.addResponseElement(clientId, created.uid, "1"),
                 writtenAt: created.dateModified,
@@ -343,8 +384,10 @@ export abstract class SyncCommand implements EasCommandHandler {
     }
 
     private async applyChange(
+        ctx: EasCommandContext,
         adapter: EasCollectionSyncAdapter<any>,
         repo: RepoUtils<any>,
+        folderUid: string,
         el: WbxmlElement,
     ): Promise<{ response?: WbxmlElement; writtenAt?: Date }> {
         const serverId = childText(el, "ServerId");
@@ -355,8 +398,14 @@ export abstract class SyncCommand implements EasCommandHandler {
             return { response: this.statusResponseElement("Change", serverId, "6") };
         }
         const existing = await repo.findOne(serverId, { ignoreACL: true });
-        if (!existing) {
+        // A ServerId that resolves to an item outside this (already ACL-verified-for-READ) collection is
+        // reported identically to "doesn't exist" - never reveal that it's real, just filed elsewhere (a
+        // different folder, or another mailbox's entirely). See this class's own doc comment.
+        if (!existing || existing.folderUid !== folderUid) {
             return { response: this.statusResponseElement("Change", serverId, "8") };
+        }
+        if (!(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.UPDATE))) {
+            return { response: this.statusResponseElement("Change", serverId, "6") };
         }
         const appData = findChild(el, "ApplicationData");
         if (!appData) {
@@ -380,20 +429,29 @@ export abstract class SyncCommand implements EasCommandHandler {
         }
     }
 
-    private async applyDelete(repo: RepoUtils<any>, el: WbxmlElement): Promise<{ response?: WbxmlElement; writtenAt?: Date }> {
+    private async applyDelete(
+        ctx: EasCommandContext,
+        repo: RepoUtils<any>,
+        folderUid: string,
+        el: WbxmlElement,
+    ): Promise<{ response?: WbxmlElement; writtenAt?: Date }> {
         const serverId = childText(el, "ServerId");
         if (!serverId) {
             return {};
         }
         const existing = await repo.findOne(serverId, { ignoreACL: true });
-        if (!existing) {
+        // Same "treat as not found" rule applyChange uses - see its own comment.
+        if (!existing || existing.folderUid !== folderUid) {
             return { response: this.statusResponseElement("Delete", serverId, "8") };
         }
+        if (!(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.DELETE))) {
+            return { response: this.statusResponseElement("Delete", serverId, "6") };
+        }
         try {
-            const writtenAt = new Date();
             await repo.delete(existing.uid, { ignoreACL: true });
-            // Success is silent, same rule as applyChange.
-            return { writtenAt };
+            // Captured AFTER the write resolves (not before) so the persisted watermark can never understate
+            // the delete's real effective time - success is silent, same rule as applyChange.
+            return { writtenAt: new Date() };
         } catch {
             return { response: this.statusResponseElement("Delete", serverId, "6") };
         }
