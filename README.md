@@ -5,13 +5,16 @@
 [![npm version](https://img.shields.io/npm/v/@rapidmx/activesync)](https://www.npmjs.com/package/@rapidmx/activesync)
 
 Exchange ActiveSync (EAS) protocol support for a [`@rapidmx/restapi`](https://github.com/RapidMX/restapi)-based
-mail server — covers the pragmatic command subset a real mobile client (iOS Mail, Outlook mobile,
-Android/Samsung Mail) needs for day-to-day use: `Provision`, `FolderSync`, `Sync`
-(`Email`/`Contacts`/`Calendar`/`Tasks`, including client-originated `Add`/`Change`/`Delete` - a device
-creating/editing/deleting a Contact, Calendar event, or Task directly persists back to the server; `Email`
-accepts `Delete` only, since `[MS-ASCMD]` itself disallows non-draft `Add` and composing/sending goes through
-`SendMail` instead), `SendMail`/`SmartForward`/`SmartReply`, `ItemOperations`, `Ping`, `Search` (GAL),
-`MeetingResponse`, and `Settings`.
+mail server — covers every command a real mobile client (iOS Mail, Outlook mobile, Android/Samsung Mail) needs
+for day-to-day use: `Provision`, `FolderSync`, `Sync` (`Email`/`Contacts`/`Calendar`/`Tasks`, multiple
+`<Collection>`s per request, client-originated `Add`/`Change`/`Delete` for every collection type including
+Email Drafts), `SendMail`/`SmartForward`/`SmartReply`, `ItemOperations`, `Ping`, `Search` (GAL),
+`MeetingResponse`, `Settings` (including `Oof`), `GetItemEstimate`, `MoveItems`, and `ResolveRecipients`.
+
+Deliberately out of scope: `Notes` sync, `DocumentLibrary`/file-share access, `RightsManagement`/IRM, `Find`,
+and `AirNotification` — legacy/rarely-used corners of the spec that even mature reference servers only
+partially implement; a client probing capabilities via `OPTIONS` correctly sees these as unsupported (see
+below), same as any other command this library doesn't register a handler for.
 
 It authenticates with the same JWT the rest of a RapidREST app's routes already use — no separate
 EAS-specific login flow — which means a real native device (rather than a test client that already has a

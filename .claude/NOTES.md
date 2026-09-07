@@ -23,6 +23,76 @@ Keep entries terse — this is a reference, not a transcript.
 
 ## Session Log
 
+### 2026-09-06/07 — Practical full EAS compliance push
+
+JP asked to finalize this package toward full `MS-ASCMD` compliance (scoped decision: every command a real
+client uses, explicitly excluding `Notes`/`DocumentLibrary`/`RightsManagement`/`Find`/`AirNotification` -
+legacy corners even mature reference servers barely implement). Landed as a sequence of independently-tested
+commits, each keeping the 95%/100%/100%/100% coverage gate green:
+
+- **Real bug found and fixed first**: `RepoUtils.update()` (service-core) never mutates its `existing`
+  argument - it returns a freshly-fetched instance with the bumped `version` instead, filtering the DB write
+  by the *patch's* `version`. Every `DeviceSyncState` writer (`ProvisionCommand.persist`,
+  `FolderSyncCommand`/`SyncCommand.persistSyncKey`, `BaseEasRoute.dispatch()`'s trailing `lastSyncAt` write)
+  discarded that return value and kept reusing the same in-memory object, so a *second* write within one
+  request silently matched zero rows. Added `EasSyncKeyUtils.persistDeviceSyncState()` as the one correct way
+  to write it going forward. This was masking itself as `lastSyncAt` never persisting; left unfixed it would
+  have broken multi-collection `Sync` (below) silently.
+- **`restapi` gained new `DeviceSyncState`/`Mailbox` fields** (`folderCollectionClasses`, `remoteWipeRequested`/
+  `remoteWipeAccountOnly`/`remoteWipeAcknowledgedAt`, `oofEnabled`/`oofMessage`/`oofStartTime`/`oofEndTime`).
+  **Gotcha**: `oofMessage` needed `@Nullable` despite being a required `string` - this framework's
+  `ObjectUtils.validate()` treats an empty string as equivalent to null/undefined for any non-nullable field,
+  and this field's natural default (no Oof configured yet) is `""`.
+  **Portal links don't work across these sibling repos** - tried `portal:../restapi` +
+  `portal:../../rapidrest/service-core` to test against local changes before JP published; even with
+  `--preserve-symlinks` (both Node's CLI flag and Vite's own `resolve.preserveSymlinks`, needed for different
+  reasons), each repo's own separately-`yarn install`ed `node_modules` produces a second physical copy of
+  `@rapidrest/core`/`@rapidrest/service-core`, breaking `instanceof ApiError`/decorator-metadata identity
+  across the boundary. Vite's own resolution made it worse, not better, when forced to preserve symlinks (one
+  path resolved to a raw `.ts` source file with no build step). Reverted; JP published both packages for real
+  instead (`service-core` 1.5.0, `restapi` 0.2.0) and this repo just bumped its own dependency ranges - the
+  "right" fix for a true monorepo (shared root `node_modules`) doesn't apply here since these are separate
+  standalone repos, each with their own lockfile.
+- **`service-core`'s real `OPTIONS` discovery fix (`hasExplicitOptionsRoute`) was NOT actually left
+  uncommitted** as the previous entry below claims - it was already committed locally (`c8cde0b`) just not
+  pushed to `origin`. Pushed and released as 1.5.0; confirmed live end-to-end here (updated the two
+  integration tests that previously documented the CORS-intercepts-everything behavior).
+- **`Sync` now handles multiple `<Collection>`s per request** (previously answered only the first) - all
+  per-collection `SyncKey`/remembered-`Class` writes for one request batch into a single
+  `persistDeviceSyncState` call at the end, never one per collection (exactly the bug above). `Class` can now
+  be omitted after a collection's first (`SyncKey "0"`) request too, remembered in the new
+  `folderCollectionClasses` field.
+- **`EasCollectionSyncAdapter` widened**: `fromApplicationData` may return a `Promise` now, and adapters are
+  instantiated via `ObjectFactory` (`adapterClass`, not a pre-built `adapter` instance) so one can `@Inject`
+  its own dependencies. This unblocked **`Email` Draft `Add`/`Change` via `Sync`** (previously `Email` only
+  accepted client-originated `Delete`) - plain-text-only, no attachments. `Message.bodyBlobKey` is documented
+  as holding raw MIME "unmodified from ingestion/send", and `ItemOperationsCommand.fetchMessage` parses it
+  with `simpleParser` unconditionally, so a Draft's body is wrapped in a minimal hand-built RFC 5322 message
+  rather than stored as bare text - keeps that contract intact for every consumer, not just this write path.
+- **`MeetingResponse` decline now soft-deletes the `CalendarEvent`** (matching real Exchange) instead of just
+  flipping the caller's own `Attendee.responseStatus` - each attendee already has their own row
+  (`mailboxUid`-scoped), so this only removes the meeting from the declining attendee's own calendar.
+- **New WBXML tag tables**: `Move`/`ItemEstimate`/`ResolveRecipients` pages, previously registered as enum
+  values only. `GetItemEstimate`'s modern (14.0+) shape reuses `AirSync`'s own `Collections`/`Collection`/
+  `Class`/`CollectionId`/`SyncKey` via `SWITCH_PAGE`, not `ItemEstimate`'s own legacy `Folders`/`Folder`
+  tags - same cross-page-reuse pattern `ItemOperationsCommand.fetchMessage` already used.
+- **Three new commands**: `GetItemEstimateCommand` (read-only, never touches a `SyncKey`), `MoveItemsCommand`
+  (`Message` only, verifies claimed source folder + destination folder ownership), `ResolveRecipientsCommand`
+  (GAL substring match, duplicating `SearchCommand`'s own matching logic rather than extracting a shared
+  `GalMatcher` DI abstraction for just two call sites - not worth the new plumbing). Both `Move`/
+  `ResolveRecipients` use an honest binary Status mapping (success vs. one generic failure code), matching
+  `ProvisionCommand`'s own established precedent, rather than a byte-exact code enumeration nobody could
+  verify without the published spec in hand.
+- **`Settings` gained `Oof` `Get`/`Set`** - single combined reply message (not the spec's three
+  audience-specific variants), `StartTime`/`EndTime` use MS-ASDTYPE's plain `dateTime` type (not Calendar's
+  Compact DateTime - a real, distinct MS-ASSETTINGS detail, not assumed).
+- **`MS-ASProtocolVersions` now also declares `16.0`/`16.1`** (previously withheld specifically because `Oof`
+  was missing) - `RightsManagementInformation` remains unimplemented but doesn't gate the version string,
+  since `MS-ASProtocolCommands` (derived live from registered handlers) is the real capability gate.
+- **Remaining before this can be called done**: `ItemOperations` still Fetch-only (no `Store`/`Options`/
+  `Move`/`EmptyFolderContents`); `Provision` still has no real policy enforcement or `RemoteWipe` handling
+  despite the new `DeviceSyncState` fields existing for it; no admin remote-wipe trigger route yet.
+
 ### 2026-09-06 — Repo split: `@rapidrest/mail` → four RapidMX packages
 
 - **This repo is `@rapidmx/activesync`**, carved out of the former monolith `@rapidrest/mail`
