@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { RecoverableBaseEntity } from "@rapidrest/service-core";
+import type { Mailbox } from "@rapidmx/restapi";
 import type { WbxmlElement } from "../codec/WbxmlElement.js";
 
 /**
@@ -33,12 +34,16 @@ export interface EasCollectionSyncAdapter<T extends RecoverableBaseEntity> {
      * field" - which is what lets the same method serve both `Add` (the partial is merged onto a fresh
      * `{mailboxUid, folderUid}` baseline) and `Change` (the partial is merged onto `existing`).
      *
+     * May return a `Promise` - `EmailSyncAdapter` needs this for a Draft `Add`/`Change`'s body, which must be
+     * written to `BlobStore` before the resulting `bodyBlobKey` is known; every other adapter today returns a
+     * plain object, which `await`s through unchanged.
+     *
      * @param el The command's `<ApplicationData>` element.
      * @param existing The item being changed, for a `Change` command; `undefined` for `Add`. Adapters that
-     * need to know the item's current field values to correctly interpret a partial update (none do today)
-     * would use this; it's threaded through mainly so a future adapter can without an interface change.
+     * need to know the item's current field values to correctly interpret a partial update - `EmailSyncAdapter`
+     * uses this to reuse an existing Draft's `bodyBlobKey` on `Change` rather than minting a new one.
      */
-    fromApplicationData?(el: WbxmlElement, existing?: T): Partial<T>;
+    fromApplicationData?(el: WbxmlElement, existing?: T): Partial<T> | Promise<Partial<T>>;
 
     /**
      * Supplies default field values for a brand-new entity created via a client-originated `Add`, applied
@@ -47,8 +52,9 @@ export interface EasCollectionSyncAdapter<T extends RecoverableBaseEntity> {
      * uses this for `icalUid`/`sequence`, since EAS's own `Add` command has no wire representation for either
      * (a device doesn't know or send an iCalendar UID) but a stored default of `""` for every Sync-created
      * event (this model's own fallback, see `CalendarEventMongo`'s constructor) would violate RFC 5545's own
-     * uniqueness expectation for `UID`. Optional; only implemented where a collection actually needs it - most
-     * adapters have no such gap.
+     * uniqueness expectation for `UID`. `EmailSyncAdapter` uses `mailbox` to populate a new Draft's `from`.
+     * Optional; only implemented where a collection actually needs it - most adapters have no such gap (and
+     * ignore the `mailbox` parameter entirely).
      */
-    newEntityDefaults?(): Partial<T>;
+    newEntityDefaults?(mailbox: Mailbox): Partial<T>;
 }

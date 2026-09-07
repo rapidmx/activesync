@@ -61,14 +61,17 @@ function syncRequest(collectionClass: string, commandsChildren: WbxmlElement[]):
     ]);
 }
 
-/** Builds a command instance with `repos` directly poked to the given fake, bypassing @Init/DI entirely -
- * mirrors MeetingResponseCommand.test.ts's own established pattern for isolating a command's logic from real
- * DI/DB wiring. */
+/** Builds a command instance with `repos`/`adapters` directly poked to the given fakes, bypassing @Init/DI
+ * entirely - mirrors MeetingResponseCommand.test.ts's own established pattern for isolating a command's logic
+ * from real DI/DB wiring. `mailboxRepo` is a bare fake resolving a minimal `Mailbox` - only exercised by the
+ * one test whose adapter implements `newEntityDefaults` (mailbox-dependent defaults). */
 async function buildCommand(collectionClass: string, adapter: EasCollectionSyncAdapter<any>, repo: any): Promise<SyncCommandMongo> {
     const objectFactory = new ObjectFactory(config, Logger());
     const command = await objectFactory.newInstance<SyncCommandMongo>(SyncCommandMongo, { initialize: false });
-    (command as any).collectionBindings = { [collectionClass]: { entityClass: class {}, adapter } };
+    (command as any).collectionBindings = { [collectionClass]: { entityClass: class {}, adapterClass: class {} } };
     (command as any).repos = new Map([[collectionClass, repo]]);
+    (command as any).adapters = new Map([[collectionClass, adapter]]);
+    (command as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue({ uid: "mbx-1", primarySmtpAddress: "owner@example.com", displayName: "Owner" }) };
     (command as any).windowSize = 100;
     return command;
 }
@@ -138,6 +141,26 @@ describe("SyncCommand Tests (client-originated Commands, isolated)", () => {
                 { icalUid: "generated@eas", sequence: 5, mailboxUid: "mbx-1", folderUid: FOLDER_UID },
                 { ignoreACL: true },
             );
+        });
+
+        it("Rejects with Status 6 when the caller's own mailbox has vanished (needed for newEntityDefaults()).", async () => {
+            const repo = fakeRepo();
+            const adapter = fakeAdapter({
+                fromApplicationData: () => ({}),
+                newEntityDefaults: () => ({}),
+            });
+            const command = await buildCommand("Fake", adapter, repo);
+            (command as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue(undefined) };
+            const request = syncRequest("Fake", [
+                element(WbxmlCodePage.AirSync, "Add", [element(WbxmlCodePage.AirSync, "ApplicationData", [])]),
+            ]);
+            const { ctx } = buildContext(request);
+
+            const response = await command.handle(ctx);
+
+            const add = findChild(findChild(collection(response!), "Responses")!, "Add")!;
+            expect(childText(add, "Status")).toBe("6");
+            expect(repo.create).not.toHaveBeenCalled();
         });
 
         it("Rejects with Status 6 when the adapter has no fromApplicationData at all (e.g. Email).", async () => {

@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrors, ObjectFactory, RepoUtils, type RecoverableBaseEntity } from "@rapidrest/service-core";
-import { RecoverableRepoUtils } from "@rapidmx/restapi";
+import { RecoverableRepoUtils, type Mailbox } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import { computeChanges, formatSyncKey, persistDeviceSyncState, resolveSyncKey } from "../EasSyncKeyUtils.js";
@@ -18,13 +18,16 @@ const { Config, Init } = ObjectDecorators;
 const DEFAULT_WINDOW_SIZE = 100;
 
 /** Binds one MS-ASCMD `Class` value (`"Email"`, `"Contacts"`, ...) to the concrete entity class `SyncCommand`
- * should build a `RepoUtils` for, and the adapter that maps that entity to/from `ApplicationData`. Supplied by
- * the Mongo/SQL concrete subclasses, one map entry per collection type currently supported (only `Email` as of
- * this step; `Contacts`/`Calendar`/`Tasks` land in later steps by adding more entries, not by changing this
- * class). */
+ * should build a `RepoUtils` for, and the adapter class that maps that entity to/from `ApplicationData`.
+ * Supplied by the Mongo/SQL concrete subclasses, one map entry per supported collection type.
+ *
+ * `adapterClass`, not a pre-built `adapter` instance: `SyncCommand.init()` instantiates each one itself via
+ * `ObjectFactory`, so an adapter can `@Inject` its own dependencies (`EmailSyncAdapter` needs `BlobStore` for a
+ * Draft's body) exactly like any other DI-managed class in this library - a bare `new EmailSyncAdapter()` has
+ * no way to satisfy that. */
 export interface SyncCollectionBinding<T extends RecoverableBaseEntity> {
     entityClass: any;
-    adapter: EasCollectionSyncAdapter<T>;
+    adapterClass: any;
 }
 
 /**
@@ -67,6 +70,11 @@ export abstract class SyncCommand implements EasCommandHandler {
 
     protected abstract collectionBindings: Record<string, SyncCollectionBinding<any>>;
 
+    /** Supplied by the Mongo/SQL concrete subclasses so a client-originated `Add`'s `newEntityDefaults()` can
+     * be given the caller's own `Mailbox` (`EmailSyncAdapter` needs it for a new Draft's `from`) - same
+     * one-line-per-backend pattern `MeetingResponseCommand`/`SettingsCommand` already use. */
+    protected abstract mailboxClass: any;
+
     @Config("mail:eas:sync_window_size", DEFAULT_WINDOW_SIZE)
     private windowSize: number = DEFAULT_WINDOW_SIZE;
 
@@ -74,9 +82,15 @@ export abstract class SyncCommand implements EasCommandHandler {
     private _objectFactory?: ObjectFactory;
 
     private repos = new Map<string, RepoUtils<any>>();
+    private adapters = new Map<string, EasCollectionSyncAdapter<any>>();
+    private mailboxRepo?: RepoUtils<any>;
 
     @Init
     public async init(): Promise<void> {
+        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.mailboxClass.name,
+            args: [this.mailboxClass],
+        });
         for (const [collectionClass, binding] of Object.entries(this.collectionBindings)) {
             // RecoverableRepoUtils, not plain RepoUtils: SyncCommand now originates its own deletes
             // (`applyDelete`) - without it, a soft-delete here wouldn't bump `dateModified`/`version`,
@@ -89,7 +103,23 @@ export abstract class SyncCommand implements EasCommandHandler {
                     args: [binding.entityClass],
                 }),
             );
+            this.adapters.set(collectionClass, await this._objectFactory!.newInstance(binding.adapterClass));
         }
+    }
+
+    /** Resolves the caller's own `Mailbox` at most once per request, and only if actually needed - most `Sync`
+     * requests contain no client-originated `Add` at all, so most requests never pay this extra round trip. */
+    private mailboxLoader(ctx: EasCommandContext): () => Promise<Mailbox> {
+        let cached: Mailbox | undefined;
+        return async () => {
+            if (!cached) {
+                cached = await this.mailboxRepo!.findOne(ctx.mailboxUid, { ignoreACL: true });
+                if (!cached) {
+                    throw new ApiError(ApiErrors.NOT_FOUND, 404, "The caller's own mailbox no longer exists.");
+                }
+            }
+            return cached;
+        };
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
@@ -105,8 +135,9 @@ export abstract class SyncCommand implements EasCommandHandler {
         let folderSyncKeys: Record<string, string> | undefined;
         let folderCollectionClasses: Record<string, string> | undefined;
 
+        const getMailbox = this.mailboxLoader(ctx);
         for (const collectionEl of collectionEls) {
-            const result = await this.processCollection(ctx, collectionEl);
+            const result = await this.processCollection(ctx, collectionEl, getMailbox);
             collectionElements.push(result.collectionElement);
             if (result.folderUid && result.newSyncKey) {
                 folderSyncKeys = {
@@ -142,6 +173,7 @@ export abstract class SyncCommand implements EasCommandHandler {
     private async processCollection(
         ctx: EasCommandContext,
         collectionEl: WbxmlElement,
+        getMailbox: () => Promise<Mailbox>,
     ): Promise<{ collectionElement: WbxmlElement; folderUid?: string; newSyncKey?: string; rememberedClass?: string }> {
         const requestedClass: string | undefined = childText(collectionEl, "Class");
         const folderUid: string | undefined = childText(collectionEl, "CollectionId");
@@ -156,9 +188,9 @@ export abstract class SyncCommand implements EasCommandHandler {
             return { collectionElement: this.collectionResponse(collectionClass, folderUid, "4", clientSyncKey) };
         }
 
-        const binding: SyncCollectionBinding<any> | undefined = this.collectionBindings[collectionClass];
         const repo: RepoUtils<any> | undefined = this.repos.get(collectionClass);
-        if (!binding || !repo) {
+        const adapter: EasCollectionSyncAdapter<any> | undefined = this.adapters.get(collectionClass);
+        if (!repo || !adapter) {
             return { collectionElement: this.collectionResponse(collectionClass, folderUid, "4", clientSyncKey) };
         }
 
@@ -198,12 +230,12 @@ export abstract class SyncCommand implements EasCommandHandler {
         };
         if (requestCommands) {
             for (const el of findChildren(requestCommands, "Add")) {
-                const outcome = await this.applyAdd(binding, repo, ctx.mailboxUid, folderUid, el);
+                const outcome = await this.applyAdd(adapter, repo, ctx.mailboxUid, folderUid, el, getMailbox);
                 if (outcome.response) responseEntries.push(outcome.response);
                 note(outcome.writtenAt);
             }
             for (const el of findChildren(requestCommands, "Change")) {
-                const outcome = await this.applyChange(binding, repo, el);
+                const outcome = await this.applyChange(adapter, repo, el);
                 if (outcome.response) responseEntries.push(outcome.response);
                 note(outcome.writtenAt);
             }
@@ -232,8 +264,8 @@ export abstract class SyncCommand implements EasCommandHandler {
         }
 
         const commandElements: WbxmlElement[] = [
-            ...changes.adds.map((item) => this.itemToCommandElement("Add", binding.adapter, item)),
-            ...changes.changes.map((item) => this.itemToCommandElement("Change", binding.adapter, item)),
+            ...changes.adds.map((item) => this.itemToCommandElement("Add", adapter, item)),
+            ...changes.changes.map((item) => this.itemToCommandElement("Change", adapter, item)),
             ...changes.deletes.map((item) =>
                 element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", item.uid)]),
             ),
@@ -278,24 +310,24 @@ export abstract class SyncCommand implements EasCommandHandler {
     }
 
     private async applyAdd(
-        binding: SyncCollectionBinding<any>,
+        adapter: EasCollectionSyncAdapter<any>,
         repo: RepoUtils<any>,
         mailboxUid: string,
         folderUid: string,
         el: WbxmlElement,
+        getMailbox: () => Promise<Mailbox>,
     ): Promise<{ response?: WbxmlElement; writtenAt?: Date }> {
         const clientId = childText(el, "ClientId");
         const appData = findChild(el, "ApplicationData");
         // [MS-ASCMD] "Add (Sync)": "The Add element cannot be used to add any non-draft email items from the
         // client to the server" - this pragmatic subset extends that same Status 6 to every collection whose
-        // adapter has no fromApplicationData at all (only EmailSyncAdapter, today), rather than special-casing
-        // "Email" by name.
-        if (!binding.adapter.fromApplicationData || !appData) {
+        // adapter has no fromApplicationData at all, rather than special-casing "Email" by name.
+        if (!adapter.fromApplicationData || !appData) {
             return { response: this.addResponseElement(clientId, undefined, "6") };
         }
         try {
-            const defaults = binding.adapter.newEntityDefaults ? binding.adapter.newEntityDefaults() : {};
-            const partial = binding.adapter.fromApplicationData(appData);
+            const defaults = adapter.newEntityDefaults ? adapter.newEntityDefaults(await getMailbox()) : {};
+            const partial = await adapter.fromApplicationData(appData);
             const created = await repo.create({ ...defaults, ...partial, mailboxUid, folderUid } as any, { ignoreACL: true });
             return {
                 response: this.addResponseElement(clientId, created.uid, "1"),
@@ -310,7 +342,7 @@ export abstract class SyncCommand implements EasCommandHandler {
     }
 
     private async applyChange(
-        binding: SyncCollectionBinding<any>,
+        adapter: EasCollectionSyncAdapter<any>,
         repo: RepoUtils<any>,
         el: WbxmlElement,
     ): Promise<{ response?: WbxmlElement; writtenAt?: Date }> {
@@ -318,7 +350,7 @@ export abstract class SyncCommand implements EasCommandHandler {
         if (!serverId) {
             return {};
         }
-        if (!binding.adapter.fromApplicationData) {
+        if (!adapter.fromApplicationData) {
             return { response: this.statusResponseElement("Change", serverId, "6") };
         }
         const existing = await repo.findOne(serverId, { ignoreACL: true });
@@ -330,7 +362,7 @@ export abstract class SyncCommand implements EasCommandHandler {
             return { response: this.statusResponseElement("Change", serverId, "6") };
         }
         try {
-            const partial = binding.adapter.fromApplicationData(appData, existing);
+            const partial = await adapter.fromApplicationData(appData, existing);
             const updated = await repo.update(
                 { uid: existing.uid, version: existing.version, ...partial },
                 existing,
