@@ -50,18 +50,19 @@ export interface SyncCollectionBinding<T extends RecoverableBaseEntity> {
  * omit it; omitting it for a folder never previously synced still gets `Status 4` (nothing to fall back to).
  *
  * **Pragmatic subset, deliberately not the full MS-ASCMD `Sync` surface**:
- * - **Client-originated `Add`/`Change`/`Delete` commands are accepted for `Contacts`/`Calendar`/`Tasks`** (a
- * device creating/editing/deleting an item directly - see `applyAdd`/`applyChange`/`applyDelete`). `Email`
- * only accepts `Delete` (a real, common operation - a client deleting a message locally); `Add` is rejected
- * with Status `6` for every collection whose bound `EasCollectionSyncAdapter` has no `fromApplicationData`
- * (only `EmailSyncAdapter`, today) - `[MS-ASCMD]` itself disallows non-draft email `Add` outright, and this
- * pragmatic subset doesn't implement Drafts-via-`Add` or Read/Flagged-via-`Change` for `Email` either
- * (composing/sending mail goes through `SendMailCommand` instead) - both documented gaps, not silently
- * dropped. Per `[MS-ASCMD]`'s own "Add (Sync)"/"Status (Sync)" pages: `Add` always gets a `Responses` entry
- * (it must report the assigned `ServerId`); `Change`/`Delete` only get one on **failure** - a silent success
- * means "assume it worked."
+ * - **Client-originated `Add`/`Change`/`Delete` commands are accepted for every collection type**, including
+ * `Email` (a device creating/editing a Draft, or deleting a message locally - see `applyAdd`/`applyChange`/
+ * `applyDelete`). `[MS-ASCMD]` itself disallows `Add`/`Change` for any *non-draft* `Email` item - this library
+ * doesn't verify a Sync `Email` Add/Change actually targets the caller's own Drafts folder specifically
+ * (matching how Contacts/Calendar/Tasks folder targeting is equally unchecked elsewhere - the client is
+ * trusted to only Add/Change within its own collection). A collection whose adapter has no
+ * `fromApplicationData` at all would get Status `6` for `Add`/`Change` instead, but every adapter today
+ * implements it. Per `[MS-ASCMD]`'s own "Add (Sync)"/"Status (Sync)" pages: `Add` always gets a `Responses`
+ * entry (it must report the assigned `ServerId`); `Change`/`Delete` only get one on **failure** - a silent
+ * success means "assume it worked."
  * - Only a body preview is returned per item (see `EmailSyncAdapter`'s own doc comment) - full body content is
- * fetched separately via `ItemOperationsCommand`.
+ * fetched separately via `ItemOperationsCommand`. A Draft's `Email` Add/Change is plain-text-only, with no
+ * attachment support (mirrors `ComposeMailCommand`'s own already-documented attachment gap).
  *
  * @author Jean-Philippe Steinmetz
  */

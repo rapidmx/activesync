@@ -13,10 +13,10 @@ import type { WbxmlElement } from "../codec/WbxmlElement.js";
  * fields go in `ApplicationData`, on which code pages) lives in one adapter per collection type, keyed by the
  * MS-ASCMD `Class` value (`"Email"`, `"Contacts"`, `"Calendar"`, `"Tasks"`) it answers to.
  *
- * `fromApplicationData` is deliberately optional: `EmailSyncAdapter` doesn't implement it (client-originated
- * `Add`/`Change` isn't supported for `Email` - see `SyncCommand`'s own doc comment for why), and `SyncCommand`
- * uses its absence as the capability check, answering Status `6` for those operations rather than needing a
- * separate flag that could drift out of sync with which adapters actually implement it.
+ * `fromApplicationData` is deliberately optional: `SyncCommand` uses its absence as the capability check,
+ * answering Status `6` for `Add`/`Change` on a collection whose adapter doesn't implement it, rather than
+ * needing a separate flag that could drift out of sync with which adapters actually implement it. Every
+ * adapter today (`Email`, `Contacts`, `Calendar`, `Tasks`) implements it.
  *
  * @author Jean-Philippe Steinmetz
  */

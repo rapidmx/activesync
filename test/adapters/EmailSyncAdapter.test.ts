@@ -1,0 +1,250 @@
+///////////////////////////////////////////////////////////////////////////////
+// Copyright (C) 2026 Jean-Philippe Steinmetz
+// SPDX-License-Identifier: MPL-2.0
+///////////////////////////////////////////////////////////////////////////////
+// EmailSyncAdapter is pure mapping logic plus a BlobStore write for Draft bodies - toApplicationData and the
+// end-to-end Add/Change flow are already exercised via test/routes/{mongo,sql}/EasRoute.test.ts's real Sync
+// command tests; this file is reserved for fromApplicationData's own field-by-field ghosting/parsing edge
+// cases (Importance/Read/Flag/address-list parsing), which are far more precise to verify directly than by
+// threading every combination through a full HTTP+DB round trip, and newEntityDefaults() in isolation.
+import { WbxmlCodePage } from "../../src/codec/WbxmlCodePages.js";
+import { element, textElement, type WbxmlElement } from "../../src/codec/WbxmlElement.js";
+import { EmailSyncAdapter } from "../../src/adapters/EmailSyncAdapter.js";
+import { MessageImportance, RecipientType, type Mailbox, type Message } from "@rapidmx/restapi";
+
+function appData(children: WbxmlElement[]): WbxmlElement {
+    return element(WbxmlCodePage.AirSync, "ApplicationData", children);
+}
+
+function buildAdapter(): { adapter: EmailSyncAdapter; put: ReturnType<typeof vi.fn> } {
+    const adapter = new EmailSyncAdapter();
+    const put = vi.fn().mockResolvedValue(undefined);
+    (adapter as any).blobStore = { put, get: vi.fn(), getStream: vi.fn(), delete: vi.fn(), exists: vi.fn(), size: vi.fn() };
+    return { adapter, put };
+}
+
+const baseMessage: Message = {
+    uid: "msg-1",
+    version: 1,
+    dateCreated: new Date(),
+    dateModified: new Date(),
+    deleted: false,
+    mailboxUid: "mbx-1",
+    folderUid: "folder-1",
+    messageId: "<existing@example.com>",
+    subject: "Existing Subject",
+    from: { address: "sender@example.com", type: RecipientType.TO },
+    recipients: [{ address: "to@example.com", type: RecipientType.TO }],
+    sentDate: new Date("2026-01-01T00:00:00.000Z"),
+    receivedDate: new Date("2026-01-01T00:00:00.000Z"),
+    bodyBlobKey: "bodies/existing",
+    bodyPreview: "Existing body",
+    flags: { read: false, flagged: false, answered: false, forwarded: false },
+    importance: MessageImportance.NORMAL,
+    references: [],
+    hasAttachments: false,
+};
+
+describe("EmailSyncAdapter Tests", () => {
+    it("Reports the Email collection class.", () => {
+        expect(new EmailSyncAdapter().collectionClass).toBe("Email");
+    });
+
+    describe("fromApplicationData", () => {
+        it("Parses Subject when present, omitting it from the partial when absent.", async () => {
+            const { adapter } = buildAdapter();
+            const withSubject = await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "Subject", "Hi")]));
+            expect(withSubject.subject).toBe("Hi");
+
+            const without = await adapter.fromApplicationData(appData([]));
+            expect("subject" in without).toBe(false);
+        });
+
+        it("Parses a bare To address list.", async () => {
+            const { adapter } = buildAdapter();
+            const partial = await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "To", "a@example.com; b@example.com")]));
+            expect(partial.recipients).toEqual([
+                { address: "a@example.com", type: RecipientType.TO },
+                { address: "b@example.com", type: RecipientType.TO },
+            ]);
+        });
+
+        it("Parses To/Cc with display names, combining both into one recipients list.", async () => {
+            const { adapter } = buildAdapter();
+            const partial = await adapter.fromApplicationData(
+                appData([
+                    textElement(WbxmlCodePage.Email, "To", "Jane Doe <jane@example.com>"),
+                    textElement(WbxmlCodePage.Email, "Cc", "John Smith <john@example.com>, plain@example.com, <bare@example.com>"),
+                ]),
+            );
+            expect(partial.recipients).toEqual([
+                { address: "jane@example.com", displayName: "Jane Doe", type: RecipientType.TO },
+                { address: "john@example.com", displayName: "John Smith", type: RecipientType.CC },
+                { address: "plain@example.com", type: RecipientType.CC },
+                { address: "bare@example.com", type: RecipientType.CC },
+            ]);
+        });
+
+        it("Leaves recipients untouched when neither To nor Cc is present.", async () => {
+            const { adapter } = buildAdapter();
+            const partial = await adapter.fromApplicationData(appData([]));
+            expect("recipients" in partial).toBe(false);
+        });
+
+        it("Maps every Importance code to its MessageImportance, defaulting an unrecognized code to NORMAL.", async () => {
+            const { adapter } = buildAdapter();
+            expect((await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "Importance", "0")]))).importance).toBe(
+                MessageImportance.LOW,
+            );
+            expect((await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "Importance", "2")]))).importance).toBe(
+                MessageImportance.HIGH,
+            );
+            expect((await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "Importance", "9")]))).importance).toBe(
+                MessageImportance.NORMAL,
+            );
+        });
+
+        it("Leaves importance untouched when the tag is absent.", async () => {
+            const { adapter } = buildAdapter();
+            expect("importance" in (await adapter.fromApplicationData(appData([])))).toBe(false);
+        });
+
+        it("Builds flags from class defaults when Read/Flag are set on a fresh item (no existing).", async () => {
+            const { adapter } = buildAdapter();
+            const partial = await adapter.fromApplicationData(
+                appData([textElement(WbxmlCodePage.Email, "Read", "1"), textElement(WbxmlCodePage.Email, "Flag", "1")]),
+            );
+            expect(partial.flags).toEqual({ read: true, flagged: true, answered: false, forwarded: false });
+        });
+
+        it("Merges only the touched flag onto existing's other flags when only one of Read/Flag is present.", async () => {
+            const { adapter } = buildAdapter();
+            const existing: Message = { ...baseMessage, flags: { read: false, flagged: false, answered: true, forwarded: true } };
+            const partial = await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "Read", "1")]), existing);
+            expect(partial.flags).toEqual({ read: true, flagged: false, answered: true, forwarded: true });
+        });
+
+        it("Leaves flags untouched when neither Read nor Flag is present.", async () => {
+            const { adapter } = buildAdapter();
+            expect("flags" in (await adapter.fromApplicationData(appData([])))).toBe(false);
+        });
+
+        it("Writes a new blob key and minimal MIME body for an Add (no existing item).", async () => {
+            const { adapter, put } = buildAdapter();
+            const partial = await adapter.fromApplicationData(
+                appData([
+                    textElement(WbxmlCodePage.Email, "Subject", "New Draft"),
+                    textElement(WbxmlCodePage.Email, "To", "to@example.com"),
+                    element(WbxmlCodePage.AirSyncBase, "Body", [
+                        textElement(WbxmlCodePage.AirSyncBase, "Type", "1"),
+                        textElement(WbxmlCodePage.AirSyncBase, "Data", "Body text"),
+                    ]),
+                ]),
+            );
+
+            expect(partial.bodyBlobKey).toMatch(/^bodies\//);
+            expect(partial.bodyPreview).toBe("Body text");
+            expect(put).toHaveBeenCalledTimes(1);
+            const [key, buffer, options] = put.mock.calls[0];
+            expect(key).toBe(partial.bodyBlobKey);
+            expect(options).toEqual({ contentType: "message/rfc822" });
+            const mime = (buffer as Buffer).toString("utf-8");
+            expect(mime).toContain("Subject: New Draft");
+            expect(mime).toContain("To: to@example.com");
+            expect(mime).toContain("Body text");
+        });
+
+        it("Omits the To header and includes only Cc when a Draft has Cc but no To recipients.", async () => {
+            const { adapter, put } = buildAdapter();
+            const partial = await adapter.fromApplicationData(
+                appData([
+                    textElement(WbxmlCodePage.Email, "Cc", "cc-only@example.com"),
+                    element(WbxmlCodePage.AirSyncBase, "Body", [
+                        textElement(WbxmlCodePage.AirSyncBase, "Type", "1"),
+                        textElement(WbxmlCodePage.AirSyncBase, "Data", "Body text"),
+                    ]),
+                ]),
+            );
+
+            const mime = (put.mock.calls[0][1] as Buffer).toString("utf-8");
+            expect(mime).not.toContain("To:");
+            expect(mime).toContain("Cc: cc-only@example.com");
+            expect(partial.recipients).toEqual([{ address: "cc-only@example.com", type: RecipientType.CC }]);
+        });
+
+        it("Reuses existing.bodyBlobKey on a Change rather than minting a new one.", async () => {
+            const { adapter, put } = buildAdapter();
+            const partial = await adapter.fromApplicationData(
+                appData([
+                    element(WbxmlCodePage.AirSyncBase, "Body", [
+                        textElement(WbxmlCodePage.AirSyncBase, "Type", "1"),
+                        textElement(WbxmlCodePage.AirSyncBase, "Data", "Updated text"),
+                    ]),
+                ]),
+                baseMessage,
+            );
+
+            expect(partial.bodyBlobKey).toBe(baseMessage.bodyBlobKey);
+            expect(partial.bodyPreview).toBe("Updated text");
+            expect(put).toHaveBeenCalledWith(baseMessage.bodyBlobKey, expect.any(Buffer), { contentType: "message/rfc822" });
+            const mime = (put.mock.calls[0][1] as Buffer).toString("utf-8");
+            // Falls back to existing's own Subject/From/recipients when the Change doesn't touch them.
+            expect(mime).toContain(`Subject: ${baseMessage.subject}`);
+            expect(mime).toContain(`From: ${baseMessage.from.address}`);
+        });
+
+        it("Mints a fresh blob key on Change when existing.bodyBlobKey was never set (no prior Body on Add).", async () => {
+            const { adapter, put } = buildAdapter();
+            const existingWithNoBody: Message = { ...baseMessage, bodyBlobKey: "" };
+            const partial = await adapter.fromApplicationData(
+                appData([
+                    element(WbxmlCodePage.AirSyncBase, "Body", [
+                        textElement(WbxmlCodePage.AirSyncBase, "Type", "1"),
+                        textElement(WbxmlCodePage.AirSyncBase, "Data", "First body"),
+                    ]),
+                ]),
+                existingWithNoBody,
+            );
+            expect(partial.bodyBlobKey).toMatch(/^bodies\//);
+            expect(partial.bodyBlobKey).not.toBe("");
+            expect(put).toHaveBeenCalledTimes(1);
+        });
+
+        it("Leaves the body untouched when no Body element is present.", async () => {
+            const { adapter, put } = buildAdapter();
+            const partial = await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "Subject", "No body")]));
+            expect("bodyBlobKey" in partial).toBe(false);
+            expect("bodyPreview" in partial).toBe(false);
+            expect(put).not.toHaveBeenCalled();
+        });
+
+        it("Returns an empty partial for an ApplicationData element with no recognized children.", async () => {
+            const { adapter } = buildAdapter();
+            expect(await adapter.fromApplicationData(appData([]))).toEqual({});
+        });
+    });
+
+    describe("newEntityDefaults", () => {
+        it("Populates from the caller's own mailbox and sensible blank-draft defaults.", () => {
+            const adapter = new EmailSyncAdapter();
+            const mailbox: Mailbox = {
+                uid: "mbx-1",
+                primarySmtpAddress: "owner@example.com",
+                displayName: "Owner Name",
+            } as unknown as Mailbox;
+
+            const defaults = adapter.newEntityDefaults(mailbox);
+
+            expect(defaults.from).toEqual({ address: "owner@example.com", displayName: "Owner Name", type: RecipientType.TO });
+            expect(defaults.subject).toBe("");
+            expect(defaults.recipients).toEqual([]);
+            expect(defaults.bodyBlobKey).toBe("");
+            expect(defaults.bodyPreview).toBe("");
+            expect(defaults.importance).toBe(MessageImportance.NORMAL);
+            expect(defaults.flags).toEqual({ read: true, flagged: false, answered: false, forwarded: false });
+            expect(defaults.hasAttachments).toBe(false);
+            expect(defaults.references).toEqual([]);
+            expect(defaults.messageId).toMatch(/^<.+@eas>$/);
+        });
+    });
+});

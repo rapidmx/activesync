@@ -1476,10 +1476,10 @@ describe("Route:EasRouteSQL Tests", () => {
                 expect(created?.priority).toBe(TaskPriority.HIGH);
             });
 
-            it("Rejects a client-originated Email Add with Status 6, per [MS-ASCMD]'s own non-draft-email rule.", async () => {
+            it("Creates a Draft via a client-originated Email Add, storing a Fetch-able MIME body.", async () => {
                 const mailbox = await createMailbox(owner.uid);
                 await provisionDevice("dev1");
-                const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Drafts", type: FolderType.DRAFTS });
                 const syncKey = await initialSyncKey("Email", folder.uid);
 
                 const response = await postWbxml(
@@ -1488,14 +1488,66 @@ describe("Route:EasRouteSQL Tests", () => {
                     syncRequestWithCommands(syncKey, "Email", folder.uid, [
                         element(WbxmlCodePage.AirSync, "Add", [
                             textElement(WbxmlCodePage.AirSync, "ClientId", "client-1"),
-                            element(WbxmlCodePage.AirSync, "ApplicationData", []),
+                            element(WbxmlCodePage.AirSync, "ApplicationData", [
+                                textElement(WbxmlCodePage.Email, "Subject", "Draft Subject"),
+                                textElement(WbxmlCodePage.Email, "To", "recipient@example.com"),
+                                element(WbxmlCodePage.AirSyncBase, "Body", [
+                                    textElement(WbxmlCodePage.AirSyncBase, "Type", "1"),
+                                    textElement(WbxmlCodePage.AirSyncBase, "Data", "Draft body text."),
+                                ]),
+                            ]),
                         ]),
                     ]),
                 );
 
                 const add = findChild(findChild(collectionOf(response), "Responses")!, "Add")!;
                 expect(childText(add, "ClientId")).toBe("client-1");
-                expect(childText(add, "Status")).toBe("6");
+                expect(childText(add, "Status")).toBe("1");
+                const serverId = childText(add, "ServerId")!;
+                expect(serverId).toBeTruthy();
+
+                const created = await messageRepo.findOne({ where: { uid: serverId } });
+                expect(created?.subject).toBe("Draft Subject");
+                expect(created?.recipients).toEqual([{ address: "recipient@example.com", type: RecipientType.TO }]);
+                expect(created?.from.address).toBe(mailbox.primarySmtpAddress);
+                expect(created?.bodyPreview).toBe("Draft body text.");
+                const mime = (await blobStore().get(created!.bodyBlobKey)).toString("utf-8");
+                expect(mime).toContain("Subject: Draft Subject");
+                expect(mime).toContain("To: recipient@example.com");
+                expect(mime).toContain("Draft body text.");
+            });
+
+            it("Updates a Draft via a client-originated Email Change silently, overwriting its MIME body.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Drafts", type: FolderType.DRAFTS });
+                const message = await createMessage(mailbox.uid, folder.uid, { subject: "Original Subject" });
+                const originalBlobKey = message.bodyBlobKey;
+                const syncKey = await initialSyncKey("Email", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Email", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Change", [
+                            textElement(WbxmlCodePage.AirSync, "ServerId", message.uid),
+                            element(WbxmlCodePage.AirSync, "ApplicationData", [
+                                element(WbxmlCodePage.AirSyncBase, "Body", [
+                                    textElement(WbxmlCodePage.AirSyncBase, "Type", "1"),
+                                    textElement(WbxmlCodePage.AirSyncBase, "Data", "Updated body text."),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                expect(findChild(collectionOf(response), "Responses")).toBeUndefined();
+                const updated = await messageRepo.findOne({ where: { uid: message.uid } });
+                expect(updated?.subject).toBe("Original Subject");
+                expect(updated?.bodyPreview).toBe("Updated body text.");
+                expect(updated?.bodyBlobKey).toBe(originalBlobKey);
+                const mime = (await blobStore().get(updated!.bodyBlobKey)).toString("utf-8");
+                expect(mime).toContain("Updated body text.");
             });
 
             it("Updates a contact via a client-originated Change silently (no Responses entry), and persists it.", async () => {
