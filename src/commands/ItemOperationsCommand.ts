@@ -172,8 +172,13 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
             bodyText = parsed.text ?? "";
         }
 
+        // Per MS-ASAIRSYNCBASE, EstimatedDataSize reports the body's size BEFORE any truncation was applied
+        // (so the client knows how much more content exists beyond what it received) - captured here, before
+        // truncateUtf8() below reassigns bodyText to the shorter value.
+        const estimatedDataSize = Buffer.byteLength(bodyText, "utf8");
+
         let truncated = false;
-        if (truncationSize !== undefined && Number.isFinite(truncationSize) && Buffer.byteLength(bodyText, "utf8") > truncationSize) {
+        if (truncationSize !== undefined && Number.isFinite(truncationSize) && estimatedDataSize > truncationSize) {
             bodyText = truncateUtf8(bodyText, truncationSize);
             truncated = true;
         }
@@ -186,7 +191,7 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
             element(WbxmlCodePage.ItemOperations, "Properties", [
                 element(WbxmlCodePage.AirSyncBase, "Body", [
                     textElement(WbxmlCodePage.AirSyncBase, "Type", bodyType),
-                    textElement(WbxmlCodePage.AirSyncBase, "EstimatedDataSize", String(Buffer.byteLength(bodyText, "utf8"))),
+                    textElement(WbxmlCodePage.AirSyncBase, "EstimatedDataSize", String(estimatedDataSize)),
                     textElement(WbxmlCodePage.AirSyncBase, "Truncated", truncated ? "1" : "0"),
                     textElement(WbxmlCodePage.AirSyncBase, "Data", bodyText),
                 ]),

@@ -2,14 +2,14 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ObjectDecorators } from "@rapidrest/core";
-import { ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { ApiError, ObjectDecorators } from "@rapidrest/core";
+import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { RecoverableRepoUtils } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import { computeChanges, resolveSyncKey } from "../EasSyncKeyUtils.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
-const { Config, Init } = ObjectDecorators;
+const { Config, Init, Inject } = ObjectDecorators;
 
 /** Caps how many changes `computeChanges()` will actually enumerate (and therefore count) per collection for
  * an already-synced folder - a real estimate, not a precise unbounded count, matching the command's own name;
@@ -41,6 +41,11 @@ export interface EstimateCollectionBinding {
  * own doc comment for why this is a real, documented approximation on a very active folder rather than a
  * precise unbounded count.
  *
+ * **ACL-checked like `Sync`**: `estimateCollection()` requires `ACLAction.READ` on the client-supplied
+ * `CollectionId` before counting anything - without it, a crafted `CollectionId` belonging to another
+ * mailbox's folder would return a real pending-change count for it. A denied folder is reported identically to
+ * an unrecognized collection (`Status 2`), never distinguishable from "you don't have this collection at all".
+ *
  * @author Jean-Philippe Steinmetz
  */
 export abstract class GetItemEstimateCommand implements EasCommandHandler {
@@ -53,6 +58,9 @@ export abstract class GetItemEstimateCommand implements EasCommandHandler {
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
+
+    @Inject(ACLUtils)
+    private aclUtils?: ACLUtils;
 
     private repos = new Map<string, RepoUtils<any>>();
 
@@ -70,6 +78,9 @@ export abstract class GetItemEstimateCommand implements EasCommandHandler {
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
+        if (!this.aclUtils) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
         const collections = ctx.request ? findChild(ctx.request, "Collections") : undefined;
         const collectionEls = collections ? findChildren(collections, "Collection") : [];
         if (collectionEls.length === 0) {
@@ -97,6 +108,13 @@ export abstract class GetItemEstimateCommand implements EasCommandHandler {
         if (!collectionClass || !folderUid || !repo) {
             // Status 2 ("Invalid collection") per [MS-ASCMD] - the request named a collection this device
             // hasn't (or can't) sync.
+            return element(WbxmlCodePage.ItemEstimate, "Response", [
+                textElement(WbxmlCodePage.ItemEstimate, "Status", "2"),
+            ]);
+        }
+
+        // Never count against a folder the caller can't even read - see this class's own doc comment.
+        if (!(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.READ))) {
             return element(WbxmlCodePage.ItemEstimate, "Response", [
                 textElement(WbxmlCodePage.ItemEstimate, "Status", "2"),
             ]);

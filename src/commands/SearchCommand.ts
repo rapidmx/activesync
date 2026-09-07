@@ -124,7 +124,9 @@ export abstract class SearchCommand implements EasCommandHandler {
                 element(WbxmlCodePage.Search, "Store", [
                     textElement(WbxmlCodePage.Search, "Status", "1"),
                     ...page.map((contact) => this.contactToResult(contact)),
-                    textElement(WbxmlCodePage.Search, "Range", `${start}-${Math.min(end, matches.length - 1)}`),
+                    // Clamped to 0 (not -1) when matches is empty - `Math.min(end, matches.length - 1)` alone
+                    // would otherwise produce the malformed "0--1" a strict client parser could reject.
+                    textElement(WbxmlCodePage.Search, "Range", `${start}-${Math.max(0, Math.min(end, matches.length - 1))}`),
                     textElement(WbxmlCodePage.Search, "Total", String(matches.length)),
                 ]),
             ]),

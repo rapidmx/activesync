@@ -2432,6 +2432,9 @@ describe("Route:EasRouteMongo Tests", () => {
             const body = findChild(findChild(fetch, "Properties")!, "Body")!;
             expect(childText(body, "Data")).toBe("0123");
             expect(childText(body, "Truncated")).toBe("1");
+            // Per MS-ASAIRSYNCBASE, EstimatedDataSize is the size BEFORE truncation (10), not the 4 bytes
+            // actually returned - otherwise the client has no way to know more content exists.
+            expect(childText(body, "EstimatedDataSize")).toBe("10");
         });
 
         it("Backs off a truncation boundary that would otherwise split a multi-byte UTF-8 character.", async () => {
@@ -2635,6 +2638,8 @@ describe("Route:EasRouteMongo Tests", () => {
             const store = findChild(findChild(response, "Response")!, "Store")!;
             expect(childText(store, "Total")).toBe("0");
             expect(findChild(store, "Result")).toBeUndefined();
+            // Not the malformed "0--1" a naive `matches.length - 1` would produce for zero matches.
+            expect(childText(store, "Range")).toBe("0-0");
         });
 
         it("Honors a Range to page results, while Total still reflects the full match count.", async () => {
@@ -3021,6 +3026,25 @@ describe("Route:EasRouteMongo Tests", () => {
             );
 
             expect(childText(findChild(response, "Response")!, "Status")).toBe("2");
+        });
+
+        it("Returns Status 2 (not a real count) for a CollectionId belonging to another mailbox's folder - IDOR regression.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const otherMailbox = await createMailbox(otherUser.uid);
+            const otherFolder = await createFolderWithAcl(otherMailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            await createMessage(otherMailbox.uid, otherFolder.uid);
+            await createMessage(otherMailbox.uid, otherFolder.uid);
+
+            const response = await postWbxml(
+                "GetItemEstimate",
+                "dev1",
+                estimateRequest([{ syncKey: "0", collectionClass: "Email", folderUid: otherFolder.uid }]),
+            );
+
+            const resp = findChild(response, "Response")!;
+            expect(childText(resp, "Status")).toBe("2");
+            expect(findChild(resp, "Collection")).toBeUndefined();
         });
 
         it("Handles multiple collections in one request independently.", async () => {
