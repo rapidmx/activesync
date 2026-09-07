@@ -42,11 +42,11 @@ export enum WbxmlCodePage {
 /**
  * Tag name -> token (byte, before the content/attribute flag bits are applied) tables, one per code page
  * actually touched by this library's pragmatic command subset (`Provision`/`FolderSync`/`Sync`/`SendMail`/
- * `SmartForward`/`SmartReply`/`ItemOperations`/`Ping`/`Search`/`MeetingResponse`/`Settings`). Deferred pages
- * (`AirNotification`, `Move`, `ItemEstimate`, `ResolveRecipients`, `ValidateCert`, `DocumentLibrary`, `Notes`,
- * `RightsManagement`, `Find`) are registered in `WbxmlCodePage` above (so `SWITCH_PAGE` decoding never fails
- * outright on them) but have no tag table here — nothing in this library's supported command set ever needs
- * to encode/decode a tag from one of them.
+ * `SmartForward`/`SmartReply`/`ItemOperations`/`Ping`/`Search`/`MeetingResponse`/`Settings`/`GetItemEstimate`/
+ * `MoveItems`/`ResolveRecipients`). Deferred pages (`AirNotification`, `ValidateCert`, `DocumentLibrary`,
+ * `Notes`, `RightsManagement`, `Find`) are registered in `WbxmlCodePage` above (so `SWITCH_PAGE` decoding never
+ * fails outright on them) but have no tag table here — nothing in this library's supported command set ever
+ * needs to encode/decode a tag from one of them.
  *
  * Values for `AirSync` (0) and `FolderHierarchy` (7) are transcribed directly from the published
  * [MS-ASWBXML] tables (`Code Page 0: AirSync`, `Code Page 7: FolderHierarchy`, learn.microsoft.com). Every
@@ -280,6 +280,33 @@ const TAGS_BY_PAGE: Readonly<Record<number, Readonly<Record<number, string>>>> =
         0x3b: "OnlineMeetingExternalLink",
         0x3c: "ClientUid",
     },
+    [WbxmlCodePage.Move]: {
+        0x05: "MoveItems",
+        0x06: "Move",
+        0x07: "SrcMsgId",
+        0x08: "SrcFldId",
+        0x09: "DstFldId",
+        0x0a: "Response",
+        0x0b: "Status",
+        0x0c: "DstMsgId",
+    },
+    [WbxmlCodePage.ItemEstimate]: {
+        0x05: "GetItemEstimate",
+        0x06: "Version", // deprecated
+        // 0x07-0x0a ("Folders"/"Folder"/"FolderType"/"FolderId") are the pre-12.0 legacy request/response shape
+        // - the modern (14.0+) GetItemEstimate this library actually implements reuses `WbxmlCodePage.AirSync`'s
+        // own `Collections`/`Collection`/`Class`/`CollectionId`/`SyncKey` via SWITCH_PAGE instead (the same
+        // cross-page-reuse pattern `ItemOperationsCommand.fetchMessage` already uses) - kept decodable here for
+        // completeness, never emitted by `GetItemEstimateCommand`.
+        0x07: "Folders", // deprecated (legacy pre-12.0 shape)
+        0x08: "Folder", // deprecated
+        0x09: "FolderType", // deprecated
+        0x0a: "FolderId", // deprecated
+        0x0b: "DateTime", // deprecated
+        0x0c: "Estimate",
+        0x0d: "Response",
+        0x0e: "Status",
+    },
     [WbxmlCodePage.FolderHierarchy]: {
         0x05: "Folders", // legacy (2.5, 12.0, 12.1)
         0x06: "Folder", // legacy
@@ -316,6 +343,33 @@ const TAGS_BY_PAGE: Readonly<Record<number, Readonly<Record<number, string>>>> =
         0x10: "ProposedStartTime",
         0x11: "ProposedEndTime",
         0x12: "SendResponse",
+    },
+    [WbxmlCodePage.ResolveRecipients]: {
+        0x05: "ResolveRecipients",
+        0x06: "Response",
+        0x07: "Status",
+        0x08: "Type",
+        0x09: "Recipient",
+        0x0a: "DisplayName",
+        0x0b: "EmailAddress",
+        0x0c: "Certificates",
+        0x0d: "Certificate",
+        0x0e: "MiniCertificate",
+        0x0f: "Options",
+        0x10: "To",
+        0x11: "CertificateRetrieval",
+        0x12: "RecipientCount",
+        0x13: "MaxCertificates",
+        0x14: "MaxAmbiguousRecipients",
+        0x15: "CertificateCount",
+        0x16: "Availability",
+        0x17: "StartTime",
+        0x18: "EndTime",
+        0x19: "MergedFreeBusy",
+        0x1a: "Picture",
+        0x1b: "MaxSize",
+        0x1c: "Data",
+        0x1d: "MaxPictures",
     },
     [WbxmlCodePage.Tasks]: {
         0x05: "Body",

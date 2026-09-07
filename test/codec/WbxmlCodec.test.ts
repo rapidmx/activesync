@@ -139,6 +139,55 @@ describe("WBXML codec Tests", () => {
             expect(switchPageOccurrences).toBe(1);
         });
 
+        it("Round-trips every tag on the Move (MoveItems) code page.", () => {
+            const tree: WbxmlElement = element(WbxmlCodePage.Move, "MoveItems", [
+                element(WbxmlCodePage.Move, "Move", [
+                    textElement(WbxmlCodePage.Move, "SrcMsgId", "msg-1"),
+                    textElement(WbxmlCodePage.Move, "SrcFldId", "folder-1"),
+                    textElement(WbxmlCodePage.Move, "DstFldId", "folder-2"),
+                ]),
+                element(WbxmlCodePage.Move, "Response", [
+                    textElement(WbxmlCodePage.Move, "Status", "3"),
+                    textElement(WbxmlCodePage.Move, "DstMsgId", "msg-1"),
+                ]),
+            ]);
+            const decoded: WbxmlElement = new WbxmlDecoder().decode(new WbxmlEncoder().encode(tree));
+            expect(decoded).toEqual(tree);
+        });
+
+        it("Round-trips every tag on the ItemEstimate (GetItemEstimate) code page.", () => {
+            const tree: WbxmlElement = element(WbxmlCodePage.ItemEstimate, "GetItemEstimate", [
+                element(WbxmlCodePage.AirSync, "Collections", [
+                    element(WbxmlCodePage.AirSync, "Collection", [
+                        textElement(WbxmlCodePage.AirSync, "Class", "Email"),
+                        textElement(WbxmlCodePage.AirSync, "CollectionId", "folder-1"),
+                        element(WbxmlCodePage.ItemEstimate, "Response", [
+                            textElement(WbxmlCodePage.ItemEstimate, "Status", "1"),
+                            textElement(WbxmlCodePage.ItemEstimate, "Estimate", "12"),
+                        ]),
+                    ]),
+                ]),
+            ]);
+            const decoded: WbxmlElement = new WbxmlDecoder().decode(new WbxmlEncoder().encode(tree));
+            expect(decoded).toEqual(tree);
+        });
+
+        it("Round-trips every tag on the ResolveRecipients code page.", () => {
+            const tree: WbxmlElement = element(WbxmlCodePage.ResolveRecipients, "ResolveRecipients", [
+                textElement(WbxmlCodePage.ResolveRecipients, "To", "jane@example.com"),
+                element(WbxmlCodePage.ResolveRecipients, "Response", [
+                    textElement(WbxmlCodePage.ResolveRecipients, "Status", "1"),
+                    element(WbxmlCodePage.ResolveRecipients, "Recipient", [
+                        textElement(WbxmlCodePage.ResolveRecipients, "Type", "1"),
+                        textElement(WbxmlCodePage.ResolveRecipients, "DisplayName", "Jane Doe"),
+                        textElement(WbxmlCodePage.ResolveRecipients, "EmailAddress", "jane@example.com"),
+                    ]),
+                ]),
+            ]);
+            const decoded: WbxmlElement = new WbxmlDecoder().decode(new WbxmlEncoder().encode(tree));
+            expect(decoded).toEqual(tree);
+        });
+
         it("Round-trips deeply nested structural elements (Sync/Collections/Collection/Commands/Add/ApplicationData).", () => {
             const tree: WbxmlElement = element(WbxmlCodePage.AirSync, "Sync", [
                 element(WbxmlCodePage.AirSync, "Collections", [
