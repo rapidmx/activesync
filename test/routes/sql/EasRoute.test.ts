@@ -2345,10 +2345,11 @@ describe("Route:EasRouteSQL Tests", () => {
             expect(childText(result, "CalendarId")).toBe(event.uid);
 
             const updated = await calendarEventRepo.findOne({ where: { uid: event.uid } });
+            expect(updated?.deleted).toBe(false);
             expect(updated?.attendees[0].responseStatus).toBe(AttendeeResponseStatus.ACCEPTED);
         });
 
-        it("Declines a meeting, updating the Attendee but omitting CalendarId from the response.", async () => {
+        it("Declines a meeting, soft-deleting the caller's own copy and omitting CalendarId from the response.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");
             const folder = await createFolderWithAcl(mailbox.uid, { name: "Calendar", type: FolderType.CALENDAR });
@@ -2380,7 +2381,10 @@ describe("Route:EasRouteSQL Tests", () => {
             expect(findChild(result, "CalendarId")).toBeUndefined();
 
             const updated = await calendarEventRepo.findOne({ where: { uid: event.uid } });
-            expect(updated?.attendees[0].responseStatus).toBe(AttendeeResponseStatus.DECLINED);
+            expect(updated?.deleted).toBe(true);
+            // Attendee status is left as-is (NEEDS_ACTION) since the event itself was removed instead - a
+            // status flip on a soon-to-be-deleted row would be meaningless.
+            expect(updated?.attendees[0].responseStatus).toBe(AttendeeResponseStatus.NEEDS_ACTION);
         });
 
         it("Returns 404 when RequestId references a calendar event that doesn't exist.", async () => {

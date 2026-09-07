@@ -25,11 +25,14 @@ const USER_RESPONSE_DECLINED = "3";
  * exposes as `ServerId` elsewhere (Sync/FolderSync) - no separate lookup table is needed.
  *
  * **Pragmatic subset**: only the first `<Request>` in the command is processed (the real spec allows several
- * per request, matching `Sync`'s own single-`Collection`-per-request scope in this library). A decline updates
- * the caller's own `Attendee.responseStatus` in place rather than deleting the calendar item outright (the
- * real spec's behavior) - the plan for this pragmatic subset deliberately avoids introducing that extra
- * "delete on behalf of the client" pathway; the response still omits `CalendarId` for a decline, matching the
- * spec's own convention, so a client relying on that signal isn't misled into thinking a new item was created.
+ * per request, matching `Sync`'s own single-`Collection`-per-request scope in this library). A **decline**
+ * soft-deletes the `CalendarEvent` (matching real Exchange behavior) rather than merely flipping the caller's
+ * own `Attendee.responseStatus` - each attendee has their own row already (`CalendarEvent.mailboxUid` scopes
+ * every event to a single mailbox, per this library's architecture), so deleting *this* row only removes the
+ * meeting from the declining attendee's own calendar, leaving the organizer's and every other attendee's own
+ * copy untouched. Accept/Tentative still update `Attendee.responseStatus` in place. The response omits
+ * `CalendarId` for a decline either way, matching the spec's own convention, so a client relying on that
+ * signal isn't misled into thinking a new item was created.
  *
  * `calendarEventClass`/`mailboxClass` are supplied by the Mongo/SQL concrete subclasses.
  *
@@ -98,14 +101,21 @@ export abstract class MeetingResponseCommand implements EasCommandHandler {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, "The caller is not an attendee of this calendar event.");
         }
 
-        const attendees = event.attendees.map((attendee, i) =>
-            i === attendeeIndex ? { ...attendee, responseStatus: USER_RESPONSE_STATUS[userResponse] } : attendee,
-        );
-        await this.calendarEventRepo.update(
-            { uid: event.uid, version: event.version, attendees } as any,
-            event,
-            { ignoreACL: true, user: ctx.user },
-        );
+        if (userResponse === USER_RESPONSE_DECLINED) {
+            // Soft-delete this attendee's own copy of the event - see this class's own doc comment for why
+            // that's correct here rather than merely flipping responseStatus (the real spec's own behavior:
+            // declining removes the meeting from the declining attendee's calendar).
+            await this.calendarEventRepo.delete(event.uid, { ignoreACL: true, user: ctx.user });
+        } else {
+            const attendees = event.attendees.map((attendee, i) =>
+                i === attendeeIndex ? { ...attendee, responseStatus: USER_RESPONSE_STATUS[userResponse] } : attendee,
+            );
+            await this.calendarEventRepo.update(
+                { uid: event.uid, version: event.version, attendees } as any,
+                event,
+                { ignoreACL: true, user: ctx.user },
+            );
+        }
 
         return element(WbxmlCodePage.MeetingResponse, "MeetingResponse", [
             element(WbxmlCodePage.MeetingResponse, "Result", [
