@@ -1106,7 +1106,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@rapidmx/activesync@workspace:."
   dependencies:
-    "@rapidmx/restapi": "npm:^0.1.0"
+    "@rapidmx/restapi": "npm:^0.2.0"
     "@rapidrest/cli": "npm:^1.0.1"
     "@rapidrest/core": "npm:^5.1.0"
     "@rapidrest/service-core": "npm:^1.3.0"
@@ -1141,15 +1141,15 @@ __metadata:
     vitest: "npm:^4.1.11"
     winston: "npm:^3.19.0"
   peerDependencies:
-    "@rapidmx/restapi": 0.1.x
+    "@rapidmx/restapi": 0.2.x
     "@rapidrest/core": 5.x
     "@rapidrest/service-core": 1.x
   languageName: unknown
   linkType: soft
 
-"@rapidmx/restapi@npm:^0.1.0":
-  version: 0.1.0
-  resolution: "@rapidmx/restapi@npm:0.1.0"
+"@rapidmx/restapi@npm:^0.2.0":
+  version: 0.2.0
+  resolution: "@rapidmx/restapi@npm:0.2.0"
   dependencies:
     html-to-text: "npm:^9.0.5"
     mailparser: "npm:^3.7.2"
@@ -1168,7 +1168,7 @@ __metadata:
       optional: true
     pdf-parse:
       optional: true
-  checksum: 10c0/c1a9eb6f3d576362d9ff6d40c6c2e2e900f950c1a0bd2177e5152b6eae89795e05131870b6fb5df6cb019b101aaf0953bc0e86c635072a4e66576cf781e55c40
+  checksum: 10c0/6518a7481da3326d1804c7e8a3cbcc5ef3fb82327a7cf1b51f889bb1c13126efa41b2fc19f9a278541050fb194f35c5a3a25ae2cea2909e4409b79e2d7705eb9
   languageName: node
   linkType: hard
 
@@ -1223,8 +1223,8 @@ __metadata:
   linkType: hard
 
 "@rapidrest/service-core@npm:^1.3.0":
-  version: 1.3.0
-  resolution: "@rapidrest/service-core@npm:1.3.0"
+  version: 1.4.0
+  resolution: "@rapidrest/service-core@npm:1.4.0"
   dependencies:
     axios: "npm:^1.19.0"
     dayjs: "npm:^1.11.23"
@@ -1254,7 +1254,7 @@ __metadata:
       optional: true
     uWebSockets.js:
       optional: true
-  checksum: 10c0/97f2d21f89672181242c905dc0ab5b0155ad24bcc29b5e985021f5f12b0d2973948a0c51919d98794e84beda65138c3366ec552f26ec2a4bebe7e9740e3e44cd
+  checksum: 10c0/632fe3c96578bb7bcfd67b08144a35ea1bad61adcbbcf422785b0ce459da40481844d12b515b1c43252ace457073e0c92e17fd1af66ed1c0a3b97c96ae3e76fb
   languageName: node
   linkType: hard
 
