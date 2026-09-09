@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
-import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
+import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCollectionSyncAdapter } from "./EasCollectionSyncAdapter.js";
 import { type Contact, type ContactPostalAddress, ContactAddressKind } from "@rapidmx/restapi";
 
@@ -74,6 +74,16 @@ export class ContactsSyncAdapter implements EasCollectionSyncAdapter<Contact> {
             );
         }
 
+        if (contact.categories && contact.categories.length > 0) {
+            children.push(
+                element(
+                    WbxmlCodePage.Contacts,
+                    "Categories",
+                    contact.categories.map((category) => textElement(WbxmlCodePage.Contacts, "Category", category)),
+                ),
+            );
+        }
+
         return element(WbxmlCodePage.AirSync, "ApplicationData", children);
     }
 
@@ -102,6 +112,9 @@ export class ContactsSyncAdapter implements EasCollectionSyncAdapter<Contact> {
      * loss for the common case). Emails lose their original `type` on any round trip through a `Change`
      * (rebuilt as `ContactAddressKind.OTHER`) since EAS's own `Email1/2/3Address` tags carry no kind at all,
      * matching `toApplicationData`'s own already-documented encode-side loss of the same information.
+     * `categories` is ghosted as its own whole group (same rule as `emails`/`phones`/`addresses`): an absent
+     * `Categories` element leaves `Contact.categories` untouched, while a present one - even `<Categories/>`
+     * with no `Category` children - rebuilds it from scratch (an empty array clears it).
      */
     public fromApplicationData(el: WbxmlElement): Partial<Contact> {
         const partial: Partial<Contact> = {};
@@ -141,6 +154,13 @@ export class ContactsSyncAdapter implements EasCollectionSyncAdapter<Contact> {
         const bodyEl = findChild(el, "Body");
         const notes = bodyEl ? childText(bodyEl, "Data") : undefined;
         if (notes !== undefined) partial.notes = notes;
+
+        const categoriesEl = findChild(el, "Categories");
+        if (categoriesEl) {
+            partial.categories = findChildren(categoriesEl, "Category")
+                .map((category) => category.text)
+                .filter((category): category is string => !!category);
+        }
 
         return partial;
     }

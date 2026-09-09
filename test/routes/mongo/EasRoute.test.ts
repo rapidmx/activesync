@@ -8,6 +8,7 @@
 // architecture plan's "Testing" section. `Ping`'s Redis-dependent logic is tested separately
 // (test/eas/commands/PingCommand.test.ts) with a fake Redis client, mirroring service-core's own documented
 // precedent for that same infrastructure gap (no real Redis is part of this repo's test setup either).
+import * as http from "http";
 import config from "../../config.js";
 import { request } from "@rapidrest/service-core/test";
 import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager, ACLAction } from "@rapidrest/service-core";
@@ -227,6 +228,49 @@ describe("Route:EasRouteMongo Tests", () => {
         expect(result.status).toBeGreaterThanOrEqual(200);
         expect(result.status).toBeLessThan(300);
         return new WbxmlDecoder().decode(Buffer.from(result.body));
+    };
+
+    /**
+     * Same request/response shape as `postWbxml`, but reads the response over a raw Node `http` socket instead
+     * of going through `@rapidrest/service-core/test`'s `request()` helper - that helper's underlying axios
+     * client is configured with `responseType: "text"`, which silently corrupts any response byte sequence
+     * that isn't valid UTF-8 (replacing it with U+FFFD) before this test ever sees it. Real EAS wire traffic
+     * uses WBXML's binary `OPAQUE` token for fields like `Email2:ConversationId` and `ItemOperations`' own
+     * `Move` `ConversationId` echo, which routinely isn't valid UTF-8 - a real device's own HTTP stack decodes
+     * these bytes correctly, so this is purely a test-harness limitation, not a wire-format bug. Only the tests
+     * that actually assert on such a field's exact byte content need this; every other test's response content
+     * is plain text and unaffected, so `postWbxml` remains the default.
+     */
+    const postWbxmlBinary = function (cmd: string, deviceId: string, requestBody?: WbxmlElement): Promise<WbxmlElement> {
+        return new Promise((resolve, reject) => {
+            const body = requestBody ? new WbxmlEncoder().encode(requestBody) : Buffer.alloc(0);
+            const req = http.request(
+                {
+                    hostname: "localhost",
+                    port: server.port,
+                    path: `${baseUrl}?Cmd=${cmd}&DeviceId=${deviceId}`,
+                    method: "POST",
+                    headers: {
+                        Authorization: "jwt " + ownerToken,
+                        "Content-Type": "application/vnd.ms-sync.wbxml",
+                        "Content-Length": body.length,
+                    },
+                },
+                (res) => {
+                    const chunks: Buffer[] = [];
+                    res.on("data", (chunk: Buffer) => chunks.push(chunk));
+                    res.on("end", () => {
+                        try {
+                            resolve(new WbxmlDecoder().decode(Buffer.concat(chunks)));
+                        } catch (err) {
+                            reject(err);
+                        }
+                    });
+                },
+            );
+            req.on("error", reject);
+            req.end(body);
+        });
     };
 
     /** Runs the real two-phase Provision handshake for `deviceId`, shared by every describe block below whose
@@ -865,6 +909,28 @@ describe("Route:EasRouteMongo Tests", () => {
             expect(childText(appData, "Flag")).toBe("1");
         });
 
+        it("Includes an Email2:ConversationId when the Message has one, omits it otherwise.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const conversationId = uuid.v4();
+            const withConversation = await createMessage(mailbox.uid, folder.uid, { conversationId });
+            const withoutConversation = await createMessage(mailbox.uid, folder.uid);
+
+            const initial = await postWbxml("Sync", "dev1", syncRequest("0", "Email", folder.uid));
+            const initialKey = childText(findChild(findChild(initial, "Collections")!, "Collection")!, "SyncKey")!;
+            const response = await postWbxmlBinary("Sync", "dev1", syncRequest(initialKey, "Email", folder.uid));
+
+            const collection = findChild(findChild(response, "Collections")!, "Collection")!;
+            const adds = findChildren(findChild(collection, "Commands")!, "Add");
+            const withConvAdd = adds.find((add) => childText(add, "ServerId") === withConversation.uid)!;
+            const withoutConvAdd = adds.find((add) => childText(add, "ServerId") === withoutConversation.uid)!;
+
+            const conversationIdEl = findChild(findChild(withConvAdd, "ApplicationData")!, "ConversationId");
+            expect(conversationIdEl?.opaque?.toString("utf8")).toBe(conversationId);
+            expect(findChild(findChild(withoutConvAdd, "ApplicationData")!, "ConversationId")).toBeUndefined();
+        });
+
         it("Reports a message deleted via the REST API as a Delete on the next sync round.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");
@@ -1194,6 +1260,7 @@ describe("Route:EasRouteMongo Tests", () => {
                 phones: [{ phoneNumber: "555-1234", type: ContactAddressKind.HOME }],
                 addresses: [{ street: "1 Babbage Way", city: "London", type: ContactAddressKind.WORK }],
                 notes: "Met at the Analytical Engine demo.",
+                categories: ["VIP", "Historical"],
             });
 
             const initial = await postWbxml("Sync", "dev1", syncRequest("0", "Contacts", folder.uid));
@@ -1215,6 +1282,8 @@ describe("Route:EasRouteMongo Tests", () => {
             expect(childText(appData, "BusinessCity")).toBe("London");
             const body = findChild(appData, "Body")!;
             expect(childText(body, "Data")).toBe("Met at the Analytical Engine demo.");
+            const categories = findChild(appData, "Categories")!;
+            expect(findChildren(categories, "Category").map((c) => c.text)).toEqual(["VIP", "Historical"]);
         });
 
         it("Reports a minimal contact as an Add, omitting unset optional fields and dropping an OTHER-kind phone.", async () => {
@@ -1243,6 +1312,7 @@ describe("Route:EasRouteMongo Tests", () => {
             // MS-ASCONTACTS has no "OtherPhoneNumber"-equivalent tag - an OTHER-kind phone has nowhere to go.
             expect(findChild(appData, "HomePhoneNumber")).toBeUndefined();
             expect(findChild(appData, "BusinessPhoneNumber")).toBeUndefined();
+            expect(findChild(appData, "Categories")).toBeUndefined();
         });
 
         it("Reports a minimal calendar event as an Add, omitting attendees/reminder/recurrence.", async () => {
@@ -2610,6 +2680,135 @@ describe("Route:EasRouteMongo Tests", () => {
                     );
 
                 expect(result.status).toBe(403);
+            });
+        });
+
+        describe("Move (conversation)", () => {
+            it("Moves every Message sharing a ConversationId to the destination folder, leaving others untouched.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const srcFolder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const dstFolder = await createFolderWithAcl(mailbox.uid, { name: "Archive", type: FolderType.USER });
+                const conversationId = uuid.v4();
+                const messageA = await createMessage(mailbox.uid, srcFolder.uid, { conversationId });
+                const messageB = await createMessage(mailbox.uid, srcFolder.uid, { conversationId });
+                const unrelated = await createMessage(mailbox.uid, srcFolder.uid, { conversationId: uuid.v4() });
+
+                const response = await postWbxmlBinary(
+                    "ItemOperations",
+                    "dev1",
+                    element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                        element(WbxmlCodePage.ItemOperations, "Move", [
+                            opaqueElement(WbxmlCodePage.ItemOperations, "ConversationId", Buffer.from(conversationId, "utf8")),
+                            textElement(WbxmlCodePage.ItemOperations, "DstFldId", dstFolder.uid),
+                        ]),
+                    ]),
+                );
+
+                const move = findChild(findChild(response, "Response")!, "Move")!;
+                expect(childText(move, "Status")).toBe("1");
+                expect(childText(move, "DstFldId")).toBe(dstFolder.uid);
+                expect(findChild(move, "ConversationId")?.opaque?.toString("utf8")).toBe(conversationId);
+
+                const movedA = await messageRepo.findOne({ uid: messageA.uid });
+                const movedB = await messageRepo.findOne({ uid: messageB.uid });
+                const stillThere = await messageRepo.findOne({ uid: unrelated.uid });
+                expect(movedA?.folderUid).toBe(dstFolder.uid);
+                expect(movedB?.folderUid).toBe(dstFolder.uid);
+                expect(stillThere?.folderUid).toBe(srcFolder.uid);
+            });
+
+            it("Skips a Message whose own folder no longer grants the caller UPDATE, still moving the rest.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const srcFolder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const dstFolder = await createFolderWithAcl(mailbox.uid, { name: "Archive", type: FolderType.USER });
+                const conversationId = uuid.v4();
+                const movable = await createMessage(mailbox.uid, srcFolder.uid, { conversationId });
+                // No Folder/ACL row exists for this uid at all (e.g. the owning folder was since deleted) -
+                // `ACLUtils.hasPermission` resolves an unresolvable ACL uid to `false` rather than throwing, so
+                // this message is skipped rather than failing the whole Move.
+                const orphaned = await createMessage(mailbox.uid, uuid.v4(), { conversationId });
+
+                const response = await postWbxmlBinary(
+                    "ItemOperations",
+                    "dev1",
+                    element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                        element(WbxmlCodePage.ItemOperations, "Move", [
+                            opaqueElement(WbxmlCodePage.ItemOperations, "ConversationId", Buffer.from(conversationId, "utf8")),
+                            textElement(WbxmlCodePage.ItemOperations, "DstFldId", dstFolder.uid),
+                        ]),
+                    ]),
+                );
+
+                const move = findChild(findChild(response, "Response")!, "Move")!;
+                expect(childText(move, "Status")).toBe("1");
+
+                const movedMovable = await messageRepo.findOne({ uid: movable.uid });
+                const stillOrphaned = await messageRepo.findOne({ uid: orphaned.uid });
+                expect(movedMovable?.folderUid).toBe(dstFolder.uid);
+                expect(stillOrphaned?.folderUid).not.toBe(dstFolder.uid);
+            });
+
+            it("Returns Status 3 when ConversationId or DstFldId is missing.", async () => {
+                await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+
+                const response = await postWbxml(
+                    "ItemOperations",
+                    "dev1",
+                    element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                        element(WbxmlCodePage.ItemOperations, "Move", []),
+                    ]),
+                );
+
+                const move = findChild(findChild(response, "Response")!, "Move")!;
+                expect(childText(move, "Status")).toBe("3");
+            });
+
+            it("Returns Status 3 when no Message shares the given ConversationId.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const dstFolder = await createFolderWithAcl(mailbox.uid, { name: "Archive", type: FolderType.USER });
+
+                const response = await postWbxml(
+                    "ItemOperations",
+                    "dev1",
+                    element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                        element(WbxmlCodePage.ItemOperations, "Move", [
+                            opaqueElement(WbxmlCodePage.ItemOperations, "ConversationId", Buffer.from("nope", "utf8")),
+                            textElement(WbxmlCodePage.ItemOperations, "DstFldId", dstFolder.uid),
+                        ]),
+                    ]),
+                );
+
+                const move = findChild(findChild(response, "Response")!, "Move")!;
+                expect(childText(move, "Status")).toBe("3");
+            });
+
+            it("Returns Status 3 when the destination folder belongs to a different mailbox.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const srcFolder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const conversationId = uuid.v4();
+                await createMessage(mailbox.uid, srcFolder.uid, { conversationId });
+
+                const otherMailbox = await createMailbox(otherUser.uid);
+                const otherFolder = await createFolderWithAcl(otherMailbox.uid, { name: "Other", type: FolderType.USER });
+
+                const response = await postWbxml(
+                    "ItemOperations",
+                    "dev1",
+                    element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                        element(WbxmlCodePage.ItemOperations, "Move", [
+                            opaqueElement(WbxmlCodePage.ItemOperations, "ConversationId", Buffer.from(conversationId, "utf8")),
+                            textElement(WbxmlCodePage.ItemOperations, "DstFldId", otherFolder.uid),
+                        ]),
+                    ]),
+                );
+
+                const move = findChild(findChild(response, "Response")!, "Move")!;
+                expect(childText(move, "Status")).toBe("3");
             });
         });
     });

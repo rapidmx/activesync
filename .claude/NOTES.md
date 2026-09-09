@@ -51,6 +51,66 @@ Keep entries terse — this is a reference, not a transcript.
 
 ## Session Log
 
+### 2026-09-08 — Caught up to `restapi` 0.3.x: Categories, ConversationId, conversation `Move`
+
+JP asked for a full review of `restapi`'s activity since this repo last pinned `0.2.x` (25 commits: iTIP meeting
+invites, resource-mailbox auto-accept, `DistributionList`, `TransportRule`, `MailFilterRule`, MDN read/delivery
+receipts, `Domain`/DNS setup, `Branding`, Focused Inbox, `Message.conversationId`/`conversations()`, recall,
+`AuditLogEntry`, `TaskList`, anonymous booking, plus-addressing) and to implement whatever of that is actually
+**ActiveSync-protocol-relevant** - the task was explicitly scoped to what MS-ASCMD itself has a wire mechanism
+for, not every new `restapi` feature. Bumped the `@rapidmx/restapi` dependency to `0.3.x`/`^0.3.1`.
+
+- **Scoping pass first, before writing any code**: most of the new surface has no EAS wire equivalent at all
+  and was deliberately left alone - `TransportRule`/`MailFilterRule` (no rules-management command in this
+  library's MS-ASCMD subset), `Domain`/DNS setup/`Branding`/`AuditLogEntry` (admin/server config, never
+  device-facing), Focused Inbox classification (an Outlook/OWA concept with no MS-ASEMAIL field), resource
+  auto-accept and iTIP invite generation (transparent at the SMTP/calendar-sync level already - the resulting
+  `CalendarEvent` just shows up via ordinary `Sync`), `Message.recall()` (no MS-ASCMD analog), plus-addressing
+  and MDN receipts (transparent at delivery time, nothing for a device to see or set). `Contact.favorite`/
+  `Task.myDay` also have no MS-ASCONTACTS/MS-ASTASK wire field to land on - left unmapped, matching this
+  library's own precedent of documenting a gap rather than inventing a field.
+- **`Contact.categories` (new `restapi` field) → MS-ASCONTACTS `Categories`/`Category`** in
+  `ContactsSyncAdapter`, both directions. Ghosted as its own whole group, same rule as `emails`/`phones`/
+  `addresses`: absent `Categories` element leaves it untouched, a present one (even empty) rebuilds it.
+- **`Message.conversationId` (new `restapi` field) → MS-ASEMAIL2 `Email2:ConversationId`**, read-only, in
+  `EmailSyncAdapter.toApplicationData`. Encoded as the uid's own UTF-8 bytes in a WBXML `OPAQUE` element
+  (`encodeConversationId`/`decodeConversationId`, now exported from `EmailSyncAdapter.ts`) rather than hashed
+  into a 16-byte GUID shape - the spec never mandates a particular binary format, a device only ever compares/
+  echoes the value byte-for-byte, and this way `decodeConversationId` inverts it exactly.
+- **Closed `ItemOperationsCommand`'s own long-documented gap**: conversation `Move` ("this library has no
+  conversation-grouping concept for `Message` at all") is now implemented, using the `ConversationId` decoded
+  the same way. Every `Message` sharing the decoded `conversationId` across the *whole mailbox* (not just one
+  folder - a conversation can span folders) that the caller has `UPDATE` on is relocated to `DstFldId`; one
+  lacking permission is silently skipped rather than failing the whole move (mirrors a shared-folder scenario,
+  not a new pattern). `MoveAlways` is accepted but not acted on - no conversation-scoped `MailFilterRule`
+  condition exists to key an ongoing rule off of; documented, not silent data loss (the move itself still
+  happens). Query is deliberately scoped to `ctx.mailboxUid`: `conversationId` is derived from the RFC 5322
+  thread (`References`/`In-Reply-To`/`Message-ID`), which can genuinely collide across two different mailboxes
+  that both received the same thread - unscoped, a `Move` could reach into a mailbox that never even
+  participated in the request.
+- **Real bug found and fixed, outside this repo's own code**: `@rapidrest/service-core`'s `test/request.js`
+  (the `request()`/`agent()` helper every route-level test in this repo uses) configures its underlying axios
+  client with `responseType: "text"`, which silently replaces any response byte sequence that isn't valid
+  UTF-8 with U+FFFD *before the test ever sees it* - corrupting the WBXML `OPAQUE` token itself (`0xC3`) in any
+  response carrying real binary content. This is why `ItemOperationsCommand.fetchAttachment` was already
+  base64-text-encoding attachment `Data` instead of using this codec's own `opaqueElement` for it - sidesteps
+  this exact test-harness limitation (whether or not that was the original reason, it has the same effect).
+  Confirmed the corruption is test-harness-only, not a wire-format bug: reproduced the exact byte-for-byte
+  round trip correctly through raw `uWebSockets.js` directly (`res.end(buffer)` preserves arbitrary bytes
+  fine) - a real device's own HTTP stack is unaffected. Didn't touch the sibling `service-core` checkout for
+  this (out of scope, not asked); instead added a `postWbxmlBinary` helper to both `test/routes/{mongo,sql}/
+  EasRoute.test.ts` that reads the response over a raw Node `http` socket, used only by the handful of new
+  tests that assert on `ConversationId`'s exact opaque byte content - every other test's response content is
+  plain text and unaffected by the bug, so `postWbxml` (via the shared helper) stays the default.
+- Also found and cleaned up: two stale, gitignored `rrst-test`/`rrst-test-acl` SQLite files at the repo root
+  left over from a session predating the `restapi` 0.3.x bump - `ec7d387` (receipts) added several new
+  required `Mailbox` boolean columns with no SQL-level `DEFAULT`, so `TypeORM`'s `ADD COLUMN` migration against
+  those stale files' pre-existing rows failed with `NOT NULL constraint failed`. Not a real bug (a fresh test
+  DB never hits this), just a local artifact; deleting them let `synchronize()` create the columns correctly
+  from scratch. Worth knowing if this resurfaces: it means a real deployment doing an in-place `synchronize()`
+  upgrade across this specific `restapi` version bump would hit the same failure against a populated `Mailbox`
+  table - a `restapi`-side migration concern, not this repo's.
+
 ### 2026-09-06/07 — Practical full EAS compliance push
 
 JP asked to finalize this package toward full `MS-ASCMD` compliance (scoped decision: every command a real

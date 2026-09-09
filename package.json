@@ -1,7 +1,7 @@
 {
     "name": "@rapidmx/activesync",
     "version": "0.1.0",
-    "description": "Exchange ActiveSync (EAS) protocol support for RapidREST mail servers.",
+    "description": "Exchange ActiveSync (EAS) protocol support for RapidMX.",
     "repository": "https://github.com/RapidMX/activesync.git",
     "author": "RapidREST <rapidrests@gmail.com>",
     "license": "MPL-2.0",
@@ -29,7 +29,7 @@
         "mailparser": "^3.9.23"
     },
     "devDependencies": {
-        "@rapidmx/restapi": "^0.3.0",
+        "@rapidmx/restapi": "^0.3.1",
         "@rapidrest/cli": "^1.0.1",
         "@rapidrest/core": "^5.2.2",
         "@rapidrest/service-core": "^1.7.2",

@@ -5,9 +5,10 @@
 import { simpleParser } from "mailparser";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
-import { BlobStore, RecoverableRepoUtils, type Attachment, type Message } from "@rapidmx/restapi";
+import { BlobStore, RecoverableRepoUtils, type Attachment, type Folder, type Message } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
-import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
+import { childText, element, findChild, findChildren, opaqueElement, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
+import { decodeConversationId } from "../adapters/EmailSyncAdapter.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 const { Init, Inject } = ObjectDecorators;
 
@@ -35,11 +36,15 @@ function truncateUtf8(text: string, maxBytes: number): string {
  * separate write/upload command as its name might suggest.
  *
  * **Pragmatic subset, deliberately not the full MS-ASCMD `ItemOperations` semantics**:
- * - `Move` (which, per the same schema, moves an entire *conversation* by `ConversationId` to a destination
- * folder - unrelated to the standalone `MoveItems` command's per-message `SrcFldId`/`SrcMsgId`/`DstFldId`
- * shape) is not implemented - this library has no conversation-grouping concept for `Message` at all. A
- * request containing only a `Move` (no `Fetch`/`EmptyFolderContents`) is rejected the same way a request with
- * no recognized operation at all is.
+ * - `Move` moves an entire *conversation* (by `ConversationId`, opaque binary - see `EmailSyncAdapter`'s
+ * `encodeConversationId`/`decodeConversationId`) to a destination folder - unrelated to the standalone
+ * `MoveItems` command's per-message `SrcFldId`/`SrcMsgId`/`DstFldId` shape. Every `Message` sharing the
+ * decoded `conversationId` across the whole mailbox (not just one folder) that the caller has `UPDATE` on is
+ * relocated to `DstFldId`; one lacking permission is silently skipped rather than failing the whole move (a
+ * conversation can legitimately span folders the caller doesn't control, e.g. a shared mailbox's Inbox). An
+ * optional `MoveAlways` (a hint to keep auto-moving future messages in this conversation) is accepted but not
+ * acted on - this library's `MailFilterRule` has no conversation-scoped condition to key an ongoing rule off
+ * of, a documented simplification, not silent data loss (the move itself still happens).
  * - `Store: "DocumentLibrary"` is rejected per-`Fetch` - matches `SearchCommand`'s own GAL-only scope decision;
  * this library has no document-library model.
  * - A `Fetch` failure (not found, no permission, malformed) aborts the whole request via an HTTP-level error
@@ -102,9 +107,8 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         }
         const fetchEls = ctx.request ? findChildren(ctx.request, "Fetch") : [];
         const emptyEl = ctx.request ? findChild(ctx.request, "EmptyFolderContents") : undefined;
-        if (fetchEls.length === 0 && !emptyEl) {
-            // Covers both a genuinely empty request and one containing only a `Move` - see this class's own
-            // doc comment for why conversation `Move` isn't implemented.
+        const moveEl = ctx.request ? findChild(ctx.request, "Move") : undefined;
+        if (fetchEls.length === 0 && !emptyEl && !moveEl) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
 
@@ -125,6 +129,9 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         }
         if (emptyEl) {
             responseChildren.push(await this.emptyFolderContents(ctx, emptyEl));
+        }
+        if (moveEl) {
+            responseChildren.push(await this.moveConversation(ctx, moveEl));
         }
 
         return element(WbxmlCodePage.ItemOperations, "ItemOperations", [
@@ -224,6 +231,59 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         return element(WbxmlCodePage.ItemOperations, "EmptyFolderContents", [
             textElement(WbxmlCodePage.ItemOperations, "Status", "1"),
         ]);
+    }
+
+    /**
+     * Handles `ItemOperations`' `Move`: relocates every `Message` sharing a decoded `ConversationId` to
+     * `DstFldId`. Unlike `emptyFolderContents`/`fetchMessage` (which fail the whole request via a thrown
+     * `ApiError`), this reports failure through the embedded `Status` the same way `MoveItemsCommand` does for
+     * its own per-item results - a malformed/unresolvable `Move` is a normal outcome for this operation, not an
+     * exceptional one.
+     */
+    private async moveConversation(ctx: EasCommandContext, moveEl: WbxmlElement): Promise<WbxmlElement> {
+        const conversationIdEl = findChild(moveEl, "ConversationId");
+        const dstFldId = childText(moveEl, "DstFldId");
+        if (!conversationIdEl?.opaque || !dstFldId) {
+            return this.moveResponse("3");
+        }
+
+        const destFolder: Folder | undefined = await this.folderRepo!.findOne(dstFldId, { ignoreACL: true });
+        if (
+            !destFolder ||
+            destFolder.mailboxUid !== ctx.mailboxUid ||
+            !(await this.aclUtils!.hasPermission(ctx.user, dstFldId, ACLAction.CREATE))
+        ) {
+            return this.moveResponse("3");
+        }
+
+        const conversationId = decodeConversationId(conversationIdEl.opaque);
+        const messages: Message[] = await this.messageRepo!.find({ mailboxUid: ctx.mailboxUid, conversationId } as any, {
+            ignoreACL: true,
+        });
+        if (messages.length === 0) {
+            return this.moveResponse("3");
+        }
+
+        for (const message of messages) {
+            if (!(await this.aclUtils!.hasPermission(ctx.user, message.folderUid, ACLAction.UPDATE))) {
+                continue;
+            }
+            await this.messageRepo!.update(
+                { uid: (message as any).uid, version: (message as any).version, folderUid: dstFldId } as any,
+                message,
+                { ignoreACL: true, user: ctx.user },
+            );
+        }
+
+        return element(WbxmlCodePage.ItemOperations, "Move", [
+            textElement(WbxmlCodePage.ItemOperations, "Status", "1"),
+            textElement(WbxmlCodePage.ItemOperations, "DstFldId", dstFldId),
+            opaqueElement(WbxmlCodePage.ItemOperations, "ConversationId", conversationIdEl.opaque),
+        ]);
+    }
+
+    private moveResponse(status: string): WbxmlElement {
+        return element(WbxmlCodePage.ItemOperations, "Move", [textElement(WbxmlCodePage.ItemOperations, "Status", status)]);
     }
 
     private async fetchAttachment(ctx: EasCommandContext, fileReference: string): Promise<WbxmlElement> {

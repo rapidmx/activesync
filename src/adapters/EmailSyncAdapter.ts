@@ -5,7 +5,7 @@
 import * as crypto from "crypto";
 import { ObjectDecorators } from "@rapidrest/core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
-import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
+import { childText, element, findChild, opaqueElement, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCollectionSyncAdapter } from "./EasCollectionSyncAdapter.js";
 import { type BlobStore, type Mailbox, type Message, type Recipient, MessageImportance, RecipientType } from "@rapidmx/restapi";
 const { Inject } = ObjectDecorators;
@@ -38,6 +38,12 @@ const BODY_TYPE_PLAIN_TEXT = "1";
  * the only `Email` write EAS itself allows) - a plain-text-only pragmatic subset: no HTML body, no attachments
  * (mirrors `ComposeMailCommand`'s own already-documented attachment gap).
  *
+ * Emits MS-ASEMAIL2's `Email2:ConversationId` (read-only - no `fromApplicationData` handling, since EAS itself
+ * never lets a client set it) whenever `Message.conversationId` is populated, so a device's threaded-view UI can
+ * group messages the same way `BaseMessageRoute.conversations()` does server-side. See `encodeConversationId`'s
+ * own doc comment for the wire encoding, and `ItemOperationsCommand`'s `Move` handling for the one place this
+ * gets decoded back.
+ *
  * @author Jean-Philippe Steinmetz
  */
 export class EmailSyncAdapter implements EasCollectionSyncAdapter<Message> {
@@ -65,6 +71,7 @@ export class EmailSyncAdapter implements EasCollectionSyncAdapter<Message> {
                 textElement(WbxmlCodePage.AirSyncBase, "Truncated", "1"),
                 textElement(WbxmlCodePage.AirSyncBase, "Data", message.bodyPreview),
             ]),
+            ...(message.conversationId ? [opaqueElement(WbxmlCodePage.Email2, "ConversationId", encodeConversationId(message.conversationId))] : []),
         ]);
     }
 
@@ -149,6 +156,21 @@ export class EmailSyncAdapter implements EasCollectionSyncAdapter<Message> {
             hasAttachments: false,
         };
     }
+}
+
+/** Encodes `Message.conversationId` (an internal string uid) into the opaque binary blob MS-ASEMAIL2's
+ * `Email2:ConversationId` carries on the wire. The spec never mandates any particular binary format for this
+ * value - a real Exchange server mints a GUID, but a client only ever compares/echoes it byte-for-byte, never
+ * interprets it - so encoding the uid's own UTF-8 bytes directly (rather than hashing into a 16-byte GUID
+ * shape) is a valid, simpler choice that `decodeConversationId` can invert exactly, which `ItemOperationsCommand`
+ * relies on to resolve an `ItemOperations` `Move`'s `ConversationId` back into this same uid. */
+export function encodeConversationId(conversationId: string): Buffer {
+    return Buffer.from(conversationId, "utf8");
+}
+
+/** Reverse of `encodeConversationId`. */
+export function decodeConversationId(opaque: Buffer): string {
+    return opaque.toString("utf8");
 }
 
 function formatAddress(address: string, displayName?: string): string {

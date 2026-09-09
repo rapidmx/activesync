@@ -1117,7 +1117,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@rapidmx/activesync@workspace:."
   dependencies:
-    "@rapidmx/restapi": "npm:^0.3.0"
+    "@rapidmx/restapi": "npm:^0.3.1"
     "@rapidrest/cli": "npm:^1.0.1"
     "@rapidrest/core": "npm:^5.2.2"
     "@rapidrest/service-core": "npm:^1.7.2"
@@ -1159,9 +1159,9 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@rapidmx/restapi@npm:^0.3.0":
-  version: 0.3.0
-  resolution: "@rapidmx/restapi@npm:0.3.0"
+"@rapidmx/restapi@npm:^0.3.1":
+  version: 0.3.1
+  resolution: "@rapidmx/restapi@npm:0.3.1"
   dependencies:
     html-to-text: "npm:^10.0.1"
     mailparser: "npm:^3.9.23"
@@ -1180,7 +1180,7 @@ __metadata:
       optional: true
     pdf-parse:
       optional: true
-  checksum: 10c0/25c63fba0879332bb2c3bcd3ddd7a3cd5ff6d1675559e8df8eef4cbca0e9aa6be51f503cd11bb9749eae054309a80a065cc9701109c6371bc89be603d7080300
+  checksum: 10c0/eb6b2dbbb34a4590af88914a025d1feb50cad5d05fad816eb88c8fa85f63d8584c4643c8bae02ad0ad6a9125928d93e7386a4909f236004e1f2a2efca6ee245f
   languageName: node
   linkType: hard
 

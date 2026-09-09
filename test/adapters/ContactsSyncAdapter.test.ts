@@ -131,6 +131,26 @@ describe("ContactsSyncAdapter Tests", () => {
             expect(adapter.fromApplicationData(el).notes).toBeUndefined();
         });
 
+        it("Parses categories from the Categories/Category elements.", () => {
+            const el = appData([
+                element(WbxmlCodePage.Contacts, "Categories", [
+                    textElement(WbxmlCodePage.Contacts, "Category", "VIP"),
+                    textElement(WbxmlCodePage.Contacts, "Category", "Historical"),
+                ]),
+            ]);
+            expect(adapter.fromApplicationData(el).categories).toEqual(["VIP", "Historical"]);
+        });
+
+        it("Clears categories to an empty array when Categories is present but empty.", () => {
+            const el = appData([element(WbxmlCodePage.Contacts, "Categories", [])]);
+            expect(adapter.fromApplicationData(el).categories).toEqual([]);
+        });
+
+        it("Leaves categories untouched when no Categories element is present.", () => {
+            const el = appData([textElement(WbxmlCodePage.Contacts, "FileAs", "X")]);
+            expect(adapter.fromApplicationData(el).categories).toBeUndefined();
+        });
+
         it("Returns an empty partial for an ApplicationData element with no recognized children.", () => {
             expect(adapter.fromApplicationData(appData([]))).toEqual({});
         });
