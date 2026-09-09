@@ -85,10 +85,79 @@ describe("EmailSyncAdapter Tests", () => {
             ]);
         });
 
-        it("Leaves recipients untouched when neither To nor Cc is present.", async () => {
+        it("Leaves recipients untouched when neither To, Cc, nor Bcc is present.", async () => {
             const { adapter } = buildAdapter();
             const partial = await adapter.fromApplicationData(appData([]));
             expect("recipients" in partial).toBe(false);
+        });
+
+        it("Parses Bcc into the recipients list alongside To/Cc.", async () => {
+            const { adapter } = buildAdapter();
+            const partial = await adapter.fromApplicationData(
+                appData([
+                    textElement(WbxmlCodePage.Email, "To", "to@example.com"),
+                    textElement(WbxmlCodePage.Email2, "Bcc", "hidden@example.com"),
+                ]),
+            );
+            expect(partial.recipients).toEqual([
+                { address: "to@example.com", type: RecipientType.TO },
+                { address: "hidden@example.com", type: RecipientType.BCC },
+            ]);
+        });
+
+        it("Preserves existing Cc/Bcc recipients when a Change touches only To, ghosting each type independently.", async () => {
+            const { adapter } = buildAdapter();
+            const existing: Message = {
+                ...baseMessage,
+                recipients: [
+                    { address: "old-to@example.com", type: RecipientType.TO },
+                    { address: "keep-cc@example.com", type: RecipientType.CC },
+                    { address: "keep-bcc@example.com", type: RecipientType.BCC },
+                ],
+            };
+            const partial = await adapter.fromApplicationData(
+                appData([textElement(WbxmlCodePage.Email, "To", "new-to@example.com")]),
+                existing,
+            );
+            expect(partial.recipients).toEqual([
+                { address: "keep-cc@example.com", type: RecipientType.CC },
+                { address: "keep-bcc@example.com", type: RecipientType.BCC },
+                { address: "new-to@example.com", type: RecipientType.TO },
+            ]);
+        });
+
+        it("Includes a Bcc header in the built Draft MIME when Bcc recipients are present.", async () => {
+            const { adapter, put } = buildAdapter();
+            await adapter.fromApplicationData(
+                appData([
+                    textElement(WbxmlCodePage.Email, "To", "to@example.com"),
+                    textElement(WbxmlCodePage.Email2, "Bcc", "hidden@example.com"),
+                    element(WbxmlCodePage.AirSyncBase, "Body", [
+                        textElement(WbxmlCodePage.AirSyncBase, "Type", "1"),
+                        textElement(WbxmlCodePage.AirSyncBase, "Data", "Body text"),
+                    ]),
+                ]),
+            );
+
+            const mime = (put.mock.calls[0][1] as Buffer).toString("utf-8");
+            expect(mime).toContain("Bcc: hidden@example.com");
+        });
+
+        it("Clears Cc to empty when Change sends an empty Cc, without touching To/Bcc.", async () => {
+            const { adapter } = buildAdapter();
+            const existing: Message = {
+                ...baseMessage,
+                recipients: [
+                    { address: "keep-to@example.com", type: RecipientType.TO },
+                    { address: "old-cc@example.com", type: RecipientType.CC },
+                    { address: "keep-bcc@example.com", type: RecipientType.BCC },
+                ],
+            };
+            const partial = await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "Cc", "")]), existing);
+            expect(partial.recipients).toEqual([
+                { address: "keep-to@example.com", type: RecipientType.TO },
+                { address: "keep-bcc@example.com", type: RecipientType.BCC },
+            ]);
         });
 
         it("Maps every Importance code to its MessageImportance, defaulting an unrecognized code to NORMAL.", async () => {

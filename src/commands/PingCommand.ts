@@ -4,10 +4,11 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { createClient, type RedisClientType } from "redis";
 import { ObjectDecorators } from "@rapidrest/core";
+import { ACLAction, ACLUtils } from "@rapidrest/service-core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
-const { Config } = ObjectDecorators;
+const { Config, Inject } = ObjectDecorators;
 
 /** MS-ASCMD `Ping` `Status` codes this pragmatic subset distinguishes - not the full enumeration the real
  * spec defines (e.g. it also has codes for "too many folders", "folder hierarchy changed", etc.), matching
@@ -24,6 +25,11 @@ const STATUS_MISSING_PARAMETERS = "3";
  * `folderUid` channels. Every `Message`/`CalendarEvent`/etc. mutation already publishes to exactly these
  * channels via `BaseScopedChildRoute.notify()`/`RepoUtils`'s own push - `Ping` needs no new publish call site
  * of its own, only a subscriber.
+ *
+ * Requested folder uids are filtered down to only those the caller currently has `READ` on before subscribing -
+ * matching every other command's ownership check on a client-supplied id, since without it a device could
+ * long-poll indefinitely on any folder uid it happens to know (including one it used to have legitimate access
+ * to and no longer does) and learn purely from this channel when that other mailbox's data changes.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -43,17 +49,34 @@ export class PingCommand implements EasCommandHandler {
     @Config("mail:eas:ping_max_heartbeat_seconds", 1740)
     private maxHeartbeatSeconds: number = 1740;
 
+    @Inject(ACLUtils)
+    private aclUtils?: ACLUtils;
+
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
         if (!ctx.request) {
             return this.statusResponse(STATUS_MISSING_PARAMETERS);
         }
 
         const foldersEl = findChild(ctx.request, "Folders");
-        const folderUids: string[] = foldersEl
+        const requestedFolderUids: string[] = foldersEl
             ? findChildren(foldersEl, "Folder")
                   .map((folderEl) => childText(folderEl, "ServerId"))
                   .filter((uid): uid is string => !!uid)
             : [];
+        if (requestedFolderUids.length === 0) {
+            return this.statusResponse(STATUS_MISSING_PARAMETERS);
+        }
+
+        // Every other command checks ownership before acting on a client-supplied folder id - `Ping` must too,
+        // or a device that once had a folder shared with it (and so learned its real uid) could keep watching
+        // that folder's live activity via this long-poll indefinitely, even after the share is later revoked.
+        // Filtered down to the permitted subset rather than failing the whole request: `Ping`'s wire response
+        // has no per-folder status to report a partial denial through, and a client legitimately re-sends the
+        // same folder list across requests regardless of access changes it has no way to know about yet.
+        const permitted = await Promise.all(
+            requestedFolderUids.map((uid) => this.aclUtils!.hasPermission(ctx.user, uid, ACLAction.READ)),
+        );
+        const folderUids = requestedFolderUids.filter((_uid, i) => permitted[i]);
         if (folderUids.length === 0) {
             return this.statusResponse(STATUS_MISSING_PARAMETERS);
         }

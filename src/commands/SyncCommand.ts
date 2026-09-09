@@ -449,9 +449,17 @@ export abstract class SyncCommand implements EasCommandHandler {
         }
         try {
             await repo.delete(existing.uid, { ignoreACL: true });
-            // Captured AFTER the write resolves (not before) so the persisted watermark can never understate
-            // the delete's real effective time - success is silent, same rule as applyChange.
-            return { writtenAt: new Date() };
+            // Re-read the now-soft-deleted row's own `dateModified` (`RecoverableRepoUtils.delete()` stamps it
+            // as part of the delete itself) rather than approximating with a fresh `new Date()` here. A plain
+            // `new Date()` captured after the write resolves is always >= that real timestamp (the delete's own
+            // internal write already completed by the time this line runs) - close enough for THIS row, but
+            // `newWatermark` is folder-wide: if it's inflated even slightly past this row's true write time, it
+            // can also run past a genuinely concurrent, unrelated write to a DIFFERENT message in the same
+            // folder that `computeChanges` already missed (it snapshotted before this Delete ran), permanently
+            // skipping that other change instead of picking it up next round. Falls back to `new Date()` only
+            // if the re-read is unexpectedly empty, which real code paths never hit.
+            const deleted = await repo.findOne(existing.uid, { ignoreACL: true, includeDeleted: true });
+            return { writtenAt: deleted?.dateModified ?? new Date() };
         } catch {
             return { response: this.statusResponseElement("Delete", serverId, "6") };
         }

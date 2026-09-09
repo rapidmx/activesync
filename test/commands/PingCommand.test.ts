@@ -114,6 +114,20 @@ function makeConfig(values: Record<string, any>): any {
     return { get: (path: string) => values[path] };
 }
 
+/**
+ * Builds a `PingCommand` via a real `ObjectFactory` (so its `@Config` fields resolve normally, matching every
+ * other test in this file), then stubs its `@Inject(ACLUtils)` field directly - this file's own config double
+ * has no real datastore for `ObjectFactory` to construct a working `ACLUtils` against (by design: `Ping` itself
+ * has no database dependency of its own), so DI leaves that field unset. `deniedFolderUids` lets a test assert
+ * on the new permission-filtering behavior without needing a real ACL backend.
+ */
+async function createCommand(values: Record<string, any>, deniedFolderUids: string[] = []): Promise<PingCommand> {
+    const command = await new ObjectFactory(makeConfig(values), Logger()).newInstance<PingCommand>(PingCommand);
+    const denied = new Set(deniedFolderUids);
+    (command as any).aclUtils = { hasPermission: async (_user: unknown, uid: string) => !denied.has(uid) };
+    return command;
+}
+
 function pingRequest(heartbeatSeconds: number | undefined, folderUids: string[]): any {
     return element(WbxmlCodePage.Ping, "Ping", [
         ...(heartbeatSeconds !== undefined ? [textElement(WbxmlCodePage.Ping, "HeartbeatInterval", String(heartbeatSeconds))] : []),
@@ -147,19 +161,46 @@ describe("PingCommand Tests", () => {
     });
 
     it("Returns Status 3 (missing parameters) when the request body is absent.", async () => {
-        const command = await new ObjectFactory(makeConfig({}), Logger()).newInstance<PingCommand>(PingCommand);
+        const command = await createCommand({});
         const response = await command.handle(makeContext(undefined));
         expect(childText(response!, "Status")).toBe("3");
     });
 
     it("Returns Status 3 (missing parameters) when no folders are specified.", async () => {
-        const command = await new ObjectFactory(makeConfig({}), Logger()).newInstance<PingCommand>(PingCommand);
+        const command = await createCommand({});
         const response = await command.handle(makeContext(element(WbxmlCodePage.Ping, "Ping", [])));
         expect(childText(response!, "Status")).toBe("3");
     });
 
+    it("Returns Status 3 (missing parameters) when the caller has no permission on any requested folder.", async () => {
+        const command = await createCommand({}, ["folder-1"]);
+        const response = await command.handle(makeContext(pingRequest(1, ["folder-1"])));
+        expect(childText(response!, "Status")).toBe("3");
+    });
+
+    it("Filters out a folder the caller has no permission on, still watching the rest.", async () => {
+        const config = {
+            "datastores:events": { url: "redis://fake" },
+            "mail:eas:ping_min_heartbeat_seconds": 1,
+            "mail:eas:ping_max_heartbeat_seconds": 5,
+        };
+        const command = await createCommand(config, ["folder-1"]);
+
+        const responsePromise = command.handle(makeContext(pingRequest(1, ["folder-1", "folder-2"])));
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        // Only "folder-2" was actually subscribed to (per hasPermission's denial of "folder-1" above) - a
+        // publish on the denied folder must never be observable through this response.
+        fakeRedisServer.publish("folder-1", JSON.stringify({ type: "Folder", action: "update" }));
+        fakeRedisServer.publish("folder-2", JSON.stringify({ type: "Folder", action: "update" }));
+
+        const response = await responsePromise;
+        expect(childText(response!, "Status")).toBe("2");
+        const folders = findChild(response!, "Folders")!;
+        expect(folders.children.map((f) => f.text)).toEqual(["folder-2"]);
+    });
+
     it("Fails open to Status 1 (no changes) quickly when no datastores:events config is present.", async () => {
-        const command = await new ObjectFactory(makeConfig({}), Logger()).newInstance<PingCommand>(PingCommand);
+        const command = await createCommand({});
         const start = Date.now();
         const response = await command.handle(makeContext(pingRequest(1, ["folder-1"])));
         expect(childText(response!, "Status")).toBe("1");
@@ -168,8 +209,7 @@ describe("PingCommand Tests", () => {
     });
 
     it("Defaults to minHeartbeatSeconds when HeartbeatInterval is omitted from the request entirely.", async () => {
-        const config = makeConfig({ "mail:eas:ping_min_heartbeat_seconds": 1, "mail:eas:ping_max_heartbeat_seconds": 5 });
-        const command = await new ObjectFactory(config, Logger()).newInstance<PingCommand>(PingCommand);
+        const command = await createCommand({ "mail:eas:ping_min_heartbeat_seconds": 1, "mail:eas:ping_max_heartbeat_seconds": 5 });
 
         const start = Date.now();
         const response = await command.handle(makeContext(pingRequest(undefined, ["folder-1"])));
@@ -180,8 +220,7 @@ describe("PingCommand Tests", () => {
     });
 
     it("Falls back to minHeartbeatSeconds when HeartbeatInterval is present but not a valid number.", async () => {
-        const config = makeConfig({ "mail:eas:ping_min_heartbeat_seconds": 1, "mail:eas:ping_max_heartbeat_seconds": 5 });
-        const command = await new ObjectFactory(config, Logger()).newInstance<PingCommand>(PingCommand);
+        const command = await createCommand({ "mail:eas:ping_min_heartbeat_seconds": 1, "mail:eas:ping_max_heartbeat_seconds": 5 });
         const request = element(WbxmlCodePage.Ping, "Ping", [
             textElement(WbxmlCodePage.Ping, "HeartbeatInterval", "not-a-number"),
             element(WbxmlCodePage.Ping, "Folders", [
@@ -194,12 +233,11 @@ describe("PingCommand Tests", () => {
     });
 
     it("Returns Status 2 with the changed folder when a publish arrives before the timeout.", async () => {
-        const config = makeConfig({
+        const command = await createCommand({
             "datastores:events": { url: "redis://fake" },
             "mail:eas:ping_min_heartbeat_seconds": 1,
             "mail:eas:ping_max_heartbeat_seconds": 5,
         });
-        const command = await new ObjectFactory(config, Logger()).newInstance<PingCommand>(PingCommand);
 
         const responsePromise = command.handle(makeContext(pingRequest(1, ["folder-1", "folder-2"])));
         // Give waitForChange() a tick to actually subscribe before publishing.
@@ -213,24 +251,22 @@ describe("PingCommand Tests", () => {
     });
 
     it("Returns Status 1 (no changes) when the heartbeat elapses with no publish.", async () => {
-        const config = makeConfig({
+        const command = await createCommand({
             "datastores:events": { url: "redis://fake" },
             "mail:eas:ping_min_heartbeat_seconds": 1,
             "mail:eas:ping_max_heartbeat_seconds": 5,
         });
-        const command = await new ObjectFactory(config, Logger()).newInstance<PingCommand>(PingCommand);
 
         const response = await command.handle(makeContext(pingRequest(1, ["folder-1"])));
         expect(childText(response!, "Status")).toBe("1");
     });
 
     it("Fails open to Status 1 when the Redis client's subscribe() call itself rejects.", async () => {
-        const config = makeConfig({
+        const command = await createCommand({
             "datastores:events": { url: "redis://fake" },
             "mail:eas:ping_min_heartbeat_seconds": 1,
             "mail:eas:ping_max_heartbeat_seconds": 5,
         });
-        const command = await new ObjectFactory(config, Logger()).newInstance<PingCommand>(PingCommand);
 
         nextSubscribeShouldFail = true;
         const response = await command.handle(makeContext(pingRequest(1, ["folder-1"])));
@@ -238,12 +274,11 @@ describe("PingCommand Tests", () => {
     });
 
     it("Still returns a successful response when the post-wait Redis cleanup (unsubscribe/disconnect) itself fails.", async () => {
-        const config = makeConfig({
+        const command = await createCommand({
             "datastores:events": { url: "redis://fake" },
             "mail:eas:ping_min_heartbeat_seconds": 1,
             "mail:eas:ping_max_heartbeat_seconds": 5,
         });
-        const command = await new ObjectFactory(config, Logger()).newInstance<PingCommand>(PingCommand);
 
         nextUnsubscribeShouldFail = true;
         nextDisconnectShouldFail = true;
@@ -252,12 +287,11 @@ describe("PingCommand Tests", () => {
     });
 
     it("Clamps a HeartbeatInterval outside the configured min/max range.", async () => {
-        const config = makeConfig({
+        const command = await createCommand({
             "datastores:events": { url: "redis://fake" },
             "mail:eas:ping_min_heartbeat_seconds": 1,
             "mail:eas:ping_max_heartbeat_seconds": 2,
         });
-        const command = await new ObjectFactory(config, Logger()).newInstance<PingCommand>(PingCommand);
 
         const start = Date.now();
         // Requests a 100-second heartbeat, clamped down to the configured 2-second max.

@@ -10,7 +10,12 @@ import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, opaqueElement, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import { decodeConversationId } from "../adapters/EmailSyncAdapter.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
-const { Init, Inject } = ObjectDecorators;
+const { Config, Init, Inject } = ObjectDecorators;
+
+/** Caps how many messages `emptyFolderContents`/`moveConversation` process per backing `find()`/delete-batch
+ * round - keeps memory bounded and, for `emptyFolderContents`, lets an arbitrarily large folder still be fully
+ * emptied via repeated batches rather than one unbounded query. */
+const DEFAULT_BATCH_SIZE = 500;
 
 /** Truncates UTF-8 text to at most `maxBytes` bytes without splitting a multi-byte character in half - backs
  * off past any trailing UTF-8 continuation byte (`10xxxxxx`) before decoding back to a string. Only ever
@@ -85,6 +90,12 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
 
+    @Config("mail:eas:itemoperations_max_fetch", 25)
+    private maxFetchesPerRequest: number = 25;
+
+    @Config("mail:eas:itemoperations_batch_size", DEFAULT_BATCH_SIZE)
+    private batchSize: number = DEFAULT_BATCH_SIZE;
+
     @Init
     public async init(): Promise<void> {
         this.folderRepo = await this._objectFactory!.newInstance(RepoUtils, {
@@ -110,6 +121,15 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         const moveEl = ctx.request ? findChild(ctx.request, "Move") : undefined;
         if (fetchEls.length === 0 && !emptyEl && !moveEl) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+        }
+        // Each Fetch's content (a full message body or a whole attachment) is buffered in memory and assumed
+        // to individually fit comfortably (see this class's own doc comment) - with no cap on the *count* of
+        // Fetches, a single request could still force many such buffers to be built and held at once (even
+        // repeated fetches of the caller's own single large item), amplifying memory/IO cost far past what one
+        // real device round-trip needs. Rejected outright rather than silently truncated, matching this
+        // command's own precedent for `DeleteSubFolders`/`DocumentLibrary`.
+        if (fetchEls.length > this.maxFetchesPerRequest) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `ItemOperations supports at most ${this.maxFetchesPerRequest} Fetch elements per request.`);
         }
 
         const responseChildren: WbxmlElement[] = [];
@@ -223,9 +243,25 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
-        const messages = await this.messageRepo!.find({ folderUid } as any, { ignoreACL: true });
-        for (const message of messages) {
-            await this.messageRepo!.delete(message.uid, { ignoreACL: true, user: ctx.user });
+        // Processed in bounded batches rather than one unbounded `find()` - a folder with a very large number
+        // of messages would otherwise force the whole set into memory at once. Deletes within a batch still run
+        // sequentially, not via `Promise.all` - the SQL backend (`better-sqlite3`) shares one connection per
+        // request and each `delete()` opens its own transaction, so concurrent deletes fail outright with
+        // "cannot start a transaction within a transaction" (confirmed against real SQL test failures, not
+        // theoretical). Looping (rather than a single pass) still empties the folder completely, however large -
+        // a deleted row no longer matches this same `find()` (soft-deleted rows are excluded from an ordinary
+        // query by default), so the loop always terminates once truly empty.
+        for (;;) {
+            const batch = await this.messageRepo!.find({ folderUid, limit: this.batchSize } as any, {
+                ignoreACL: true,
+                limit: this.batchSize,
+            });
+            if (batch.length === 0) {
+                break;
+            }
+            for (const message of batch) {
+                await this.messageRepo!.delete(message.uid, { ignoreACL: true, user: ctx.user });
+            }
         }
 
         return element(WbxmlCodePage.ItemOperations, "EmptyFolderContents", [
@@ -238,7 +274,9 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
      * `DstFldId`. Unlike `emptyFolderContents`/`fetchMessage` (which fail the whole request via a thrown
      * `ApiError`), this reports failure through the embedded `Status` the same way `MoveItemsCommand` does for
      * its own per-item results - a malformed/unresolvable `Move` is a normal outcome for this operation, not an
-     * exceptional one.
+     * exceptional one. Reports failure (`Status 3`) if not even one message was actually moved - including when
+     * every message sharing the conversation sits in a folder the caller lacks `UPDATE` on, which would
+     * otherwise silently fall through to a false "success" with nothing having moved.
      */
     private async moveConversation(ctx: EasCommandContext, moveEl: WbxmlElement): Promise<WbxmlElement> {
         const conversationIdEl = findChild(moveEl, "ConversationId");
@@ -257,22 +295,37 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         }
 
         const conversationId = decodeConversationId(conversationIdEl.opaque);
-        const messages: Message[] = await this.messageRepo!.find({ mailboxUid: ctx.mailboxUid, conversationId } as any, {
-            ignoreACL: true,
-        });
+        // Capped rather than an unbounded `find()` - an unusually long-running thread could otherwise return an
+        // unbounded number of rows for one request.
+        const messages: Message[] = await this.messageRepo!.find(
+            { mailboxUid: ctx.mailboxUid, conversationId, limit: this.batchSize } as any,
+            { ignoreACL: true, limit: this.batchSize },
+        );
         if (messages.length === 0) {
             return this.moveResponse("3");
         }
 
-        for (const message of messages) {
-            if (!(await this.aclUtils!.hasPermission(ctx.user, message.folderUid, ACLAction.UPDATE))) {
+        // The permission checks (reads) are independent and safe to run concurrently, but the updates
+        // themselves are not: the SQL backend (`better-sqlite3`) shares one connection per request and each
+        // `update()` opens its own transaction, so concurrent updates fail outright with "cannot start a
+        // transaction within a transaction" (confirmed against real SQL test failures, not theoretical) -
+        // updates run sequentially in a plain loop instead.
+        const permitted = await Promise.all(messages.map((message) => this.aclUtils!.hasPermission(ctx.user, message.folderUid, ACLAction.UPDATE)));
+        let movedAny = false;
+        for (let i = 0; i < messages.length; i++) {
+            if (!permitted[i]) {
                 continue;
             }
+            const message = messages[i];
             await this.messageRepo!.update(
                 { uid: (message as any).uid, version: (message as any).version, folderUid: dstFldId } as any,
                 message,
                 { ignoreACL: true, user: ctx.user },
             );
+            movedAny = true;
+        }
+        if (!movedAny) {
+            return this.moveResponse("3");
         }
 
         return element(WbxmlCodePage.ItemOperations, "Move", [

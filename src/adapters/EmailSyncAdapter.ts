@@ -36,7 +36,9 @@ const BODY_TYPE_PLAIN_TEXT = "1";
  *
  * Also handles client-originated `Add`/`Change` for Drafts (`SyncCommand`'s own doc comment covers why this is
  * the only `Email` write EAS itself allows) - a plain-text-only pragmatic subset: no HTML body, no attachments
- * (mirrors `ComposeMailCommand`'s own already-documented attachment gap).
+ * (mirrors `ComposeMailCommand`'s own already-documented attachment gap). `To`/`Cc`/`Bcc` (the latter MS-ASEMAIL2's
+ * own `Bcc` tag) are ghosted independently per recipient type, not as one combined group - a `Change` touching
+ * only one of them leaves the others untouched, carried over from `existing.recipients`.
  *
  * Emits MS-ASEMAIL2's `Email2:ConversationId` (read-only - no `fromApplicationData` handling, since EAS itself
  * never lets a client set it) whenever `Message.conversationId` is populated, so a device's threaded-view UI can
@@ -55,12 +57,14 @@ export class EmailSyncAdapter implements EasCollectionSyncAdapter<Message> {
     public toApplicationData(message: Message): WbxmlElement {
         const to = message.recipients.filter((r) => r.type === RecipientType.TO).map((r) => r.address);
         const cc = message.recipients.filter((r) => r.type === RecipientType.CC).map((r) => r.address);
+        const bcc = message.recipients.filter((r) => r.type === RecipientType.BCC).map((r) => r.address);
 
         return element(WbxmlCodePage.AirSync, "ApplicationData", [
             textElement(WbxmlCodePage.Email, "Subject", message.subject),
             textElement(WbxmlCodePage.Email, "From", formatAddress(message.from.address, message.from.displayName)),
             ...(to.length > 0 ? [textElement(WbxmlCodePage.Email, "To", to.join("; "))] : []),
             ...(cc.length > 0 ? [textElement(WbxmlCodePage.Email, "Cc", cc.join("; "))] : []),
+            ...(bcc.length > 0 ? [textElement(WbxmlCodePage.Email2, "Bcc", bcc.join("; "))] : []),
             textElement(WbxmlCodePage.Email, "DateReceived", message.receivedDate.toISOString()),
             textElement(WbxmlCodePage.Email, "Importance", IMPORTANCE_CODES[message.importance]),
             textElement(WbxmlCodePage.Email, "Read", message.flags.read ? "1" : "0"),
@@ -91,10 +95,22 @@ export class EmailSyncAdapter implements EasCollectionSyncAdapter<Message> {
 
         const to = childText(el, "To");
         const cc = childText(el, "Cc");
-        if (to !== undefined || cc !== undefined) {
+        const bcc = childText(el, "Bcc");
+        if (to !== undefined || cc !== undefined || bcc !== undefined) {
+            // Ghosted per-recipient-type, not as one combined group: a `Change` touching only `To` must leave
+            // any existing `Cc`/`Bcc` recipients alone, so untouched types are carried over from `existing`
+            // rather than the whole `recipients` array being rebuilt from just what's present in `el`.
+            const untouched = (existing?.recipients ?? []).filter(
+                (r) =>
+                    (r.type !== RecipientType.TO || to === undefined) &&
+                    (r.type !== RecipientType.CC || cc === undefined) &&
+                    (r.type !== RecipientType.BCC || bcc === undefined),
+            );
             partial.recipients = [
+                ...untouched,
                 ...(to !== undefined ? parseAddressList(to, RecipientType.TO) : []),
                 ...(cc !== undefined ? parseAddressList(cc, RecipientType.CC) : []),
+                ...(bcc !== undefined ? parseAddressList(bcc, RecipientType.BCC) : []),
             ];
         }
 
@@ -209,10 +225,12 @@ function sanitizeHeaderValue(value: string): string {
 function buildPlainTextMime(parts: { subject: string; from?: Recipient; recipients: Recipient[]; date: Date; text: string }): string {
     const to = parts.recipients.filter((r) => r.type === RecipientType.TO).map((r) => formatAddress(r.address, r.displayName));
     const cc = parts.recipients.filter((r) => r.type === RecipientType.CC).map((r) => formatAddress(r.address, r.displayName));
+    const bcc = parts.recipients.filter((r) => r.type === RecipientType.BCC).map((r) => formatAddress(r.address, r.displayName));
     const headers = [
         ...(parts.from ? [`From: ${sanitizeHeaderValue(formatAddress(parts.from.address, parts.from.displayName))}`] : []),
         ...(to.length > 0 ? [`To: ${sanitizeHeaderValue(to.join(", "))}`] : []),
         ...(cc.length > 0 ? [`Cc: ${sanitizeHeaderValue(cc.join(", "))}`] : []),
+        ...(bcc.length > 0 ? [`Bcc: ${sanitizeHeaderValue(bcc.join(", "))}`] : []),
         `Subject: ${sanitizeHeaderValue(parts.subject)}`,
         `Date: ${parts.date.toUTCString()}`,
         "MIME-Version: 1.0",

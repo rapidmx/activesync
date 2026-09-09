@@ -49,7 +49,58 @@ Keep entries terse — this is a reference, not a transcript.
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
 
-## Session Log
+### 2026-09-08 (2) — Adversarial two-agent review #2, 6 confirmed findings fixed
+
+JP asked for another full adversarial two-agent review (correctness/bugs-lens + security/performance-lens, same
+pattern as the 2026-09-07 entry below) covering all of `src/`, including the conversation-`Move`/`ConversationId`/
+`Categories` work from the same day's earlier session. Verified every claim against actual source (one agent
+claim about `SyncCommand`'s watermark needed a framework-source read to confirm precisely) before fixing:
+
+- **HIGH, fixed**: `ItemOperationsCommand.moveConversation` fell through to `Status "1"` (success) even when
+  every message sharing the `ConversationId` was skipped for lacking `UPDATE` - a device could be told a move
+  succeeded when nothing moved. Now tracks whether any message actually moved and returns `Status "3"` if not.
+- **HIGH, fixed**: `PingCommand` never checked ACL on client-supplied folder uids before subscribing to their
+  Redis pub/sub channels - the one command in the codebase that had this gap (every other command checks
+  ownership on a client-supplied id). Concretely: a device that once had a folder shared with it could keep a
+  live activity signal for that folder indefinitely, even after the share was revoked, since `Ping` never
+  re-checks. Now filters the requested folder list down to only those the caller currently has `READ` on
+  before subscribing (not a hard failure - `Ping`'s wire response has no per-folder status to report a partial
+  denial through, and a client has no way to know its access changed before it re-sends the same list).
+  `PingCommand.test.ts`'s own bespoke minimal config double (deliberately DB-less, since `Ping` itself needs no
+  database) can't construct a real `ACLUtils` via `ObjectFactory` - added a `createCommand()` test helper that
+  stubs `aclUtils` directly after construction instead.
+- **MEDIUM, fixed**: `EmailSyncAdapter.fromApplicationData` ghosted `To`/`Cc` as one combined group rebuilt from
+  scratch rather than per-type against `existing.recipients` - a `Change` touching only `To` silently dropped
+  any existing `Cc`. `Bcc` (MS-ASEMAIL2's own tag, already in the codec's tag table) was never handled in either
+  direction at all. Both fixed together: each of `To`/`Cc`/`Bcc` is now ghosted independently, and `Bcc` is
+  read/written symmetrically with the other two (including in the built Draft MIME's own `Bcc:` header).
+- **MEDIUM, fixed**: `SyncCommand.applyDelete`'s watermark used a fresh `new Date()` captured after
+  `repo.delete()` resolves - a deliberate prior-session fix for duplicate-Delete redelivery, but with its own
+  narrow trade-off: since `computeChanges()` snapshots the folder *before* this round's own Delete runs, a
+  genuinely concurrent unrelated write to a different message in the same folder landing in that narrow window
+  could end up permanently skipped once the watermark advances past it. Fixed by re-reading the now-soft-deleted
+  row's own real `dateModified` via `repo.findOne(uid, {ignoreACL:true, includeDeleted:true})` instead of
+  approximating with wall-clock time - `RepoFindOptions.includeDeleted` already exists on the base `RepoUtils`
+  (confirmed by reading `service-core`'s own source), no need for a `RecoverableRepoUtils`-specific cast.
+- **LOW/performance, fixed**: `ItemOperationsCommand`'s `Fetch` loop had no cap on Fetches per request (each
+  fully buffered in memory) - added `mail:eas:itemoperations_max_fetch` (default 25), rejected outright like
+  `DeleteSubFolders`/`DocumentLibrary` rather than silently truncated.
+- **LOW/performance, fixed**: `emptyFolderContents`/`moveConversation` ran unbounded `find()` queries. Added
+  `mail:eas:itemoperations_batch_size` (default 500) and switched `emptyFolderContents` to a batched loop
+  (repeated bounded `find()`+delete rounds until the folder is actually empty - a soft-deleted row stops
+  matching the same query, so this always terminates) and capped `moveConversation`'s own query with the same
+  limit.
+- **Real bug found and reverted while fixing the above**: my first pass parallelized both batches' writes via
+  `Promise.all` (independent rows, seemingly safe) - broke the SQL backend outright with `SqliteError: cannot
+  start a transaction within a transaction`. `better-sqlite3` shares one connection per request and each
+  `delete()`/`update()` opens its own transaction, so concurrent writes against it always fail; confirmed via
+  a real failing SQL test run, not assumed. Reverted to sequential writes in both spots - only the read-only
+  ACL permission checks (independent, no shared-connection transaction) are still parallelized via `Promise.all`
+  in `moveConversation`. Worth remembering for any future "these look independent, parallelize them" instinct
+  in this codebase: reads are fine, writes sharing the SQL connection are not.
+- Two agent claims were investigated and found to already be correct as-is, not re-reported: `ItemOperations`
+  Move's destination-folder ownership check itself (sound), and the WBXML codec's opaque/length encoding
+  (round-trips correctly, verified against the codec's own passing round-trip tests).
 
 ### 2026-09-08 — Caught up to `restapi` 0.3.x: Categories, ConversationId, conversation `Move`
 

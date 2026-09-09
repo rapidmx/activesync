@@ -889,6 +889,10 @@ describe("Route:EasRouteMongo Tests", () => {
             const message = await createMessage(mailbox.uid, folder.uid, {
                 subject: "Hello EAS",
                 flags: { read: true, flagged: true, answered: false, forwarded: false },
+                recipients: [
+                    { address: "owner@example.com", type: RecipientType.TO },
+                    { address: "hidden@example.com", type: RecipientType.BCC },
+                ],
             });
 
             const initial = await postWbxml("Sync", "dev1", syncRequest("0", "Email", folder.uid));
@@ -907,6 +911,7 @@ describe("Route:EasRouteMongo Tests", () => {
             expect(childText(appData, "From")).toBe("Sender <sender@example.com>");
             expect(childText(appData, "Read")).toBe("1");
             expect(childText(appData, "Flag")).toBe("1");
+            expect(childText(appData, "Bcc")).toBe("hidden@example.com");
         });
 
         it("Includes an Email2:ConversationId when the Message has one, omits it otherwise.", async () => {
@@ -2412,6 +2417,28 @@ describe("Route:EasRouteMongo Tests", () => {
             expect(result.status).toBe(404);
         });
 
+        it("Returns 400 when a request packs more Fetch elements than the configured max.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            // Default max is 25 - none of these need to resolve to anything real, the count cap is enforced
+            // before any of them are looked up.
+            const fetches = Array.from({ length: 26 }, () =>
+                element(WbxmlCodePage.ItemOperations, "Fetch", [
+                    textElement(WbxmlCodePage.ItemOperations, "Store", "Mailbox"),
+                    textElement(WbxmlCodePage.AirSyncBase, "FileReference", uuid.v4()),
+                ]),
+            );
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
+                .set("Authorization", "jwt " + ownerToken)
+                .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                .send(new WbxmlEncoder().encode(element(WbxmlCodePage.ItemOperations, "ItemOperations", fetches)));
+
+            expect(result.status).toBe(400);
+        });
+
         it("Returns 403 when fetching an attachment the caller has no permission on.", async () => {
             await createMailbox(owner.uid);
             await provisionDevice("dev1");
@@ -2748,6 +2775,37 @@ describe("Route:EasRouteMongo Tests", () => {
                 const stillOrphaned = await messageRepo.findOne({ uid: orphaned.uid });
                 expect(movedMovable?.folderUid).toBe(dstFolder.uid);
                 expect(stillOrphaned?.folderUid).not.toBe(dstFolder.uid);
+            });
+
+            it("Returns Status 3 (not a false success) when every message sharing the ConversationId lacks UPDATE.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const dstFolder = await createFolderWithAcl(mailbox.uid, { name: "Archive", type: FolderType.USER });
+                const conversationId = uuid.v4();
+                // Neither message's own folderUid resolves to a real, accessible Folder/ACL row - every
+                // permission check fails, so nothing is actually moved. The response must say so (Status 3),
+                // not silently claim success with zero real effect.
+                const orphanedA = await createMessage(mailbox.uid, uuid.v4(), { conversationId });
+                const orphanedB = await createMessage(mailbox.uid, uuid.v4(), { conversationId });
+
+                const response = await postWbxml(
+                    "ItemOperations",
+                    "dev1",
+                    element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                        element(WbxmlCodePage.ItemOperations, "Move", [
+                            opaqueElement(WbxmlCodePage.ItemOperations, "ConversationId", Buffer.from(conversationId, "utf8")),
+                            textElement(WbxmlCodePage.ItemOperations, "DstFldId", dstFolder.uid),
+                        ]),
+                    ]),
+                );
+
+                const move = findChild(findChild(response, "Response")!, "Move")!;
+                expect(childText(move, "Status")).toBe("3");
+
+                const stillA = await messageRepo.findOne({ uid: orphanedA.uid });
+                const stillB = await messageRepo.findOne({ uid: orphanedB.uid });
+                expect(stillA?.folderUid).not.toBe(dstFolder.uid);
+                expect(stillB?.folderUid).not.toBe(dstFolder.uid);
             });
 
             it("Returns Status 3 when ConversationId or DstFldId is missing.", async () => {
