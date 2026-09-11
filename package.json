@@ -18,7 +18,8 @@
         "test": "vitest run",
         "test:prod": "npm run lint && vitest run --coverage",
         "test:watch": "vitest",
-        "release": "rapidrest release"
+        "release": "npx @rapidrest/cli release",
+        "prepublish": "yarn build"
     },
     "peerDependencies": {
         "@rapidmx/restapi": "0.3.x",
@@ -30,7 +31,6 @@
     },
     "devDependencies": {
         "@rapidmx/restapi": "^0.3.1",
-        "@rapidrest/cli": "^1.0.1",
         "@rapidrest/core": "^5.2.2",
         "@rapidrest/service-core": "^1.7.2",
         "@swc/core": "^1.16.2",
