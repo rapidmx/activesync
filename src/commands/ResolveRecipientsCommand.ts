@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ObjectDecorators } from "@rapidrest/core";
+import { ObjectDecorators, StringUtils } from "@rapidrest/core";
 import { ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import type { Contact } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
@@ -22,21 +22,16 @@ const LOOKS_LIKE_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const STATUS_SUCCESS = "1";
 const STATUS_NOT_FOUND = "4";
 
-/** Wraps a client-supplied query string as a glob pattern for `RepoUtils`' `like()` operator - identical helper
- * to `SearchCommand`'s own `globPattern()` (small enough, and specific enough to each command's own surrounding
- * logic, that extracting a shared utility for two call sites isn't worth a new cross-command dependency). See
- * that file's own doc comment for why this wraps rather than escapes, since `@rapidrest/service-core` 2.x's
- * `like()` now compiles glob syntax (`*`/`?`) identically on both backends, with no escape mechanism for either
- * character. */
-function globPattern(value: string): string {
-    return `*${value}*`;
-}
-
 /**
  * Handles EAS `ResolveRecipients`: resolves each `<To>` value (a display name, partial name, or address) the
  * client is unsure how to reach against the mailbox's own `Contact` (GAL) store - the same substring-match
- * approach `SearchCommand` uses for its own `Store Name="GAL"` lookups, duplicated rather than shared (see
- * `globPattern`'s own doc comment).
+ * approach `SearchCommand` uses for its own `Store Name="GAL"` lookups, duplicated rather than shared (small
+ * enough, and specific enough to each command's own surrounding logic, that extracting a shared utility for two
+ * call sites isn't worth a new cross-command dependency). Both use `RepoUtils`' `regex(...)` operator (not
+ * `like(...)`, which compiles a glob pattern under `@rapidrest/service-core` ^2.0 - anchored, and with no escape
+ * for a literal `*`/`?`): `StringUtils.escapeRegExp(value)` gives a genuine, unanchored literal-substring match
+ * with no residual wildcard ambiguity, matching the same fix already applied to the `mapi` plugin's own
+ * identical GAL-search gap.
  *
  * **Pragmatic subset**: no free-busy `Availability`, no S/MIME `Certificates`/`Options` handling at all - this
  * command's real-world use is overwhelmingly enterprise S/MIME certificate lookup, which this library doesn't
@@ -88,11 +83,11 @@ export abstract class ResolveRecipientsCommand implements EasCommandHandler {
             return this.responseElement(value, STATUS_SUCCESS, [this.recipientElement(value, undefined)]);
         }
 
-        const pattern = globPattern(value);
+        const pattern = StringUtils.escapeRegExp(value);
         const findOptions: any = { ignoreACL: true, limit: this.maxMatches };
         const perField = await Promise.all(
             ["displayName", "givenName", "surname"].map((field) =>
-                this.contactRepo!.find({ mailboxUid: ctx.mailboxUid, [field]: `like(${pattern})` } as any, findOptions),
+                this.contactRepo!.find({ mailboxUid: ctx.mailboxUid, [field]: `regex(${pattern})` } as any, findOptions),
             ),
         );
         const byUid = new Map<string, Contact & { uid: string }>();

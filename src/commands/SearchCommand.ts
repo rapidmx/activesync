@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, ObjectDecorators } from "@rapidrest/core";
+import { ApiError, ObjectDecorators, StringUtils } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
@@ -11,19 +11,6 @@ import type { EmailSyncAdapter } from "../adapters/EmailSyncAdapter.js";
 import type { Contact, Message } from "@rapidmx/restapi";
 import type { SearchProvider } from "@rapidmx/restapi/search";
 const { Config, Init, Inject } = ObjectDecorators;
-
-/** Wraps a client-supplied search string as a glob pattern (`*` = any sequence, `?` = any single character) for
- * `RepoUtils`' `like()` query operator, so a partial name matches as a case-insensitive substring. Since
- * `@rapidrest/service-core` 2.x, `like()` compiles glob syntax identically on both Mongo (`globToRegExpSource` -
- * an anchored, fully-escaped `$regex`) and SQL (`globToLike` - a `LIKE` pattern), rather than the old two-backend
- * split this file used to document (Mongo unanchored-regex vs. SQL exact-unless-`%`-wrapped) - confirmed by
- * reading `ModelUtils.ts` directly, not assumed from the version bump alone. Neither translation offers an
- * escape mechanism for a literal `*`/`?` a user happens to type (`globToLike`'s own doc comment: "a client
- * wanting to match a literal % or _ cannot fully escape it, a narrow, documented limitation"), so this wraps
- * only - it does not attempt to neutralize those two characters, matching the framework's own accepted stance. */
-function globPattern(value: string): string {
-    return `*${value}*`;
-}
 
 /** Parses a `Range` value (`"m-n"`, a zero-based inclusive index pair) into `{ start, end }`, falling back to
  * `defaultEnd` for a missing/malformed value - never trusting the client to request more than `maxEnd` rows. */
@@ -159,11 +146,19 @@ export abstract class SearchCommand implements EasCommandHandler {
         // a broken TypeORM `where` clause (a literal `$or` property, not a real OR) and 500s. Querying each
         // field separately and merging in memory - the same workaround `EasSyncKeyUtils.computeChanges()`
         // already uses for its own two-backend query gap - works identically on both backends instead.
-        const pattern = globPattern(query);
+        //
+        // Uses `regex()`, not `like()`: `like()` (`@rapidrest/service-core` ^2.0) compiles a **glob** pattern
+        // (`*`/`?` as wildcards), anchored on both backends, so a substring match needs wrapping the term in
+        // `*...*` - and even then a literal `*`/`?` the user typed still acts as a wildcard, since glob syntax
+        // has no escape mechanism for either character. `regex()` takes a real, unanchored regular expression
+        // compiled case-insensitively on both backends (`$regex`/driver-native `REGEXP`), so escaping the term
+        // with `StringUtils.escapeRegExp` gives a genuine literal-substring match with no residual wildcard
+        // ambiguity - no `*...*` wrapping needed, `regex()` already matches anywhere in the field by default.
+        const pattern = StringUtils.escapeRegExp(query);
         const findOptions: any = { ignoreACL: true, limit: this.maxRangeEnd + 1 };
         const perField = await Promise.all(
             ["displayName", "givenName", "surname", "company"].map((field) =>
-                this.contactRepo!.find({ mailboxUid: ctx.mailboxUid, [field]: `like(${pattern})`, limit: this.maxRangeEnd + 1 } as any, findOptions),
+                this.contactRepo!.find({ mailboxUid: ctx.mailboxUid, [field]: `regex(${pattern})`, limit: this.maxRangeEnd + 1 } as any, findOptions),
             ),
         );
         const byUid = new Map<string, Contact & { uid: string }>();

@@ -2949,6 +2949,24 @@ describe("Route:EasRouteMongo Tests", () => {
             expect(childText(properties, "Phone")).toBe("555-9999");
         });
 
+        it("Matches a literal regex metacharacter in the query against a literal one in the stored value.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+            // "a.b" would find "aXb" too if the query's "." reached regex() unescaped, and would find nothing at
+            // all if it were double-escaped (as a literal glob-wrap over an already-escaping like() briefly was,
+            // before this file switched to regex()) - this must match the real dot and only the real dot.
+            await createContact(mailbox.uid, folder.uid, { displayName: "a.b Corp" });
+            await createContact(mailbox.uid, folder.uid, { displayName: "aXb Corp" });
+
+            const response = await postWbxml("Search", "dev1", searchRequest("a.b"));
+
+            const store = findChild(findChild(response, "Response")!, "Store")!;
+            expect(childText(store, "Total")).toBe("1");
+            const properties = findChild(findChild(store, "Result")!, "Properties")!;
+            expect(childText(properties, "DisplayName")).toBe("a.b Corp");
+        });
+
         it("Returns 400 when the GAL Store has no Query element at all.", async () => {
             await createMailbox(owner.uid);
             await provisionDevice("dev1");
@@ -3806,6 +3824,27 @@ describe("Route:EasRouteMongo Tests", () => {
             const recipient = findChild(resp, "Recipient")!;
             expect(childText(recipient, "DisplayName")).toBe("Jane Doe");
             expect(childText(recipient, "EmailAddress")).toBe("new@example.com");
+        });
+
+        it("Matches a literal regex metacharacter in the query against a literal one in the stored value.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+            await createContact(mailbox.uid, folder.uid, {
+                displayName: "a.b Corp",
+                emails: [{ address: "ab-corp@example.com", type: ContactAddressKind.OTHER }],
+            });
+            await createContact(mailbox.uid, folder.uid, {
+                displayName: "aXb Corp",
+                emails: [{ address: "axb-corp@example.com", type: ContactAddressKind.OTHER }],
+            });
+
+            const response = await postWbxml("ResolveRecipients", "dev1", resolveRequest(["a.b"]));
+
+            const resp = findChild(response, "Response")!;
+            expect(childText(resp, "Status")).toBe("1");
+            expect(childText(resp, "RecipientCount")).toBe("1");
+            expect(childText(findChild(resp, "Recipient")!, "EmailAddress")).toBe("ab-corp@example.com");
         });
 
         it("Reports Status 4 when no Contact matches and the value doesn't look like an email address.", async () => {

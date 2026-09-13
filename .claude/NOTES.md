@@ -49,6 +49,33 @@ Keep entries terse — this is a reference, not a transcript.
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
 
+### 2026-09-13 (3) — Switched GAL search from `like()` glob-wrapping to `regex()`, matching the `mapi` plugin's own fix
+
+JP pointed out the sibling `mapi` plugin hit the exact same `service-core` 2.0 `like()`-glob regression this repo
+fixed two entries below, and its own follow-up commit (`424bd27`) went further: switched from escaping-then-
+wrapping a glob pattern for `like()` to using the newer `regex()` operator directly. Checked out `mapi`'s actual
+diff (not just its commit message) before assuming the same applies here - it does, cleanly:
+
+- **`regex()` (`@rapidrest/service-core` ^2.0) takes a real, unanchored regular expression**, case-insensitively
+  compiled on both backends (Mongo `$regex`/`$options:"i"`; SQL `~*`/`REGEXP`/`better-sqlite3`'s custom `REGEXP`
+  function) - substring matching is its *default* behavior, unlike `like()`'s anchored glob translation, which
+  needed wrapping the term in `*...*` to get the same effect. `StringUtils.escapeRegExp(query)` (already in
+  `@rapidrest/core`, no new dependency) escapes every regex metacharacter *including* `*`/`?` - closing the one
+  residual gap the glob-wrap approach couldn't: a search term containing a literal `*` or `?` no longer acts as
+  a wildcard, since `regex()` has a real escape mechanism where glob syntax has none.
+- Replaced `SearchCommand.ts`'s `globPattern()`/`ResolveRecipientsCommand.ts`'s duplicate of it with a direct
+  `StringUtils.escapeRegExp(...)` call at each of the two call sites - no wrapping function needed at all now,
+  since `regex()` doesn't require the `*...*` dressing `like()` did.
+- **`regex()` is independently validated by the framework** (`ModelUtils.isUnsafeRegexPattern`) against
+  catastrophic-backtracking shapes *and* a 100-character pattern length cap - neither applies to `like()`. Since
+  the entire query is escaped before it ever reaches the operator, no unescaped metacharacter can form one of
+  the rejected shapes; the length cap is a real, if practically unlikely, new constraint (a GAL/ResolveRecipients
+  search term over 100 characters now gets a framework-level 400 it wouldn't have before) - worth knowing if a
+  future report ever traces back to it, not worth engineering around today for names/partial-address queries.
+- Added a regression test per command, per backend (`"a.b"` matching `"a.b Corp"` but not `"aXb Corp"`) - the
+  exact shape that would have failed under either the pre-2.0 assumption (double-escaping) or an unescaped
+  `regex()` call (over-matching), mirroring `mapi`'s own added coverage for the identical fix.
+
 ### 2026-09-13 (2) — Closed the deferred `Message.labelUids` → Categories gap
 
 JP asked to address the remaining gap the prior entry deliberately deferred. Implemented it after all, since the
