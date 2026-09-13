@@ -10,9 +10,4 @@ import { ResolveRecipientsCommand } from "../ResolveRecipientsCommand.js";
  */
 export class ResolveRecipientsCommandMongo extends ResolveRecipientsCommand {
     protected contactClass: any = ContactMongo;
-
-    protected likePattern(escaped: string): string {
-        // Mongo's like() compiles to an unanchored $regex - already a substring match with no wrapping needed.
-        return escaped;
-    }
 }

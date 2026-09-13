@@ -25,7 +25,7 @@ import {
     TaskMongo,
 } from "@rapidmx/restapi/mongo";
 import { MongoMemoryServer } from "mongodb-memory-server";
-import { registerTestDoubles, RecordingMailTransport, InMemoryBlobStore } from "../../testDoubles.js";
+import { registerTestDoubles, RecordingMailTransport, InMemoryBlobStore, NoopSearchProvider } from "../../testDoubles.js";
 import { WbxmlEncoder } from "../../../src/codec/WbxmlEncoder.js";
 import { WbxmlDecoder } from "../../../src/codec/WbxmlDecoder.js";
 import { element, textElement, opaqueElement, findChild, findChildren, childText, type WbxmlElement } from "../../../src/codec/WbxmlElement.js";
@@ -187,6 +187,10 @@ describe("Route:EasRouteMongo Tests", () => {
 
     const blobStore = function (): InMemoryBlobStore {
         return objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
+    };
+
+    const searchProvider = function (): NoopSearchProvider {
+        return objectFactory.getInstance<NoopSearchProvider>("SearchProvider")!;
     };
 
     /** Creates an `Attachment` record whose `blobKey` actually resolves to real content in the shared
@@ -2913,6 +2917,25 @@ describe("Route:EasRouteMongo Tests", () => {
             expect(childText(properties, "Phone")).toBe("555-9999");
         });
 
+        it("Returns 400 when the GAL Store has no Query element at all.", async () => {
+            await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+
+            const result = await request(server.getApplication())
+                .post(`${baseUrl}?Cmd=Search&DeviceId=dev1`)
+                .set("Authorization", "jwt " + ownerToken)
+                .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                .send(
+                    new WbxmlEncoder().encode(
+                        element(WbxmlCodePage.Search, "Search", [
+                            element(WbxmlCodePage.Search, "Store", [textElement(WbxmlCodePage.Search, "Name", "GAL")]),
+                        ]),
+                    ),
+                );
+
+            expect(result.status).toBe(400);
+        });
+
         it("Returns Total 0 with no Result elements when nothing matches.", async () => {
             await createMailbox(owner.uid);
             await provisionDevice("dev1");
@@ -2953,7 +2976,7 @@ describe("Route:EasRouteMongo Tests", () => {
             expect(findChildren(store, "Result").length).toBe(1);
         });
 
-        it("Returns 400 when the Store name isn't GAL.", async () => {
+        it("Returns 400 when the Store name is neither GAL nor Mailbox.", async () => {
             await createMailbox(owner.uid);
             await provisionDevice("dev1");
 
@@ -2965,7 +2988,7 @@ describe("Route:EasRouteMongo Tests", () => {
                     new WbxmlEncoder().encode(
                         element(WbxmlCodePage.Search, "Search", [
                             element(WbxmlCodePage.Search, "Store", [
-                                textElement(WbxmlCodePage.Search, "Name", "Mailbox"),
+                                textElement(WbxmlCodePage.Search, "Name", "DocumentLibrary"),
                                 textElement(WbxmlCodePage.Search, "Query", "test"),
                             ]),
                         ]),
@@ -2973,6 +2996,165 @@ describe("Route:EasRouteMongo Tests", () => {
                 );
 
             expect(result.status).toBe(400);
+        });
+
+        describe("Mailbox store", () => {
+            const mailboxSearchRequest = function (
+                freeText: string | undefined,
+                options: { className?: string; folderUid?: string; range?: string; useAndWrapper?: boolean } = {},
+            ): WbxmlElement {
+                const { className = "Email", folderUid, range, useAndWrapper = true } = options;
+                const queryChildren: WbxmlElement[] = [
+                    textElement(WbxmlCodePage.AirSync, "Class", className),
+                    ...(folderUid ? [textElement(WbxmlCodePage.AirSync, "CollectionId", folderUid)] : []),
+                    ...(freeText !== undefined ? [textElement(WbxmlCodePage.Search, "FreeText", freeText)] : []),
+                ];
+                return element(WbxmlCodePage.Search, "Search", [
+                    element(WbxmlCodePage.Search, "Store", [
+                        textElement(WbxmlCodePage.Search, "Name", "Mailbox"),
+                        element(WbxmlCodePage.Search, "Query", [
+                            useAndWrapper ? element(WbxmlCodePage.Search, "And", queryChildren) : queryChildren,
+                        ].flat()),
+                        ...(range
+                            ? [element(WbxmlCodePage.Search, "Options", [textElement(WbxmlCodePage.Search, "Range", range)])]
+                            : []),
+                    ]),
+                ]);
+            };
+
+            it("Finds a message via the SearchProvider index and renders it with EmailSyncAdapter's own field mapping.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const message = await createMessage(mailbox.uid, folder.uid, { subject: "Quarterly Budget Review" });
+                await searchProvider().index({
+                    entityType: "message",
+                    entityUid: message.uid,
+                    mailboxUid: mailbox.uid,
+                    subject: message.subject,
+                });
+
+                const response = await postWbxml("Search", "dev1", mailboxSearchRequest("Budget"));
+
+                const store = findChild(findChild(response, "Response")!, "Store")!;
+                expect(childText(store, "Status")).toBe("1");
+                expect(childText(store, "Total")).toBe("1");
+                const result = findChild(store, "Result")!;
+                expect(childText(result, "Class")).toBe("Email");
+                expect(childText(result, "CollectionId")).toBe(folder.uid);
+                expect(childText(result, "ServerId")).toBe(message.uid);
+                const properties = findChild(result, "Properties")!;
+                expect(childText(properties, "Subject")).toBe("Quarterly Budget Review");
+                expect(childText(properties, "From")).toBe("Sender <sender@example.com>");
+            });
+
+            it("Also accepts a Query with no And wrapper, reading Class/FreeText as Query's own direct children.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const message = await createMessage(mailbox.uid, folder.uid, { subject: "Direct Children Shape" });
+                await searchProvider().index({
+                    entityType: "message",
+                    entityUid: message.uid,
+                    mailboxUid: mailbox.uid,
+                    subject: message.subject,
+                });
+
+                const response = await postWbxml("Search", "dev1", mailboxSearchRequest("Direct Children", { useAndWrapper: false }));
+
+                const store = findChild(findChild(response, "Response")!, "Store")!;
+                expect(childText(store, "Total")).toBe("1");
+            });
+
+            it("Returns 400 when Query's Class is not Email.", async () => {
+                await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+
+                const result = await request(server.getApplication())
+                    .post(`${baseUrl}?Cmd=Search&DeviceId=dev1`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                    .send(new WbxmlEncoder().encode(mailboxSearchRequest("term", { className: "Contacts" })));
+
+                expect(result.status).toBe(400);
+            });
+
+            it("Returns 400 when the Query has no FreeText.", async () => {
+                await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+
+                const result = await request(server.getApplication())
+                    .post(`${baseUrl}?Cmd=Search&DeviceId=dev1`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                    .send(new WbxmlEncoder().encode(mailboxSearchRequest(undefined)));
+
+                expect(result.status).toBe(400);
+            });
+
+            it("Returns 400 when the Mailbox Store has no Query element at all.", async () => {
+                await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+
+                const result = await request(server.getApplication())
+                    .post(`${baseUrl}?Cmd=Search&DeviceId=dev1`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                    .send(
+                        new WbxmlEncoder().encode(
+                            element(WbxmlCodePage.Search, "Search", [
+                                element(WbxmlCodePage.Search, "Store", [textElement(WbxmlCodePage.Search, "Name", "Mailbox")]),
+                            ]),
+                        ),
+                    );
+
+                expect(result.status).toBe(400);
+            });
+
+            it("Silently skips a stale index entry whose Message no longer exists.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                await searchProvider().index({
+                    entityType: "message",
+                    entityUid: uuid.v4(),
+                    mailboxUid: mailbox.uid,
+                    subject: "Ghost Message",
+                });
+
+                const response = await postWbxml("Search", "dev1", mailboxSearchRequest("Ghost"));
+
+                const store = findChild(findChild(response, "Response")!, "Store")!;
+                expect(childText(store, "Total")).toBe("0");
+            });
+
+            it("Excludes a match whose folder no longer grants the caller READ, without failing the whole search.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const visible = await createMessage(mailbox.uid, inbox.uid, { subject: "Visible Report" });
+                // No Folder/ACL row exists for this uid at all - `ACLUtils.hasPermission` resolves an
+                // unresolvable ACL uid to `false` rather than throwing, so this hit is excluded rather than
+                // failing the whole request (same "orphaned folderUid" technique used for ItemOperations Move).
+                const orphaned = await createMessage(mailbox.uid, uuid.v4(), { subject: "Hidden Report" });
+                await searchProvider().index({
+                    entityType: "message",
+                    entityUid: visible.uid,
+                    mailboxUid: mailbox.uid,
+                    subject: visible.subject,
+                });
+                await searchProvider().index({
+                    entityType: "message",
+                    entityUid: orphaned.uid,
+                    mailboxUid: mailbox.uid,
+                    subject: orphaned.subject,
+                });
+
+                const response = await postWbxml("Search", "dev1", mailboxSearchRequest("Report"));
+
+                const store = findChild(findChild(response, "Response")!, "Store")!;
+                expect(childText(store, "Total")).toBe("1");
+                expect(childText(findChild(store, "Result")!, "ServerId")).toBe(visible.uid);
+            });
         });
     });
 

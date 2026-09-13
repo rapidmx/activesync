@@ -43,6 +43,11 @@ const baseMessage: Message = {
     importance: MessageImportance.NORMAL,
     references: [],
     hasAttachments: false,
+    encrypted: false,
+    deliveryReceiptPending: false,
+    readReceiptPending: false,
+    deliveryReceiptDeclined: false,
+    readReceiptDeclined: false,
 };
 
 describe("EmailSyncAdapter Tests", () => {

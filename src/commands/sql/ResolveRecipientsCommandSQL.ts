@@ -10,9 +10,4 @@ import { ResolveRecipientsCommand } from "../ResolveRecipientsCommand.js";
  */
 export class ResolveRecipientsCommandSQL extends ResolveRecipientsCommand {
     protected contactClass: any = ContactSQL;
-
-    protected likePattern(escaped: string): string {
-        // SQL's like() compiles to TypeORM's ILike() - a plain LIKE, exact unless wrapped in % wildcards.
-        return `%${escaped}%`;
-    }
 }

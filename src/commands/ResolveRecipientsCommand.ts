@@ -22,18 +22,21 @@ const LOOKS_LIKE_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const STATUS_SUCCESS = "1";
 const STATUS_NOT_FOUND = "4";
 
-/** Escapes regex metacharacters so a client-supplied query string is matched literally - identical helper to
- * `SearchCommand`'s own (small enough, and specific enough to each command's own surrounding logic, that
- * extracting a shared utility for two call sites isn't worth a new cross-command dependency). */
-function escapeForLikeQuery(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** Wraps a client-supplied query string as a glob pattern for `RepoUtils`' `like()` operator - identical helper
+ * to `SearchCommand`'s own `globPattern()` (small enough, and specific enough to each command's own surrounding
+ * logic, that extracting a shared utility for two call sites isn't worth a new cross-command dependency). See
+ * that file's own doc comment for why this wraps rather than escapes, since `@rapidrest/service-core` 2.x's
+ * `like()` now compiles glob syntax (`*`/`?`) identically on both backends, with no escape mechanism for either
+ * character. */
+function globPattern(value: string): string {
+    return `*${value}*`;
 }
 
 /**
  * Handles EAS `ResolveRecipients`: resolves each `<To>` value (a display name, partial name, or address) the
  * client is unsure how to reach against the mailbox's own `Contact` (GAL) store - the same substring-match
  * approach `SearchCommand` uses for its own `Store Name="GAL"` lookups, duplicated rather than shared (see
- * `escapeForLikeQuery`'s own doc comment).
+ * `globPattern`'s own doc comment).
  *
  * **Pragmatic subset**: no free-busy `Availability`, no S/MIME `Certificates`/`Options` handling at all - this
  * command's real-world use is overwhelmingly enterprise S/MIME certificate lookup, which this library doesn't
@@ -50,10 +53,6 @@ export abstract class ResolveRecipientsCommand implements EasCommandHandler {
     public readonly command = "ResolveRecipients";
 
     protected abstract contactClass: any;
-
-    /** Same two-backend `like()` quirk `SearchCommand.likePattern` documents - supplied by the Mongo/SQL
-     * concrete subclasses. */
-    protected abstract likePattern(escaped: string): string;
 
     @Config("mail:eas:resolve_recipients_max_matches", 10)
     private maxMatches: number = 10;
@@ -89,7 +88,7 @@ export abstract class ResolveRecipientsCommand implements EasCommandHandler {
             return this.responseElement(value, STATUS_SUCCESS, [this.recipientElement(value, undefined)]);
         }
 
-        const pattern = this.likePattern(escapeForLikeQuery(value));
+        const pattern = globPattern(value);
         const findOptions: any = { ignoreACL: true, limit: this.maxMatches };
         const perField = await Promise.all(
             ["displayName", "givenName", "surname"].map((field) =>

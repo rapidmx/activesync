@@ -49,6 +49,88 @@ Keep entries terse — this is a reference, not a transcript.
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
 
+### 2026-09-13 — Caught up to `restapi` 0.8.x (65 commits: E2E encryption, search overhaul, compliance roadmap); added Mailbox-store Search
+
+JP asked for a full review of `restapi`'s activity since this repo's `0.3.1` pin, including its new
+`specs/end-to-end_encryption.md`/`specs/search.md` design docs, and to implement whatever ActiveSync-protocol-
+relevant surface it now supports. Bumped `@rapidmx/restapi` to `0.8.x` and `@rapidrest/service-core` to `2.x`
+(restapi's own peer range moved to `service-core` 2.x's query-DSL overhaul).
+
+**Scoping pass**: the overwhelming majority of the 65 commits (S/MIME digital signatures, end-to-end encryption
+key vault/escrow/discovery, GDPR export/erasure, Legal Hold/Matter/eDiscovery, mailbox import, data retention,
+Label entity + mail filter action, `FolderType.ARCHIVE` + archive REST action, SES transport, S3 blob store) are
+either pure server/admin/compliance features with no EAS wire mechanism at all, or - for E2E specifically -
+fundamentally client-side crypto (key generation/wrapping/S-MIME construction happens on the device; this
+library's `SendMail`/`SmartForward`/`SmartReply` already relay a client-supplied raw MIME blob unmodified, so a
+client that builds its own S/MIME structure already round-trips through this library with no changes needed).
+Two genuinely new things landed:
+
+- **Fixed real breakage from the version bump** (not new features, but required for the bump to be usable at
+  all):
+  - `FolderType.ARCHIVE` (new restapi enum member) broke `FolderSyncCommand`'s exhaustive `Record<FolderType,
+    string>` map - `tsc` catches this (confirmed via `npx tsc --noEmit`, which `yarn lint`/`yarn test` do NOT
+    run - worth remembering: neither of this repo's two actual gates type-checks `Record<Enum,X>`
+    exhaustiveness, only a real `tsc` invocation does). Mapped to the same Type `12` (generic user folder)
+    fallback as `USER`/`JUNK` - MS-ASCMD's `FolderHierarchy` `Type` enumeration has no dedicated Archive code.
+  - **`@rapidrest/service-core` 2.x's `like()` operator now compiles glob syntax (`*`/`?`) instead of the old
+    per-backend split this file's own doc comments described (Mongo: raw unanchored regex; SQL: exact-unless-
+    `%`-wrapped)** - confirmed by reading `ModelUtils.ts`'s `globToLike()`/`globToRegExpSource()` directly, not
+    assumed from the changelog. This was a real, silent functional regression risk: `SearchCommand`/
+    `ResolveRecipientsCommand`'s existing `escapeForLikeQuery()` backslash-escaped regex metacharacters
+    (`. ( ) + ? ^ $ { } | [ ]`) on the assumption Mongo's `like()` compiled to raw regex - but neither
+    `globToLike` nor `globToRegExpSource` recognize a backslash as an escape at all, so a query containing any
+    of those characters (e.g. searching "jane.doe" or "a+b") would have started matching a literal backslash
+    that was never in the stored data, breaking the match entirely. Fixed by replacing the escape function with
+    a plain `*query*` glob-wrap (`globPattern()`) - the framework's own doc comment for `globToLike` explicitly
+    says a literal `*`/`%`/`_`/`?` can't be fully escaped either way ("a narrow, documented limitation"), so
+    over-matching on those four characters is accepted, not worked around. Also deleted the now-provably-false
+    per-backend `likePattern()` abstract hook and all four Mongo/SQL overrides, since both backends behave
+    identically under the new glob translation - a real simplification, not just a bug fix.
+  - `restapi`'s `BaseMessageRoute`/`ScanQueueJob` now unconditionally `@Inject("DnsResolver")` (federated-peer
+    detection for the new receipt/encryption-key scoping) - `Server.start()`'s eager route instantiation failed
+    outright in every integration test with "No class found with name: DnsResolver" until a `StaticDnsResolver`
+    test double (always throws NXDOMAIN-shaped errors, matching "no `_rapidmx` record") was registered in
+    `testDoubles.ts` alongside the existing `BlobStore`/`SearchProvider`/etc. doubles.
+  - `SearchProvider` interface gained `candidates()` (Tier 3 candidate-set query) - added a trivial
+    implementation to `NoopSearchProvider` so it still satisfies the interface.
+  - `Message` gained a new required `encrypted: boolean` field - added to `EmailSyncAdapter.test.ts`'s
+    `baseMessage` fixture (along with four already-required receipt fields the fixture had apparently never
+    actually carried - `tsc -p tsconfig.test.json` was never run as a gate here either, so this had been
+    latently wrong since the receipt feature landed and nothing caught it).
+- **Added EAS `Search` for the `Mailbox` store** (previously `GAL`-only) - real mailbox full-text search,
+  backed by `restapi`'s now much richer `SearchProvider` (the search overhaul in `specs/search.md`: operator
+  grammar, `folderUid`/`flags`/`hasAttachments` schema, Tier 3 candidates). **Pragmatic subset**: only `Class`
+  `Email` (matches the `GAL`-only precedent this file already set for search generally - Contacts/Calendar/
+  Tasks search via `Mailbox` store is a documented gap); only the common real-world `Query` shape -
+  `Class`/`CollectionId`/`FreeText`, optionally grouped under one `And` (both forms accepted, since the schema
+  permits omitting the wrapper) - not the full recursive `And`/`Or`/`GreaterThan`/`LessThan` boolean-tree
+  grammar. Each hit is re-verified for `READ` on its own current `folderUid` before being included -
+  `SearchProvider`'s index is scoped by `mailboxUid` alone, not per-folder ACL, so (unlike `GAL`, whose
+  `Contact.find()` query is already mailbox-scoped end to end) this is the one place in this command that still
+  needs a per-result ACL check, the same "orphaned folderUid" pattern already established for `ItemOperations`
+  Move. A stale index entry whose `Message` has since been hard/soft-deleted is silently skipped, not treated
+  as an error. `SearchResultPage` carries no total count (full-text relevance search doesn't compute one
+  cheaply), so `Total` here honestly means "how many matches this request's own capped fetch actually
+  returned," not an exact server-side count - documented as an approximation, same spirit as `GAL`'s own
+  already-approximate status-code enumeration. Result properties reuse `EmailSyncAdapter.toApplicationData()`'s
+  own field mapping directly (its `.children`) rather than a second parallel mapping, so `Search` and `Sync`
+  can never render the same message differently.
+- **Considered and deliberately deferred**: `Message.labelUids` (new restapi `Label` entity) → MS-ASEMAIL
+  `Categories`/`Category` (the same tag this repo already wired up for `Contact.categories` last session). The
+  mapping is directionally right, but a real bidirectional implementation needs label name↔uid resolution
+  against a `Label` repo from inside `EmailSyncAdapter`, which today has no repo dependency at all (only
+  `BlobStore`) and whose `toApplicationData()` is called synchronously from multiple call sites (`SyncCommand`,
+  now also `SearchCommand`) - making it async to add a repo lookup would ripple outward for a feature real
+  clients exercise far less often than Contact categories. Left as a documented gap rather than forcing an
+  awkward architecture change for a lower-value feature.
+- **Considered and rejected**: wiring the new `EncryptionPolicy` singleton (tri-state
+  `automatic`/`optional`/`prohibited`, independently per same-org/federated/external recipient tier) into
+  `ProvisionCommand`'s existing `RequireSignedSMIMEMessages`/`RequireEncryptedSMIMEMessages` policy booleans.
+  The semantics don't actually line up: MS-ASPROV's fields mean "the device MUST sign/encrypt every outgoing
+  message," a blanket per-device mandate, while `EncryptionPolicy` is a nuanced per-recipient-tier default that
+  can legitimately be `automatic` for one tier and `prohibited` for another - collapsing that into one boolean
+  would misrepresent server policy to the device rather than honestly reflect it. No corresponding change made.
+
 ### 2026-09-08 (2) — Adversarial two-agent review #2, 6 confirmed findings fixed
 
 JP asked for another full adversarial two-agent review (correctness/bugs-lens + security/performance-lens, same

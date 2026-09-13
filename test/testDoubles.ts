@@ -17,11 +17,21 @@ import {
     type BlobPutOptions,
     type BlobRange,
     type BlobStore,
+    type DnsMxRecord,
+    type DnsResolver,
     type MailTransport,
     type OutboundMessage,
     type TransportResult,
 } from "@rapidmx/restapi";
-import type { SearchDocument, SearchEntityType, SearchProvider, SearchQuery, SearchResultPage } from "@rapidmx/restapi/search";
+import type {
+    CandidateQuery,
+    CandidateResultPage,
+    SearchDocument,
+    SearchEntityType,
+    SearchProvider,
+    SearchQuery,
+    SearchResultPage,
+} from "@rapidmx/restapi/search";
 import type { AvScanProvider, AvScanResult, ScanEnvelope, SpamScanProvider, SpamScanResult } from "@rapidmx/restapi/scan";
 import type { ObjectFactory } from "@rapidrest/service-core";
 
@@ -100,6 +110,17 @@ export class NoopSearchProvider implements SearchProvider {
             .map((doc) => ({ entityType: doc.entityType, entityUid: doc.entityUid, score: 1 }));
         return { results };
     }
+
+    /** Never exercised by this library's own `SearchCommand` (GAL/Contact-only, doesn't use `SearchProvider`
+     * at all) - implemented only so this test double satisfies the interface for whatever else in the DI graph
+     * requests a `SearchProvider`. */
+    public async candidates(query: CandidateQuery): Promise<CandidateResultPage> {
+        const candidates = Array.from(this.indexed.values())
+            .filter((doc) => doc.mailboxUid === query.mailboxUid)
+            .filter((doc) => !query.entityTypes || query.entityTypes.includes(doc.entityType))
+            .map((doc) => ({ entityType: doc.entityType, entityUid: doc.entityUid }));
+        return { candidates };
+    }
 }
 
 /**
@@ -161,6 +182,23 @@ export class RecordingMailTransport implements MailTransport {
 }
 
 /**
+ * A `DnsResolver` that finds nothing for every lookup. This library's EAS surface never itself exercises
+ * federation/domain-verification behavior, but `@rapidmx/restapi`'s `BaseMessageRoute`/`ScanQueueJob` now
+ * unconditionally `@Inject("DnsResolver")` (federated-peer detection for receipt/encryption-key scoping), and
+ * `Server.start()` eagerly instantiates every route it discovers - so this needs to be registered for the
+ * shared test fixture apps to boot at all, even though no EAS test ever triggers a real lookup through it.
+ */
+export class StaticDnsResolver implements DnsResolver {
+    public async resolveTxt(hostname: string): Promise<string[][]> {
+        throw new Error(`StaticDnsResolver: no TXT records for ${hostname}`);
+    }
+
+    public async resolveMx(hostname: string): Promise<DnsMxRecord[]> {
+        throw new Error(`StaticDnsResolver: no MX records for ${hostname}`);
+    }
+}
+
+/**
  * Registers a full set of test-double implementations for this library's pluggable interfaces against
  * `objectFactory`. Call this before `server.start()` in any integration test that boots the shared server
  * fixture apps.
@@ -171,4 +209,5 @@ export function registerTestDoubles(objectFactory: ObjectFactory): void {
     objectFactory.register(AlwaysCleanSpamScanProvider, "SpamScanProvider");
     objectFactory.register(AlwaysCleanAvScanProvider, "AvScanProvider");
     objectFactory.register(RecordingMailTransport, "MailTransport");
+    objectFactory.register(StaticDnsResolver, "DnsResolver");
 }

@@ -27,6 +27,11 @@ const FOLDER_TYPE_CODES: Record<FolderType, string> = {
     [FolderType.CONTACTS]: "9",
     [FolderType.NOTES]: "10",
     [FolderType.JUNK]: "12",
+    // MS-ASCMD's FolderHierarchy Type enumeration has no dedicated "Archive" code - real Exchange either treats
+    // Archive as a wholly separate mailbox (Online Archive, out of scope here) or, for an ordinary in-mailbox
+    // Archive folder as this library models it, a Type 12 user-created folder is the closest fit. Same fallback
+    // as USER/JUNK above, not a distinct case.
+    [FolderType.ARCHIVE]: "12",
     [FolderType.USER]: "12",
 };
 
