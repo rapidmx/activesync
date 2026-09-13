@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.1] - 2026-09-13
+
+### Added
+- Added a StaticDnsResolver test double, required for Server.start() to boot now that restapi's BaseMessageRoute/ScanQueueJob unconditionally inject DnsResolver
+- Added SearchProvider.candidates() to NoopSearchProvider and the new required Message.encrypted field to the EmailSyncAdapter test fixture
+- Added EAS Search support for the Mailbox store (previously GAL-only), backed by restapi's SearchProvider full-text index, with per-result folder ACL verification and results rendered via EmailSyncAdapter's existing field mapping
+- Added Message.labelUids support to EmailSyncAdapter, rendering resolved Label names as MS-ASEMAIL Categories, closing the gap deferred from the prior restapi 0.8.x upgrade
+- Added Label to the SQL/Mongo test harnesses' model registration, missing entirely until the first createLabel() call surfaced it
+- Added a regression test per command per backend proving a literal regex metacharacter in the query matches only the literal value, not a broader pattern
+
+### Changed
+- Bump @rapidmx/restapi to 0.8.x and @rapidrest/service-core to 2.x, catching up to restapi's E2E encryption/search overhaul/compliance roadmap since the prior 0.3.1 pin
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Widen EasCollectionSyncAdapter.toApplicationData to allow an async return, the same optional-async shape fromApplicationData already had, needed for EmailSyncAdapter's new Label repo lookup
+- Split EmailSyncAdapter into an abstract base plus EmailSyncAdapterMongo/SQL concrete subclasses supplying the backend-specific Label model, mirroring every command's own Mongo/SQL split
+- Update SyncCommand and SearchCommand to await the now-async toApplicationData at both call sites
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Switch SearchCommand/ResolveRecipientsCommand's GAL search from like() glob-wrapping to the regex() operator, matching the same fix already applied in the sibling mapi plugin for the identical service-core 2.0 like()-glob regression
+- Replace globPattern()/its ResolveRecipientsCommand duplicate with a direct StringUtils.escapeRegExp() call at each call site, since regex() needs no *...* wrapping and has a real escape mechanism like() glob syntax lacks for a literal */? in the query
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- update release notes
+
+### Fixed
+- Fixed FolderSyncCommand's folder-type map missing the new FolderType.ARCHIVE member, mapping it to the same generic Type 12 fallback as USER/JUNK
+- Fixed SearchCommand/ResolveRecipientsCommand's like() escaping, which assumed service-core 1.x's raw-regex semantics and silently broke substring matches containing regex metacharacters under 2.x's new glob-based like(); replaced with a plain wildcard wrap and removed the now-identical per-backend likePattern() split
+
+### Removed
+- Removed @rapidrest/cli as a dep
+
 ## [1.0.0-beta.0] - 2026-09-09
 
 ### Added
@@ -127,5 +156,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Removed unused files
 
-[Unreleased]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.0...HEAD
+[Unreleased]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.1...HEAD
+[1.0.0-beta.1]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.0...v1.0.0-beta.1
 [1.0.0-beta.0]: https://github.com/RapidMX/activesync/releases/tag/v1.0.0-beta.0
