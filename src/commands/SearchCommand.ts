@@ -7,7 +7,7 @@ import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory, RepoUt
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
-import { EmailSyncAdapter } from "../adapters/EmailSyncAdapter.js";
+import type { EmailSyncAdapter } from "../adapters/EmailSyncAdapter.js";
 import type { Contact, Message } from "@rapidmx/restapi";
 import type { SearchProvider } from "@rapidmx/restapi/search";
 const { Config, Init, Inject } = ObjectDecorators;
@@ -80,7 +80,7 @@ function paginate<T>(matches: T[], start: number, end: number): { page: T[]; ran
  * request's own capped fetch actually returned" - a client requesting a `Range` past that cap sees fewer
  * results than may really exist, a documented approximation rather than exact server-side paging.
  *
- * `contactClass`/`messageClass` are supplied by the Mongo/SQL concrete subclasses.
+ * `contactClass`/`messageClass`/`emailAdapterClass` are supplied by the Mongo/SQL concrete subclasses.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -89,13 +89,14 @@ export abstract class SearchCommand implements EasCommandHandler {
 
     protected abstract contactClass: any;
     protected abstract messageClass: any;
+    protected abstract emailAdapterClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
     private contactRepo?: RepoUtils<any>;
     private messageRepo?: RepoUtils<any>;
-    private readonly emailAdapter = new EmailSyncAdapter();
+    private emailAdapter?: EmailSyncAdapter;
 
     @Inject("SearchProvider")
     private searchProvider?: SearchProvider;
@@ -119,10 +120,11 @@ export abstract class SearchCommand implements EasCommandHandler {
             name: this.messageClass.name,
             args: [this.messageClass],
         });
+        this.emailAdapter = await this._objectFactory!.newInstance(this.emailAdapterClass);
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
-        if (!this.contactRepo || !this.messageRepo || !this.searchProvider) {
+        if (!this.contactRepo || !this.messageRepo || !this.searchProvider || !this.emailAdapter) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         const storeEl = ctx.request ? findChild(ctx.request, "Store") : undefined;
@@ -219,10 +221,11 @@ export abstract class SearchCommand implements EasCommandHandler {
             matches.push(message);
         }
         const { page, rangeStart, rangeEnd } = paginate(matches, start, end);
+        const results = await Promise.all(page.map((message) => this.messageToResult(message)));
 
         return element(WbxmlCodePage.Search, "Store", [
             textElement(WbxmlCodePage.Search, "Status", "1"),
-            ...page.map((message) => this.messageToResult(message)),
+            ...results,
             textElement(WbxmlCodePage.Search, "Range", `${rangeStart}-${rangeEnd}`),
             textElement(WbxmlCodePage.Search, "Total", String(matches.length)),
         ]);
@@ -245,12 +248,13 @@ export abstract class SearchCommand implements EasCommandHandler {
      * Importance/Read/Flag/Body/ConversationId) for a Mailbox-store search hit's `Properties` - the same
      * per-field shape `Sync` already renders for this message, rather than a second, parallel mapping that
      * could drift out of sync with it. */
-    private messageToResult(message: Message): WbxmlElement {
+    private async messageToResult(message: Message): Promise<WbxmlElement> {
+        const applicationData = await this.emailAdapter!.toApplicationData(message);
         return element(WbxmlCodePage.Search, "Result", [
             textElement(WbxmlCodePage.AirSync, "Class", "Email"),
             textElement(WbxmlCodePage.AirSync, "CollectionId", message.folderUid),
             textElement(WbxmlCodePage.AirSync, "ServerId", (message as any).uid),
-            element(WbxmlCodePage.Search, "Properties", this.emailAdapter.toApplicationData(message).children),
+            element(WbxmlCodePage.Search, "Properties", applicationData.children),
         ]);
     }
 }

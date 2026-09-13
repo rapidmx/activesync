@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { ContactMongo, MessageMongo } from "@rapidmx/restapi/mongo";
+import { EmailSyncAdapterMongo } from "../../adapters/mongo/EmailSyncAdapterMongo.js";
 import { SearchCommand } from "../SearchCommand.js";
 
 /**
@@ -11,4 +12,5 @@ import { SearchCommand } from "../SearchCommand.js";
 export class SearchCommandMongo extends SearchCommand {
     protected contactClass: any = ContactMongo;
     protected messageClass: any = MessageMongo;
+    protected emailAdapterClass: any = EmailSyncAdapterMongo;
 }

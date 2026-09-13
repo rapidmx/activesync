@@ -5,3 +5,4 @@
 export * from "./EasRouteSQL.js";
 export * from "./DeviceSyncStateRouteSQL.js";
 export * from "../commands/sql/index.js";
+export * from "../adapters/sql/index.js";

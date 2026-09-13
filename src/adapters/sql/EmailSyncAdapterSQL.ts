@@ -2,7 +2,12 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-export * from "./EasRouteMongo.js";
-export * from "./DeviceSyncStateRouteMongo.js";
-export * from "../commands/mongo/index.js";
-export * from "../adapters/mongo/index.js";
+import { LabelSQL } from "@rapidmx/restapi/sql";
+import { EmailSyncAdapter } from "../EmailSyncAdapter.js";
+
+/**
+ * @author Jean-Philippe Steinmetz
+ */
+export class EmailSyncAdapterSQL extends EmailSyncAdapter {
+    protected labelClass: any = LabelSQL;
+}

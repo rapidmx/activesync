@@ -4,11 +4,12 @@
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
 import { ObjectDecorators } from "@rapidrest/core";
+import { ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, opaqueElement, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCollectionSyncAdapter } from "./EasCollectionSyncAdapter.js";
-import { type BlobStore, type Mailbox, type Message, type Recipient, MessageImportance, RecipientType } from "@rapidmx/restapi";
-const { Inject } = ObjectDecorators;
+import { type BlobStore, type Label, type Mailbox, type Message, type Recipient, MessageImportance, RecipientType } from "@rapidmx/restapi";
+const { Init, Inject } = ObjectDecorators;
 
 /** MS-ASEMAIL `Importance`: 0=Low, 1=Normal, 2=High. */
 const IMPORTANCE_CODES: Record<MessageImportance, string> = {
@@ -46,18 +47,47 @@ const BODY_TYPE_PLAIN_TEXT = "1";
  * own doc comment for the wire encoding, and `ItemOperationsCommand`'s `Move` handling for the one place this
  * gets decoded back.
  *
+ * Emits MS-ASEMAIL's `Categories`/`Category` (also read-only) from `Message.labelUids`, resolved against the
+ * `Label` repo to real display names - a stale `labelUids` entry (the label was since deleted) is silently
+ * dropped rather than surfacing as an error, the same "tolerate a dangling reference" stance `SearchCommand`
+ * already takes for a stale search-index entry. Deliberately not writable: unlike `Contact.categories` (a
+ * plain free-form string array with no separate entity behind it), a `Label` is a real mailbox-scoped entity
+ * referenced by uid - a write path would need to resolve category name strings back to `Label`s and create new
+ * ones on the fly for names that don't exist yet, real added scope this pragmatic subset defers. One `find()`
+ * per message that actually has labels (most won't, since labels are opt-in) - not batched across a whole Sync
+ * page/search result set, a documented, modest N+1 tradeoff rather than widening this adapter's own interface
+ * further to let a caller pre-resolve names for a whole batch.
+ *
+ * `labelClass` is supplied by the Mongo/SQL concrete subclasses.
+ *
  * @author Jean-Philippe Steinmetz
  */
-export class EmailSyncAdapter implements EasCollectionSyncAdapter<Message> {
+export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Message> {
     public readonly collectionClass = "Email";
+
+    protected abstract labelClass: any;
+
+    // Automatically injected by ObjectFactory on instantiation
+    private _objectFactory?: ObjectFactory;
+
+    private labelRepo?: RepoUtils<any>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
 
-    public toApplicationData(message: Message): WbxmlElement {
+    @Init
+    public async init(): Promise<void> {
+        this.labelRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.labelClass.name,
+            args: [this.labelClass],
+        });
+    }
+
+    public async toApplicationData(message: Message): Promise<WbxmlElement> {
         const to = message.recipients.filter((r) => r.type === RecipientType.TO).map((r) => r.address);
         const cc = message.recipients.filter((r) => r.type === RecipientType.CC).map((r) => r.address);
         const bcc = message.recipients.filter((r) => r.type === RecipientType.BCC).map((r) => r.address);
+        const categories = await this.resolveLabelNames(message);
 
         return element(WbxmlCodePage.AirSync, "ApplicationData", [
             textElement(WbxmlCodePage.Email, "Subject", message.subject),
@@ -76,7 +106,27 @@ export class EmailSyncAdapter implements EasCollectionSyncAdapter<Message> {
                 textElement(WbxmlCodePage.AirSyncBase, "Data", message.bodyPreview),
             ]),
             ...(message.conversationId ? [opaqueElement(WbxmlCodePage.Email2, "ConversationId", encodeConversationId(message.conversationId))] : []),
+            ...(categories.length > 0
+                ? [
+                      element(
+                          WbxmlCodePage.Email,
+                          "Categories",
+                          categories.map((name) => textElement(WbxmlCodePage.Email, "Category", name)),
+                      ),
+                  ]
+                : []),
         ]);
+    }
+
+    private async resolveLabelNames(message: Message): Promise<string[]> {
+        if (!message.labelUids || message.labelUids.length === 0) {
+            return [];
+        }
+        const labels: Label[] = await this.labelRepo!.find(
+            { mailboxUid: message.mailboxUid, uid: `in(${message.labelUids.join(",")})` } as any,
+            { ignoreACL: true },
+        );
+        return labels.map((label) => label.name);
     }
 
     /**

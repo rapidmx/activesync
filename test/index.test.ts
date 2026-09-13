@@ -39,10 +39,14 @@ describe("eas/index Tests", () => {
     });
 
     it("Re-exports every Sync collection adapter.", () => {
+        // EmailSyncAdapter is abstract (it needs a backend-specific labelClass, supplied by
+        // EmailSyncAdapterMongo/SQL - see src/mongo.js/src/sql.js) - a `typeof` check is all a
+        // backend-agnostic instantiation can do; test/adapters/EmailSyncAdapter.test.ts exercises a real
+        // instance via its own minimal concrete test subclass.
         expect(typeof Eas.EmailSyncAdapter).toBe("function");
         expect(typeof Eas.ContactsSyncAdapter).toBe("function");
         expect(typeof Eas.CalendarSyncAdapter).toBe("function");
         expect(typeof Eas.TasksSyncAdapter).toBe("function");
-        expect(new Eas.EmailSyncAdapter().collectionClass).toBe("Email");
+        expect(new Eas.ContactsSyncAdapter().collectionClass).toBe("Contacts");
     });
 });

@@ -12,15 +12,25 @@ import { element, textElement, type WbxmlElement } from "../../src/codec/WbxmlEl
 import { EmailSyncAdapter } from "../../src/adapters/EmailSyncAdapter.js";
 import { MessageImportance, RecipientType, type Mailbox, type Message } from "@rapidmx/restapi";
 
+/** `EmailSyncAdapter` is abstract (it needs a backend-specific `labelClass`, supplied by
+ * `EmailSyncAdapterMongo`/`SQL` in real use) - this minimal concrete subclass is all a backend-agnostic unit
+ * test needs, since `labelClass` is only ever read by `@Init` (never invoked here; `labelRepo` is stubbed
+ * directly instead, the same bypass-DI convention `blobStore` below already uses). */
+class TestEmailSyncAdapter extends EmailSyncAdapter {
+    protected labelClass: any = {};
+}
+
 function appData(children: WbxmlElement[]): WbxmlElement {
     return element(WbxmlCodePage.AirSync, "ApplicationData", children);
 }
 
-function buildAdapter(): { adapter: EmailSyncAdapter; put: ReturnType<typeof vi.fn> } {
-    const adapter = new EmailSyncAdapter();
+function buildAdapter(): { adapter: EmailSyncAdapter; put: ReturnType<typeof vi.fn>; labelFind: ReturnType<typeof vi.fn> } {
+    const adapter = new TestEmailSyncAdapter();
     const put = vi.fn().mockResolvedValue(undefined);
     (adapter as any).blobStore = { put, get: vi.fn(), getStream: vi.fn(), delete: vi.fn(), exists: vi.fn(), size: vi.fn() };
-    return { adapter, put };
+    const labelFind = vi.fn().mockResolvedValue([]);
+    (adapter as any).labelRepo = { find: labelFind };
+    return { adapter, put, labelFind };
 }
 
 const baseMessage: Message = {
@@ -52,7 +62,7 @@ const baseMessage: Message = {
 
 describe("EmailSyncAdapter Tests", () => {
     it("Reports the Email collection class.", () => {
-        expect(new EmailSyncAdapter().collectionClass).toBe("Email");
+        expect(new TestEmailSyncAdapter().collectionClass).toBe("Email");
     });
 
     describe("fromApplicationData", () => {
@@ -324,7 +334,7 @@ describe("EmailSyncAdapter Tests", () => {
 
     describe("newEntityDefaults", () => {
         it("Populates from the caller's own mailbox and sensible blank-draft defaults.", () => {
-            const adapter = new EmailSyncAdapter();
+            const adapter = new TestEmailSyncAdapter();
             const mailbox: Mailbox = {
                 uid: "mbx-1",
                 primarySmtpAddress: "owner@example.com",

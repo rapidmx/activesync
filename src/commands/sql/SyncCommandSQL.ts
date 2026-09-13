@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { MessageSQL, ContactSQL, CalendarEventSQL, TaskSQL, MailboxSQL } from "@rapidmx/restapi/sql";
-import { EmailSyncAdapter } from "../../adapters/EmailSyncAdapter.js";
+import { EmailSyncAdapterSQL } from "../../adapters/sql/EmailSyncAdapterSQL.js";
 import { ContactsSyncAdapter } from "../../adapters/ContactsSyncAdapter.js";
 import { CalendarSyncAdapter } from "../../adapters/CalendarSyncAdapter.js";
 import { TasksSyncAdapter } from "../../adapters/TasksSyncAdapter.js";
@@ -15,7 +15,7 @@ import { SyncCommand, type SyncCollectionBinding } from "../SyncCommand.js";
 export class SyncCommandSQL extends SyncCommand {
     protected mailboxClass: any = MailboxSQL;
     protected collectionBindings: Record<string, SyncCollectionBinding<any>> = {
-        Email: { entityClass: MessageSQL, adapterClass: EmailSyncAdapter },
+        Email: { entityClass: MessageSQL, adapterClass: EmailSyncAdapterSQL },
         Contacts: { entityClass: ContactSQL, adapterClass: ContactsSyncAdapter },
         Calendar: { entityClass: CalendarEventSQL, adapterClass: CalendarSyncAdapter },
         Tasks: { entityClass: TaskSQL, adapterClass: TasksSyncAdapter },

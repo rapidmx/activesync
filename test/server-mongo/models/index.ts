@@ -10,6 +10,7 @@ export {
     ContactMongo,
     DeviceSyncStateMongo,
     FolderMongo,
+    LabelMongo,
     MailboxMongo,
     MessageMongo,
     TaskMongo,

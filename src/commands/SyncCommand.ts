@@ -298,8 +298,8 @@ export abstract class SyncCommand implements EasCommandHandler {
         }
 
         const commandElements: WbxmlElement[] = [
-            ...changes.adds.map((item) => this.itemToCommandElement("Add", adapter, item)),
-            ...changes.changes.map((item) => this.itemToCommandElement("Change", adapter, item)),
+            ...(await Promise.all(changes.adds.map((item) => this.itemToCommandElement("Add", adapter, item)))),
+            ...(await Promise.all(changes.changes.map((item) => this.itemToCommandElement("Change", adapter, item)))),
             ...changes.deletes.map((item) =>
                 element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", item.uid)]),
             ),
@@ -317,10 +317,10 @@ export abstract class SyncCommand implements EasCommandHandler {
         };
     }
 
-    private itemToCommandElement(kind: "Add" | "Change", adapter: EasCollectionSyncAdapter<any>, item: RecoverableBaseEntity): WbxmlElement {
+    private async itemToCommandElement(kind: "Add" | "Change", adapter: EasCollectionSyncAdapter<any>, item: RecoverableBaseEntity): Promise<WbxmlElement> {
         return element(WbxmlCodePage.AirSync, kind, [
             textElement(WbxmlCodePage.AirSync, "ServerId", item.uid),
-            adapter.toApplicationData(item),
+            await adapter.toApplicationData(item),
         ]);
     }
 

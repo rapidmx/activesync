@@ -49,6 +49,38 @@ Keep entries terse — this is a reference, not a transcript.
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
 
+### 2026-09-13 (2) — Closed the deferred `Message.labelUids` → Categories gap
+
+JP asked to address the remaining gap the prior entry deliberately deferred. Implemented it after all, since the
+real blocker (widening `EmailSyncAdapter.toApplicationData()` to async) turned out cheaper than first estimated:
+
+- **Widened `EasCollectionSyncAdapter.toApplicationData()` to `WbxmlElement | Promise<WbxmlElement>`** - the
+  exact same optional-async shape `fromApplicationData()` already had (for `EmailSyncAdapter`'s own `BlobStore`
+  write), just applied to the other direction. `SyncCommand.itemToCommandElement()` and
+  `SearchCommand.messageToResult()` (both call sites) now `await` it; the three adapters that stay synchronous
+  (`Contacts`/`Calendar`/`Tasks`) are unaffected - `await` on a non-`Promise` value resolves immediately.
+- **`EmailSyncAdapter` is now `abstract`** with a `protected abstract labelClass: any`, resolved via its own
+  `@Init` into a `Label` repo (mirroring every command's own `RepoUtils` construction pattern - adapters go
+  through the identical `ObjectFactory.newInstance()` DI lifecycle as commands, confirmed by reading how
+  `SyncCommand.init()` already constructs each adapter this way). Added `EmailSyncAdapterMongo`/`SQL` concrete
+  subclasses (`src/adapters/{mongo,sql}/`, a first for this adapter - every other adapter stays a single
+  shared class since none of them needed a backend-specific model class before) and rewired
+  `SyncCommandMongo`/`SQL`'s `Email` binding and `SearchCommandMongo`/`SQL`'s own adapter construction to the
+  new concrete classes instead of the old bare `EmailSyncAdapter`.
+- **Read-only**, unlike `Contact.categories`: a `Label` is a real mailbox-scoped entity referenced by uid, not a
+  free-form string array, so a write path would need to resolve category name strings back to `Label`s *and*
+  create new ones on the fly for names that don't exist yet - real added scope deliberately left as a
+  documented gap, matching this adapter's own existing precedent for `Email2:ConversationId`.
+- **One `find()` per message that actually has labels** (`labelUids` empty/absent short-circuits before ever
+  touching the repo), not batched across a whole `Sync` page or search result set - a documented, modest N+1
+  tradeoff accepted rather than widening the adapter interface further to let a caller pre-resolve names for an
+  entire batch. A stale `labelUids` entry (the `Label` was since deleted) is silently dropped via the same
+  `in(...)` query-DSL operator confirmed working in the `SyncCommand`/`ResolveRecipientsCommand` fixes above.
+- **Test harness gap found while writing the first integration test**: `test/server-{mongo,sql}/models/index.ts`
+  (the named re-export list gating which `@DataStore` classes the test `ClassLoader` actually discovers) didn't
+  include `Label{Mongo,SQL}` at all - `EntityMetadataNotFoundError` on the very first `createLabel()` call.
+  Added it alongside the other eight model classes already listed in both files.
+
 ### 2026-09-13 — Caught up to `restapi` 0.8.x (65 commits: E2E encryption, search overhaul, compliance roadmap); added Mailbox-store Search
 
 JP asked for a full review of `restapi`'s activity since this repo's `0.3.1` pin, including its new
@@ -115,14 +147,6 @@ Two genuinely new things landed:
   already-approximate status-code enumeration. Result properties reuse `EmailSyncAdapter.toApplicationData()`'s
   own field mapping directly (its `.children`) rather than a second parallel mapping, so `Search` and `Sync`
   can never render the same message differently.
-- **Considered and deliberately deferred**: `Message.labelUids` (new restapi `Label` entity) → MS-ASEMAIL
-  `Categories`/`Category` (the same tag this repo already wired up for `Contact.categories` last session). The
-  mapping is directionally right, but a real bidirectional implementation needs label name↔uid resolution
-  against a `Label` repo from inside `EmailSyncAdapter`, which today has no repo dependency at all (only
-  `BlobStore`) and whose `toApplicationData()` is called synchronously from multiple call sites (`SyncCommand`,
-  now also `SearchCommand`) - making it async to add a repo lookup would ripple outward for a feature real
-  clients exercise far less often than Contact categories. Left as a documented gap rather than forcing an
-  awkward architecture change for a lower-value feature.
 - **Considered and rejected**: wiring the new `EncryptionPolicy` singleton (tri-state
   `automatic`/`optional`/`prohibited`, independently per same-org/federated/external recipient tier) into
   `ProvisionCommand`'s existing `RequireSignedSMIMEMessages`/`RequireEncryptedSMIMEMessages` policy booleans.

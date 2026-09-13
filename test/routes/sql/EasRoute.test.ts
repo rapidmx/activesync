@@ -25,6 +25,7 @@ import {
     ContactSQL,
     DeviceSyncStateSQL,
     FolderSQL,
+    LabelSQL,
     MailboxSQL,
     MessageSQL,
     TaskSQL,
@@ -59,6 +60,7 @@ describe("Route:EasRouteSQL Tests", () => {
     let taskRepo: Repository<TaskSQL>;
     let attachmentRepo: Repository<AttachmentSQL>;
     let deviceSyncStateRepo: Repository<DeviceSyncStateSQL>;
+    let labelRepo: Repository<LabelSQL>;
     let aclRepo: Repository<AccessControlListSQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
@@ -126,6 +128,11 @@ describe("Route:EasRouteSQL Tests", () => {
                 ...data,
             } as any),
         );
+    };
+
+    /** See the identical helper in test/routes/mongo/EasRoute.test.ts. */
+    const createLabel = async function (mailboxUid: string, name: string): Promise<LabelSQL> {
+        return await labelRepo.save(new LabelSQL({ mailboxUid, name } as any));
     };
 
     /** See the identical helper in test/routes/mongo/EasRoute.test.ts. */
@@ -309,6 +316,7 @@ describe("Route:EasRouteSQL Tests", () => {
             taskRepo = conn.getRepository(TaskSQL);
             attachmentRepo = conn.getRepository(AttachmentSQL);
             deviceSyncStateRepo = conn.getRepository(DeviceSyncStateSQL);
+            labelRepo = conn.getRepository(LabelSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -910,6 +918,31 @@ describe("Route:EasRouteSQL Tests", () => {
             const conversationIdEl = findChild(findChild(withConvAdd, "ApplicationData")!, "ConversationId");
             expect(conversationIdEl?.opaque?.toString("utf8")).toBe(conversationId);
             expect(findChild(findChild(withoutConvAdd, "ApplicationData")!, "ConversationId")).toBeUndefined();
+        });
+
+        it("Resolves Message.labelUids against the Label repo, rendering Categories; a stale uid is silently dropped.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const important = await createLabel(mailbox.uid, "Important");
+            const followUp = await createLabel(mailbox.uid, "Follow Up");
+            const withLabels = await createMessage(mailbox.uid, folder.uid, {
+                labelUids: [important.uid, followUp.uid, uuid.v4()],
+            });
+            const withoutLabels = await createMessage(mailbox.uid, folder.uid);
+
+            const initial = await postWbxml("Sync", "dev1", syncRequest("0", "Email", folder.uid));
+            const initialKey = childText(findChild(findChild(initial, "Collections")!, "Collection")!, "SyncKey")!;
+            const response = await postWbxml("Sync", "dev1", syncRequest(initialKey, "Email", folder.uid));
+
+            const collection = findChild(findChild(response, "Collections")!, "Collection")!;
+            const adds = findChildren(findChild(collection, "Commands")!, "Add");
+            const withLabelsAdd = adds.find((add) => childText(add, "ServerId") === withLabels.uid)!;
+            const withoutLabelsAdd = adds.find((add) => childText(add, "ServerId") === withoutLabels.uid)!;
+
+            const categories = findChild(findChild(withLabelsAdd, "ApplicationData")!, "Categories")!;
+            expect(findChildren(categories, "Category").map((c) => c.text).sort()).toEqual(["Follow Up", "Important"]);
+            expect(findChild(findChild(withoutLabelsAdd, "ApplicationData")!, "Categories")).toBeUndefined();
         });
 
         it("Reports a message deleted via the REST API as a Delete on the next sync round.", async () => {

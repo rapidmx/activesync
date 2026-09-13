@@ -8,6 +8,7 @@ export {
     ContactSQL,
     DeviceSyncStateSQL,
     FolderSQL,
+    LabelSQL,
     MailboxSQL,
     MessageSQL,
     TaskSQL,

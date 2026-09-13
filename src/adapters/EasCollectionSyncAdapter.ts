@@ -24,8 +24,11 @@ export interface EasCollectionSyncAdapter<T extends RecoverableBaseEntity> {
     /** The MS-ASCMD `Class` value this adapter handles, e.g. `"Email"`. */
     readonly collectionClass: string;
 
-    /** Builds the `<ApplicationData>` element for one `Add`/`Change` command reporting `item`. */
-    toApplicationData(item: T): WbxmlElement;
+    /** Builds the `<ApplicationData>` element for one `Add`/`Change` command reporting `item`. May return a
+     * `Promise` - `EmailSyncAdapter` needs this to resolve `Message.labelUids` against the `Label` repo before
+     * rendering `Categories`; every other adapter today returns a plain `WbxmlElement`, which callers `await`
+     * through unchanged (the same optional-async shape `fromApplicationData` already established below). */
+    toApplicationData(item: T): WbxmlElement | Promise<WbxmlElement>;
 
     /**
      * Parses one client-originated `Add`/`Change` command's `<ApplicationData>` element (`el`) into a partial
