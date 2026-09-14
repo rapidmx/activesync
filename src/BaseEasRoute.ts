@@ -53,6 +53,11 @@ function firstQueryValue(value: string | string[] | undefined): string | undefin
     return Array.isArray(value) ? value[0] : value;
 }
 
+/** An acceptable `DeviceId`: up to 128 visible ASCII characters other than parentheses and commas. [MS-ASHTTP] only
+ * allows alphanumerics; this stays more tolerant of real clients while keeping the value out of the query parser's
+ * `op(value)` and `in(a,b)` syntax - `DeviceId` goes straight into `find()` criteria for the device's own rows. */
+const DEVICE_ID_PATTERN = /^[\x21-\x27\x2a\x2b\x2d-\x7e]{1,128}$/;
+
 /**
  * Abstract base for the single fixed EAS endpoint (`POST /Microsoft-Server-ActiveSync` by MS-ASHTTP
  * convention, though the concrete path is left to the consuming application to mount via `@Route(...)` — see
@@ -161,7 +166,7 @@ export abstract class BaseEasRoute<D extends DeviceSyncState, M extends Mailbox 
         const deviceId: string | undefined = firstQueryValue(req.query["DeviceId"]);
         const deviceType: string = firstQueryValue(req.query["DeviceType"]) ?? "Unknown";
         const policyKey: string | undefined = firstQueryValue(req.query["PolicyKey"]);
-        if (!cmd || !deviceId) {
+        if (!cmd || !deviceId || !DEVICE_ID_PATTERN.test(deviceId)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
 

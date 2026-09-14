@@ -8,6 +8,8 @@ import type { Folder, Message } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
+import { type MessageMovePlan, planMessageMove } from "../MessageMoveRules.js";
+import { asEntity } from "../RestapiCompat.js";
 const { Init, Inject } = ObjectDecorators;
 
 /** [MS-ASCMD] `MoveItems` `Status` codes (section 2.2.3.177.10): `3` is success - not `1`, which means an invalid
@@ -27,9 +29,11 @@ export const MAX_MOVES_PER_REQUEST = 500;
  * message's own mailbox) and a request may carry at most `MAX_MOVES_PER_REQUEST` moves.
  *
  * Each move gets its own [MS-ASCMD] status: `3` success; `1` an unknown/unreadable message, or a `SrcFldId` that
- * isn't where it lives (or can't be updated); `2` an unknown destination, one in another mailbox, or one the caller
- * can't create in; `4` source and destination are the same folder; `7` the update itself failed (e.g. a concurrent
- * edit's version conflict) - one failing move never aborts the others.
+ * isn't where it lives (or can't be updated); `2` an unknown destination, one in another mailbox, one the caller
+ * can't create in, Outbox, or Drafts for a message that isn't already a draft (`MessageMoveRules.planMessageMove`);
+ * `4` source and destination are the same folder; `7` the update itself failed (e.g. a concurrent edit's version
+ * conflict - the update is version-checked on both backends), a send in flight, or the message already left Outbox as sent - one failing
+ * move never aborts the others. Moving a message out of Outbox cancels its scheduled send.
  *
  * **Pragmatic subset**: `Message` only - `Contacts`/`Calendar`/`Tasks` moves are rare in practice (unlike
  * `Message`, whose Inbox-to-subfolder filing is a real, common client action) and would each need their own
@@ -111,10 +115,16 @@ export abstract class MoveItemsCommand implements EasCommandHandler {
             return this.responseElement(srcMsgId, STATUS_INVALID_DESTINATION, undefined);
         }
 
+        const sourceFolder: Folder | undefined = await this.folderRepo!.findOne(message.folderUid, { ignoreACL: true });
+        const plan: MessageMovePlan = planMessageMove(message, sourceFolder?.type, destFolder.type);
+        if (!plan.allowed) {
+            return this.responseElement(srcMsgId, plan.reason === "destination" ? STATUS_INVALID_DESTINATION : STATUS_LOCKED, undefined);
+        }
+
         try {
             await this.messageRepo!.update(
-                { uid: message.uid, version: (message as any).version, folderUid: dstFldId } as any,
-                message,
+                { uid: message.uid, version: (message as any).version, folderUid: dstFldId, ...plan.patch } as any,
+                asEntity(this.messageRepo!, message),
                 { ignoreACL: true, user: ctx.user },
             );
         } catch {

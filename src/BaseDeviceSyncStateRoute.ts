@@ -20,6 +20,11 @@ const { Auth, Param, Post, Request, User: AuthUser } = RouteDecorators;
  * existing 449 gate, at which point `ProvisionCommand.issuePolicy` sees the flag and sends the device a
  * `RemoteWipe` directive instead of a normal policy document - no separate push/notification channel is needed.
  *
+ * **Scope**: a `DeviceSyncState` row is one (mailbox, client-supplied `DeviceId`) pairing, so the wipe and the block
+ * that follows its acknowledgement apply to that `DeviceId` only. A compliant client wipes itself; a client that
+ * ignores the directive can pair again under a different `DeviceId` with the same credentials. Cutting such a client
+ * off requires revoking the account's credentials - not something this route does.
+ *
  * `deviceSyncStateClass` is supplied by the Mongo/SQL concrete subclasses, the same one-line-per-backend
  * pattern used throughout this library.
  *

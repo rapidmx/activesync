@@ -12,8 +12,8 @@ import config from "../config.js";
 import { ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { SendMailCommandMongo } from "../../src/commands/mongo/SendMailCommandMongo.js";
-import { countHeader, stripHeader } from "../../src/commands/ComposeMailCommand.js";
-import { element, opaqueElement } from "../../src/codec/WbxmlElement.js";
+import { stripHeader } from "../../src/commands/ComposeMailCommand.js";
+import { childText, element, opaqueElement } from "../../src/codec/WbxmlElement.js";
 import { WbxmlCodePage } from "../../src/codec/WbxmlCodePages.js";
 import type { EasCommandContext } from "../../src/EasCommandHandler.js";
 
@@ -75,15 +75,26 @@ describe("ComposeMailCommand Tests (guard clauses only)", () => {
         expect(send).not.toHaveBeenCalled();
     });
 
-    describe("countHeader", () => {
-        it("Counts header fields case-insensitively, allowing whitespace before the colon, ignoring folded lines, look-alike names and the body.", () => {
-            const raw = Buffer.from(
-                ["From: a@example.com", " From: folded continuation", "From-Address: x", "FROM\t: b@example.com", "Subject: hi", "", "From: in the body"].join("\r\n"),
-            );
-            expect(countHeader(raw, "From")).toBe(2);
-            expect(countHeader(raw, "sender")).toBe(0);
-            expect(countHeader(Buffer.from("From: a\nFrom: b"), "from")).toBe(2);
-        });
+    it("handle() answers Status 119 for a message with no recipient address and HTTP 400 for no From at all, relaying nothing.", async () => {
+        const send = vi.fn();
+        const mailboxRepo = { findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "me@example.com", aliasAddresses: [] }) };
+        const build = (headers: string[], cmd: string = "SendMail") => {
+            const command = objectFactory.newInstance<SendMailCommandMongo>(SendMailCommandMongo, { initialize: false });
+            Object.assign(command as any, { folderRepo: {}, messageRepo: {}, mailboxRepo, blobStore: {}, mailTransport: { send }, scanPipeline: {} });
+            const mime = Buffer.from([...headers, "Subject: Hi", "", "Body"].join("\r\n"));
+            return { command, request: element(WbxmlCodePage.ComposeMail, cmd, [opaqueElement(WbxmlCodePage.ComposeMail, "MIME", mime)]) };
+        };
+
+        for (const headers of [["From: me@example.com"], ["From: me@example.com", "To: undisclosed-recipients:;", "Cc: "]]) {
+            const { command, request } = build(headers);
+            const response = await (command as any).handle({ mailboxUid: "mbx", request });
+            expect(response.tag).toBe("SendMail");
+            expect(childText(response, "Status")).toBe("119");
+        }
+
+        const { command, request } = build(["To: you@example.com"]);
+        await expect((command as any).handle({ mailboxUid: "mbx", request })).rejects.toMatchObject({ status: 400 });
+        expect(send).not.toHaveBeenCalled();
     });
 
     describe("stripHeader", () => {

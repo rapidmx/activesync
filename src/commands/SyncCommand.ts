@@ -26,7 +26,9 @@ import {
     workingStateFromRound,
     workingStateFromRow,
 } from "../EasCollectionSync.js";
-import { type ChunkStore, clearHeldSet, type HeldSet, loadHeldSet, saveHeldSet } from "../EasCollectionStore.js";
+import { type ChunkStore, clearHeldSet, type HeldSet, INLINE_HELD_LIMIT, loadHeldSet, saveHeldSet } from "../EasCollectionStore.js";
+import { type MessageMovePlan, planMessageMove } from "../MessageMoveRules.js";
+import { asEntity } from "../RestapiCompat.js";
 import { EasCollectionLease, type LeaseRelease } from "../EasCollectionLease.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 import type { EasCollectionSyncAdapter } from "../adapters/EasCollectionSyncAdapter.js";
@@ -138,7 +140,10 @@ interface CollectionRound {
  * collection); `Add`/`Change`/`Delete` additionally need `CREATE`/`UPDATE`/`DELETE`, and a `ServerId` that resolves
  * to an item outside the synced folder is reported as not found (Status 8). An `Email` `Add` is only accepted in
  * a Drafts folder ([MS-ASCMD]: no non-draft email may be added by a client), and a new item's `mailboxUid` is the
- * folder's own mailbox, so an item added to a shared folder belongs to that folder's mailbox.
+ * folder's own mailbox, so an item added to a shared folder belongs to that folder's mailbox. An `Email` body can only
+ * be changed on a genuine draft (`EmailSyncAdapter`), and a delete-as-move out of Outbox cancels the scheduled send
+ * (`MessageMoveRules.planMessageMove`; Status 6 once the message was relayed). Every update is version-checked on both
+ * backends (`asEntity`).
  *
  * Per `[MS-ASCMD]`, `Add` always gets a `Responses` entry; `Change`/`Delete` only on failure.
  *
@@ -487,8 +492,15 @@ export abstract class SyncCommand implements EasCommandHandler {
     /**
      * Writes the held set (`held.ids`, given the set `held.loaded` the round started from) and then creates or
      * updates the collection's state row. Returns `false` - after logging - when anything failed (including losing a
-     * race for the row): the caller must then not hand out the new key. A `"restart"` empties the held set, removing
-     * the chunk rows of a chunked collection.
+     * race for the row): the caller must then not hand out the new key. A `"restart"` empties the held set.
+     *
+     * **Chunk writes can't be atomic with the state row**, so before any chunk row is touched the state row is first
+     * marked `chunked` with both its `SyncKey` and its previous round's key blanked (`invalidateBeforeChunkWrite()`).
+     * If anything after that fails - including the final state write, and even when the device never sees this round's
+     * Status 3 - no key matches the half-written chunks any more: the device's next `Sync` gets Status 3 and restarts
+     * with `SyncKey 0`, which always removes every chunk row of the collection (whether or not the row says `chunked`,
+     * so rows orphaned before this rule existed are cleared too). A collection converting from inline to chunked also
+     * clears leftover chunk rows first, so an orphan can never collide with the unique `chunkIndex`.
      */
     private async saveState(
         stored: (EasCollectionState & { version: number }) | undefined,
@@ -497,20 +509,27 @@ export abstract class SyncCommand implements EasCommandHandler {
     ): Promise<boolean> {
         try {
             let heldValues: { serverIds: string[]; chunked: boolean };
+            let current: (EasCollectionState & { version: number }) | undefined = stored;
             if (held === "restart") {
-                if (stored?.chunked) {
-                    await clearHeldSet(values, this.chunkStore);
-                }
+                await clearHeldSet(values, this.chunkStore);
                 heldValues = { serverIds: [], chunked: false };
             } else {
-                heldValues = await saveHeldSet(values, held.loaded, held.ids, !!stored?.chunked, this.chunkStore);
+                const wasChunked: boolean = !!stored?.chunked;
+                if (stored && (wasChunked || held.ids.size > INLINE_HELD_LIMIT)) {
+                    current = await this.invalidateBeforeChunkWrite(stored);
+                    if (!wasChunked) {
+                        await clearHeldSet(values, this.chunkStore);
+                    }
+                }
+                heldValues = await saveHeldSet(values, held.loaded, held.ids, wasChunked, this.chunkStore);
             }
             const row = { ...values, ...heldValues };
-            if (stored) {
-                await this.collectionStateRepo!.update({ ...row, uid: stored.uid, version: stored.version } as any, stored, {
-                    ignoreACL: true,
-                    skipPush: true,
-                });
+            if (current) {
+                await this.collectionStateRepo!.update(
+                    { ...row, uid: current.uid, version: current.version } as any,
+                    asEntity(this.collectionStateRepo!, current),
+                    { ignoreACL: true, skipPush: true },
+                );
             } else {
                 await this.collectionStateRepo!.create(new this.collectionStateClass(row), { ignoreACL: true, skipPush: true });
             }
@@ -519,6 +538,25 @@ export abstract class SyncCommand implements EasCommandHandler {
             this.logger?.warn(`SyncCommand: failed to save sync state for folder ${values.folderUid}: ${err?.message}`);
             return false;
         }
+    }
+
+    /** Marks `stored` chunked with no acceptable `SyncKey` (current or previous) before its chunk rows are written - see
+     * `saveState()`. Returns the updated row, whose version the final state write must carry. */
+    private async invalidateBeforeChunkWrite(
+        stored: EasCollectionState & { version: number },
+    ): Promise<EasCollectionState & { version: number }> {
+        return await this.collectionStateRepo!.update(
+            {
+                uid: stored.uid,
+                version: stored.version,
+                syncKey: "",
+                ...(stored.previous ? { previous: { ...stored.previous, syncKey: "" } } : {}),
+                serverIds: [],
+                chunked: true,
+            } as any,
+            asEntity(this.collectionStateRepo!, stored),
+            { ignoreACL: true, skipPush: true },
+        );
     }
 
     private addResponseElement(clientId: string | undefined, serverId: string | undefined, status: string): WbxmlElement {
@@ -611,7 +649,7 @@ export abstract class SyncCommand implements EasCommandHandler {
         }
         try {
             const partial = await adapter.fromApplicationData(appData, existing, await round.getFolderMailbox());
-            const updated = await repo.update({ uid: existing.uid, version: existing.version, ...partial }, existing, { ignoreACL: true });
+            const updated = await repo.update({ uid: existing.uid, version: existing.version, ...partial }, asEntity(repo, existing), { ignoreACL: true });
             this.noteWrite(round, updated);
             return undefined;
         } catch (err: any) {
@@ -649,14 +687,19 @@ export abstract class SyncCommand implements EasCommandHandler {
                     FolderType.DELETED_ITEMS,
                     ctx.user,
                 );
-                await repo.update({ uid: existing.uid, version: existing.version, folderUid: deletedItems.uid }, existing, {
+                // A move out of Outbox cancels the scheduled send (or is refused once the message was relayed).
+                const plan: MessageMovePlan = planMessageMove(existing, folder.type, FolderType.DELETED_ITEMS);
+                if (!plan.allowed) {
+                    return this.statusResponseElement("Delete", serverId, "6");
+                }
+                await repo.update({ uid: existing.uid, version: existing.version, folderUid: deletedItems.uid, ...plan.patch }, asEntity(repo, existing), {
                     ignoreACL: true,
                     user: ctx.user,
                 });
             } else {
                 const stamp = adapter.beforeDelete ? adapter.beforeDelete(existing, await round.getFolderMailbox()) : undefined;
                 if (stamp) {
-                    await repo.update({ uid: existing.uid, version: existing.version, ...stamp }, existing, { ignoreACL: true });
+                    await repo.update({ uid: existing.uid, version: existing.version, ...stamp }, asEntity(repo, existing), { ignoreACL: true });
                 }
                 await repo.delete(existing.uid, { ignoreACL: true });
             }

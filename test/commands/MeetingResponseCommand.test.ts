@@ -7,6 +7,7 @@
 // the iTIP reply, and a meeting request message whose MIME can't be read. The common flows (accept/decline, a
 // response by meeting request message, the reply to the organizer, per-request Status 2) run over real HTTP+DB in
 // test/routes/{mongo,sql}/EasRoute.test.ts.
+import { createHash } from "crypto";
 import config from "../config.js";
 import { ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
@@ -279,5 +280,101 @@ describe("MeetingResponseCommand Tests (isolated)", () => {
         calendarEventRepo.find.mockResolvedValueOnce([event({ uid: "only-override", recurrenceId: new Date() })]);
         const single = await command.handle(ctx(request(reply("1", "invite"))));
         expect(childText(findChild(single!, "Result")!, "CalendarId")).toBe("only-override");
+    });
+
+    describe("Round 5", () => {
+        const inviteMime = (uid: string): Buffer =>
+            Buffer.from(
+                [
+                    "From: boss@example.com",
+                    "To: me@example.com",
+                    "Subject: Planning",
+                    "MIME-Version: 1.0",
+                    'Content-Type: multipart/mixed; boundary="b"',
+                    "",
+                    "--b",
+                    "Content-Type: text/calendar; method=REQUEST",
+                    "",
+                    ["BEGIN:VCALENDAR", "METHOD:REQUEST", "BEGIN:VEVENT", `UID:${uid}`, "SEQUENCE:0", "END:VEVENT", "END:VCALENDAR"].join("\r\n"),
+                    "--b--",
+                    "",
+                ].join("\r\n"),
+            );
+        const byMessage = (uid: string, rows: any[]) => {
+            const calendarEventRepo = {
+                findOne: vi.fn().mockResolvedValue(undefined),
+                find: vi.fn().mockResolvedValue(rows),
+                update: vi.fn().mockResolvedValue({}),
+                delete: vi.fn().mockResolvedValue(undefined),
+            };
+            const built = build({
+                calendarEventRepo,
+                messageRepo: { findOne: vi.fn().mockResolvedValue({ uid: "invite", folderUid: "inbox", bodyBlobKey: "invite" }) },
+                blobStore: { get: vi.fn().mockResolvedValue(inviteMime(uid)) },
+            });
+            return { ...built, calendarEventRepo };
+        };
+
+        it("Never lets an operator-shaped iCalendar UID select another meeting: rows not exactly matching are ignored.", async () => {
+            // A query parser would read `ne(x)` as "icalUid != x" and hand back unrelated meetings.
+            const { command, calendarEventRepo } = byMessage("ne(x)", [event({ uid: "other", icalUid: "unrelated@example.com" })]);
+
+            const response = await command.handle(ctx(request(reply("3", "invite"))));
+
+            expect(statuses(response)).toEqual(["2"]);
+            expect(calendarEventRepo.find.mock.calls[0][0].icalUid).toBe("ne(x)");
+            expect(calendarEventRepo.update).not.toHaveBeenCalled();
+            expect(calendarEventRepo.delete).not.toHaveBeenCalled();
+        });
+
+        it("Looks up an iCalendar UID over 255 characters by the bounded (hashed) value restapi stores.", async () => {
+            const longUid = `${"u".repeat(300)}@example.com`;
+            const key = `sha256:${createHash("sha256").update(longUid, "utf8").digest("hex")}`;
+            const { command, calendarEventRepo } = byMessage(longUid, [event({ uid: "stored", icalUid: key }), event({ uid: "elsewhere", icalUid: key, mailboxUid: "mbx-2" })]);
+
+            const response = await command.handle(ctx(request(reply("1", "invite"))));
+
+            expect(statuses(response)).toEqual(["1"]);
+            expect(calendarEventRepo.find.mock.calls[0][0].icalUid).toBe(key);
+            expect(childText(findChild(response!, "Result")!, "CalendarId")).toBe("stored");
+        });
+
+        it("Refuses a delegate's response on the owner's organizer copy, judging organizer-ness by the event's own mailbox.", async () => {
+            const bossMailbox = { uid: "boss-mbx", primarySmtpAddress: "boss@example.com", aliasAddresses: [], displayName: "Boss" };
+            const organizerCopy = event({ mailboxUid: "boss-mbx", organizer: { address: "boss@example.com", type: RecipientType.TO } });
+            const { command, calendarEventRepo } = build({
+                calendarEventRepo: { findOne: vi.fn().mockResolvedValue(organizerCopy), update: vi.fn(), delete: vi.fn() },
+            });
+            (command as any).mailboxRepo.findOne = vi.fn().mockImplementation(async (uid: string) => (uid === "boss-mbx" ? bossMailbox : MAILBOX));
+
+            expect(statuses(await command.handle(ctx(request(reply("3", "event-1")))))).toEqual(["2"]);
+            expect(calendarEventRepo.delete).not.toHaveBeenCalled();
+            expect(calendarEventRepo.update).not.toHaveBeenCalled();
+
+            // The owner's attendee copy of a third party's meeting is still fine (and stamped as an attendee copy).
+            calendarEventRepo.findOne.mockResolvedValue(event({ mailboxUid: "boss-mbx", organizer: { address: "ceo@example.org", type: RecipientType.TO } }));
+            calendarEventRepo.update.mockResolvedValue({});
+            calendarEventRepo.delete.mockResolvedValue(undefined);
+            expect(statuses(await command.handle(ctx(request(reply("3", "event-1")))))).toEqual(["1"]);
+            expect(calendarEventRepo.update.mock.calls[0][0]).toHaveProperty("cancelNoticeSentAt");
+
+            // An owner mailbox that no longer exists answers Status 2.
+            (command as any).mailboxRepo.findOne = vi.fn().mockImplementation(async (uid: string) => (uid === "boss-mbx" ? undefined : MAILBOX));
+            expect(statuses(await command.handle(ctx(request(reply("1", "event-1")))))).toEqual(["2"]);
+        });
+
+        it("Passes each event update a version-checked entity when the repository has a model class.", async () => {
+            class FakeEntity {
+                constructor(row: any) {
+                    Object.assign(this, row);
+                }
+            }
+            const calendarEventRepo = { modelClass: FakeEntity, findOne: vi.fn().mockResolvedValue(event()), update: vi.fn().mockResolvedValue({}), delete: vi.fn() };
+            const { command } = build({ calendarEventRepo });
+
+            await command.handle(ctx(request(reply("1", "event-1"))));
+
+            expect(calendarEventRepo.update.mock.calls[0][1]).toBeInstanceOf(FakeEntity);
+        });
     });
 });

@@ -21,6 +21,7 @@ import {
     type TransportResult,
 } from "@rapidmx/restapi";
 import { isOrganizedBy } from "../adapters/CalendarSyncAdapter.js";
+import { asEntity, boundIndexedValue } from "../RestapiCompat.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 const { Init, Inject, Logger } = ObjectDecorators;
 
@@ -53,7 +54,13 @@ type StoredEvent = CalendarEvent & { uid: string; version: number };
  * **`RequestId`** is either the `CalendarEvent.uid` (a response from the calendar) or the `Message.uid` of the
  * meeting request in the Inbox (a response from the mail view - what most clients send). For a message, the
  * caller needs `READ` on its folder; its `text/calendar` part's `UID` is then resolved to the caller's own copy of
- * the event (`icalUid` within the caller's mailbox).
+ * the event (`icalUid` within the caller's mailbox) - looked up bounded (`boundIndexedValue`, as restapi stores it) and
+ * exact-matched in memory, since the UID is sender-controlled text a query parser could read as an operator.
+ *
+ * **Someone else's calendar**: whether a copy is the organizer's is judged against the event's own mailbox, not the
+ * caller's. A response to an event in another mailbox (a delegate with `UPDATE` on it) is refused with Status 2 when
+ * that event is its owner's organizer copy - it can only ever be an attendee copy. Updates are version-checked on both
+ * backends (`asEntity`).
  *
  * **Effect**: the caller must be an attendee and have `UPDATE` on the event's folder. Accept/Tentative update
  * the caller's `Attendee.responseStatus`. A decline removes the caller's own copy of the event (matching Exchange)
@@ -169,15 +176,27 @@ export abstract class MeetingResponseCommand implements EasCommandHandler {
         }
         const updatedAttendee: Attendee = { ...event.attendees[attendeeIndex], responseStatus: USER_RESPONSE_STATUS[userResponse] };
 
-        const attendeeCopy: boolean = !isOrganizedBy(event, mailbox);
+        // Whose copy this is decides whether it's the organizer's: the event's own mailbox, which for a delegate
+        // responding in someone else's calendar is not the caller's. A delegate never responds on (and so never
+        // deletes, or re-invites from) the owner's organizer copy of a meeting.
+        const owner: Mailbox | undefined =
+            event.mailboxUid === ctx.mailboxUid ? mailbox : await this.mailboxRepo!.findOne(event.mailboxUid, { ignoreACL: true });
+        if (!owner) {
+            return this.result(requestId, STATUS_INVALID_REQUEST);
+        }
+        const attendeeCopy: boolean = !isOrganizedBy(event, owner);
+        if (!attendeeCopy && owner !== mailbox) {
+            return this.result(requestId, STATUS_INVALID_REQUEST);
+        }
         let removed = false;
         try {
             if (userResponse === USER_RESPONSE_DECLINED && (await this.aclUtils!.hasPermission(ctx.user, event.folderUid, ACLAction.DELETE))) {
                 if (attendeeCopy && event.cancelNoticeSentAt == null) {
-                    await this.calendarEventRepo!.update({ uid: event.uid, version: event.version, cancelNoticeSentAt: new Date() } as any, event, {
-                        ignoreACL: true,
-                        user: ctx.user,
-                    });
+                    await this.calendarEventRepo!.update(
+                        { uid: event.uid, version: event.version, cancelNoticeSentAt: new Date() } as any,
+                        asEntity(this.calendarEventRepo!, event),
+                        { ignoreACL: true, user: ctx.user },
+                    );
                 }
                 await this.calendarEventRepo!.delete(event.uid, { ignoreACL: true, user: ctx.user });
                 removed = true;
@@ -185,10 +204,11 @@ export abstract class MeetingResponseCommand implements EasCommandHandler {
                 const attendees = event.attendees.map((attendee, i) => (i === attendeeIndex ? updatedAttendee : attendee));
                 const inviteSequence =
                     attendeeCopy && event.inviteSequenceSent !== event.sequence ? { inviteSequenceSent: event.sequence ?? 0 } : {};
-                await this.calendarEventRepo!.update({ uid: event.uid, version: event.version, attendees, ...inviteSequence } as any, event, {
-                    ignoreACL: true,
-                    user: ctx.user,
-                });
+                await this.calendarEventRepo!.update(
+                    { uid: event.uid, version: event.version, attendees, ...inviteSequence } as any,
+                    asEntity(this.calendarEventRepo!, event),
+                    { ignoreACL: true, user: ctx.user },
+                );
             }
         } catch (err: any) {
             this.logger?.warn(`MeetingResponseCommand: failed to record response to event ${event.uid}: ${err?.message}`);
@@ -217,10 +237,16 @@ export abstract class MeetingResponseCommand implements EasCommandHandler {
         if (!icalUid) {
             return undefined;
         }
-        const events: StoredEvent[] = await this.calendarEventRepo!.find({ mailboxUid: ctx.mailboxUid, icalUid, limit: 10 } as any, {
-            ignoreACL: true,
-            limit: 10,
-        });
+        // The UID is sender-controlled: looked up bounded (restapi stores `icalUid` through `boundIndexedValue()`) and
+        // exact-matched in memory, as restapi's `ScanQueueJob.findCalendarEventRows()` does - a UID like `ne(x)` would
+        // otherwise be parsed as a query operator and select (and let a decline delete) a different meeting.
+        const key: string = boundIndexedValue(icalUid);
+        const events: StoredEvent[] = (
+            await this.calendarEventRepo!.find({ mailboxUid: ctx.mailboxUid, icalUid: key, limit: 50 } as any, {
+                ignoreACL: true,
+                limit: 50,
+            })
+        ).filter((row: StoredEvent) => row.icalUid === key && row.mailboxUid === ctx.mailboxUid);
         // The series master (no `recurrenceId`) is what a response to the whole invitation applies to.
         return events.find((candidate) => !candidate.recurrenceId) ?? events[0];
     }

@@ -14,16 +14,23 @@ import {
     type Mailbox,
     type Message,
     MessageImportance,
+    prependHeaders,
     RecipientType,
     RecoverableRepoUtils,
     scanAndRelay,
 } from "@rapidmx/restapi";
-import { childText, findChild, type WbxmlElement } from "../codec/WbxmlElement.js";
+import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
+import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
+import { checkComposedOriginators, extractOriginatorHeaders, stripHeader } from "../MimeHeaderUtils.js";
+import { boundIndexedValue } from "../RestapiCompat.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 const { Init, Inject, Logger } = ObjectDecorators;
 
 /** Most envelope recipients (To + Cc + Bcc) one composed message may carry. */
 export const MAX_COMPOSE_RECIPIENTS = 500;
+
+/** [MS-ASCMD] common Status 119, MessageHasNoRecipient. */
+const STATUS_NO_RECIPIENT = "119";
 
 /** Flattens mailparser's `AddressObject | AddressObject[] | undefined` union (grouped addresses can nest an
  * `AddressObject` per group) into a plain list of SMTP addresses, dropping any entry with no address (a
@@ -48,55 +55,7 @@ function collectAddresses(entry: EmailAddress, out: string[]): void {
     }
 }
 
-/** The top-level header block of `raw` (up to the first empty line), as `latin1` text, and where it ends. */
-function headerBlock(raw: Buffer): { text: string; header: string; end: number } {
-    const text = raw.toString("latin1");
-    const crlf = text.indexOf("\r\n\r\n");
-    const lf = text.indexOf("\n\n");
-    const end = crlf !== -1 && (lf === -1 || crlf < lf) ? crlf + 2 : lf !== -1 ? lf + 1 : text.length;
-    return { text, header: text.slice(0, end), end };
-}
-
-/**
- * Counts the top-level header fields named `name` (case-insensitive) in `raw`. Folded continuation lines are part
- * of the field before them, so only field starts count; optional whitespace before the colon (RFC 5322's obsolete
- * syntax, which parsers still accept) is allowed. `name` is a plain header name (letters, digits and `-`).
- */
-export function countHeader(raw: Buffer, name: string): number {
-    const prefix: string = name.toLowerCase();
-    return headerBlock(raw)
-        .header.split(/\r?\n/)
-        .filter((line) => {
-            const lower = line.toLowerCase();
-            return lower.startsWith(prefix) && /^[ \t]*:/.test(lower.slice(prefix.length));
-        }).length;
-}
-
-/**
- * Returns a copy of `raw` with every top-level header named `name` (case-insensitive, including its folded
- * continuation lines) removed. Only the header block is touched; the body is copied verbatim. Works on the
- * `latin1` view of the bytes so no byte sequence is altered.
- */
-export function stripHeader(raw: Buffer, name: string): Buffer {
-    const { text, header, end } = headerBlock(raw);
-    const lines = header.split(/(?<=\n)/);
-    const kept: string[] = [];
-    let dropping = false;
-    const prefix = `${name.toLowerCase()}:`;
-    for (const line of lines) {
-        if (line.startsWith(" ") || line.startsWith("\t")) {
-            if (!dropping) {
-                kept.push(line);
-            }
-            continue;
-        }
-        dropping = line.toLowerCase().startsWith(prefix);
-        if (!dropping) {
-            kept.push(line);
-        }
-    }
-    return Buffer.from(kept.join("") + text.slice(end), "latin1");
-}
+export { stripHeader };
 
 /**
  * Shared implementation for EAS `SendMail`, `SmartForward`, and `SmartReply` (MS-ASCMD `ComposeMail` namespace)
@@ -105,12 +64,19 @@ export function stripHeader(raw: Buffer, name: string): Buffer {
  * `BaseMessageRoute.send()`, which this class's `scanAndRelay()` call shares its scan-then-relay core with via
  * `MailSendUtils.ts`).
  *
- * **Sender and envelope checks** (the MIME is entirely device-controlled): every `From` address - and a `Sender`
- * header, if present - must be the caller's own mailbox's primary or alias address (HTTP 403 otherwise), so a
- * device can't send as anyone else. A message with more than one `From` or `Sender` header field is refused the same
- * way: the parser checks only one of them, while a recipient's mail client may display another; the envelope sender is that validated `From`. The envelope is capped at
- * `MAX_COMPOSE_RECIPIENTS` recipients (HTTP 400). `Bcc` recipients are delivered via the envelope, but the `Bcc`
- * header itself is stripped from the relayed copy so other recipients never see it (the Sent Items copy keeps it).
+ * **Sender and envelope checks** (the MIME is entirely device-controlled): the raw bytes pass restapi's own originator
+ * rules before anything parses them (`MimeHeaderUtils.checkComposedOriginators`: an inline copy of restapi's
+ * `checkOriginatorHeaders` with `rejectAddressLikeDisplayNames`): exactly one `From`, at most one `Sender` (found by a tolerant lexer - `From :`, folded lines and bare-CR
+ * line breaks included), every address in them - group members too - the caller's own mailbox's primary or alias
+ * address, no address-like text outside an address (`<me@x> <victim@y>`), and no address in a display name or comment
+ * (`"ceo@y" <me@x>`, `me@x (victim@y)`), and - stricter than restapi - no empty group (`victims:;, me@x`). Anything
+ * else is HTTP 403 (a MIME with no `From` at all is HTTP 400), so a device can't send as, or appear to be, anyone else;
+ * the envelope sender is the validated `From`. A message with no To/Cc/Bcc address is answered with the command's own
+ * `Status` 119 (MessageHasNoRecipient), nothing relayed. The envelope is capped at `MAX_COMPOSE_RECIPIENTS`
+ * recipients (HTTP 400). `Bcc` recipients are delivered via the envelope, but every `Bcc` header field (found by the
+ * same lexer, so `Bcc :` too) is stripped from the relayed copy so other recipients never see it (the Sent Items copy
+ * keeps it). The Sent Items copy records the relay's own `Message-ID`/`conversationId` (bounded like restapi's), so
+ * recall and threading match what recipients received.
  *
  * **Pragmatic subset, deliberately not the full MS-ASCMD semantics**:
  * - `SmartForward`/`SmartReply`'s `<Source>` (the message being forwarded/replied to) is used only to thread
@@ -215,45 +181,62 @@ export abstract class ComposeMailCommand implements EasCommandHandler {
             original = found;
         }
 
-        // Checked on the raw bytes before parsing: mailparser keeps just one of several `From`/`Sender` fields, so the
-        // address check below would validate a field other than the one a recipient may be shown.
-        if (countHeader(raw, "from") > 1 || countHeader(raw, "sender") > 1) {
-            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "The composed message has more than one From or Sender header.");
+        const mailbox: Mailbox | undefined = await this.mailboxRepo.findOne(ctx.mailboxUid, { ignoreACL: true });
+        if (!mailbox) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        const ownAddresses = new Set(
+            [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].filter((a) => typeof a === "string").map((a) => a.toLowerCase()),
+        );
+        const isAllowed = (address: string): boolean => ownAddresses.has(address.toLowerCase());
+
+        // Checked on the raw bytes before parsing, with restapi's own sender rules (see `MimeHeaderUtils`): mailparser
+        // keeps just one of several `From`/`Sender` fields and recovers malformed address lists tolerantly, so checking
+        // only its parse would validate something other than what a recipient may be shown.
+        if (extractOriginatorHeaders(raw).from.length === 0) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The composed Mime has no resolvable From/To address.");
+        }
+        if (checkComposedOriginators(raw, isAllowed) !== undefined) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "The composed message's From address is not one of this mailbox's addresses.");
         }
 
         const parsed: ParsedMail = await simpleParser(raw);
         const fromAddresses: string[] = addressesOf(parsed.from);
         const envelopeFrom: string | undefined = fromAddresses[0];
-        const envelopeTo: string[] = [...addressesOf(parsed.to), ...addressesOf(parsed.cc), ...addressesOf(parsed.bcc)];
-        if (!envelopeFrom || envelopeTo.length === 0) {
+        const envelopeTo: string[] = [...addressesOf(parsed.to), ...addressesOf(parsed.cc), ...addressesOf(parsed.bcc)].filter(
+            (address) => address.trim().length > 0,
+        );
+        /* v8 ignore start -- checkComposedOriginators() already required a From address mailparser reads too */
+        if (!envelopeFrom) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The composed Mime has no resolvable From/To address.");
+        }
+        /* v8 ignore stop */
+        if (envelopeTo.length === 0) {
+            // Like restapi's send() (400 for a message with no To/Cc/Bcc recipient), refused before anything is relayed -
+            // reported the ActiveSync way, [MS-ASCMD] Status 119 (MessageHasNoRecipient) in the command's own response.
+            return element(WbxmlCodePage.ComposeMail, this.command, [textElement(WbxmlCodePage.ComposeMail, "Status", STATUS_NO_RECIPIENT)]);
         }
         if (envelopeTo.length > MAX_COMPOSE_RECIPIENTS) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A composed message may have at most ${MAX_COMPOSE_RECIPIENTS} recipients.`);
         }
-
-        const mailbox: Mailbox | undefined = await this.mailboxRepo.findOne(ctx.mailboxUid, { ignoreACL: true });
-        if (!mailbox) {
-            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
-        }
-        const ownAddresses = new Set([mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].map((a) => a.toLowerCase()));
+        // Defense in depth: the raw checks above already cover every address mailparser can report.
+        /* v8 ignore start -- unreachable while checkOriginatorHeaders() passes; kept in case the two parsers ever disagree */
         const senderAddresses: string[] = addressesOf(parsed.headers.get("sender") as AddressObject | undefined);
-        if ([...fromAddresses, ...senderAddresses].some((address) => !ownAddresses.has(address.toLowerCase()))) {
+        if ([...fromAddresses, ...senderAddresses].some((address) => !isAllowed(address))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "The composed message's From address is not one of this mailbox's addresses.");
         }
+        /* v8 ignore stop */
 
-        const { sanitizedHtmlBlobKey } = await scanAndRelay(
-            stripHeader(raw, "bcc"),
-            envelopeFrom,
-            envelopeTo,
-            this.scanPipeline,
-            this.mailTransport,
-            this.blobStore,
-        );
+        const stripped: Buffer = stripHeader(raw, "bcc");
+        const relayed = await scanAndRelay(stripped, envelopeFrom, envelopeTo, this.scanPipeline, this.mailTransport, this.blobStore);
 
         if (findChild(ctx.request, "SaveInSentItems")) {
             const bodyBlobKey = `bodies/${crypto.randomUUID()}`;
-            await this.blobStore.put(bodyBlobKey, raw, { contentType: "message/rfc822" });
+            // The Sent Items copy keeps its Bcc header, but must carry the `Message-ID` the message was actually relayed
+            // with: `scanAndRelay()` injects one when the device's MIME had none, and recall/threading match on it.
+            const stored: Buffer =
+                relayed.raw !== stripped ? prependHeaders(raw, [{ name: "Message-ID", value: `<${relayed.messageId}>` }]) : raw;
+            await this.blobStore.put(bodyBlobKey, stored, { contentType: "message/rfc822" });
 
             const sentFolder: any = await findOrCreateWellKnownFolder(
                 this.folderRepo,
@@ -267,14 +250,18 @@ export abstract class ComposeMailCommand implements EasCommandHandler {
                 new this.messageClass({
                     folderUid: sentFolder.uid,
                     mailboxUid: ctx.mailboxUid,
-                    messageId: parsed.messageId ?? `${crypto.randomUUID()}@eas`,
+                    // The relay's own values (angle brackets stripped, as every recipient's ingest stores them), bounded
+                    // the way restapi stores indexed identifiers - not mailparser's bracketed `Message-ID`.
+                    messageId: boundIndexedValue(relayed.messageId),
+                    conversationId: boundIndexedValue(relayed.conversationId),
                     subject: parsed.subject ?? "",
                     from: { address: envelopeFrom, type: RecipientType.TO },
                     recipients: buildRecipients(parsed),
                     sentDate: new Date(),
                     receivedDate: new Date(),
                     bodyBlobKey,
-                    sanitizedHtmlBlobKey,
+                    sanitizedHtmlBlobKey: relayed.sanitizedHtmlBlobKey,
+                    encrypted: relayed.encrypted,
                     bodyPreview: (parsed.text ?? "").slice(0, 200),
                     flags: { read: true, flagged: false, answered: false, forwarded: false },
                     importance: MessageImportance.NORMAL,

@@ -6,56 +6,88 @@
 // `redis` module (no real Redis is part of this repo's test setup - see PingCommand.test.ts for the same approach).
 import { EasCollectionLease } from "../src/EasCollectionLease.js";
 
+const never = <T>(): Promise<T> => new Promise<T>(() => undefined);
+
 const redis = {
     keys: new Map<string, string>(),
     connectFails: false,
+    connectHangs: false,
     setFails: false,
     evalFails: false,
+    isOpen: undefined as boolean | undefined,
+    /** When set, `set` calls wait on it before answering. */
+    setGate: undefined as Promise<void> | undefined,
     setCalls: 0,
+    clientsCreated: 0,
+    clientOptions: [] as any[],
+    renewCalls: [] as string[][],
     errorHandlers: [] as Array<(err: Error) => void>,
     reset(): void {
         this.errorHandlers = [];
         this.keys.clear();
         this.connectFails = false;
+        this.connectHangs = false;
         this.setFails = false;
         this.evalFails = false;
+        this.isOpen = undefined;
+        this.setGate = undefined;
         this.setCalls = 0;
+        this.clientsCreated = 0;
+        this.clientOptions = [];
+        this.renewCalls = [];
     },
 };
 
 vi.mock("redis", () => ({
-    createClient: () => ({
-        on: (_event: string, handler: (err: Error) => void) => {
-            redis.errorHandlers.push(handler);
-        },
-        connect: async () => {
-            if (redis.connectFails) {
-                throw new Error("connect refused");
-            }
-        },
-        set: async (key: string, value: string, options: any) => {
-            redis.setCalls++;
-            if (redis.setFails) {
-                throw new Error("connection lost");
-            }
-            expect(options).toEqual({ condition: "NX", expiration: { type: "PX", value: 1000 } });
-            if (redis.keys.has(key)) {
-                return null;
-            }
-            redis.keys.set(key, value);
-            return "OK";
-        },
-        eval: async (_script: string, options: { keys: string[]; arguments: string[] }) => {
-            if (redis.evalFails) {
-                throw new Error("connection lost");
-            }
-            if (redis.keys.get(options.keys[0]) === options.arguments[0]) {
-                redis.keys.delete(options.keys[0]);
-                return 1;
-            }
-            return 0;
-        },
-    }),
+    createClient: (options: any) => {
+        redis.clientsCreated++;
+        redis.clientOptions.push(options);
+        return {
+            get isOpen() {
+                return redis.isOpen;
+            },
+            on: (_event: string, handler: (err: Error) => void) => {
+                redis.errorHandlers.push(handler);
+            },
+            connect: async () => {
+                if (redis.connectHangs) {
+                    await never();
+                }
+                if (redis.connectFails) {
+                    throw new Error("connect refused");
+                }
+            },
+            set: async (key: string, value: string, options: any) => {
+                redis.setCalls++;
+                if (redis.setGate) {
+                    await redis.setGate;
+                }
+                if (redis.setFails) {
+                    throw new Error("connection lost");
+                }
+                expect(options).toEqual({ condition: "NX", expiration: { type: "PX", value: expect.any(Number) } });
+                if (redis.keys.has(key)) {
+                    return null;
+                }
+                redis.keys.set(key, value);
+                return "OK";
+            },
+            eval: async (script: string, options: { keys: string[]; arguments: string[] }) => {
+                if (redis.evalFails) {
+                    throw new Error("connection lost");
+                }
+                if (script.includes("pexpire")) {
+                    redis.renewCalls.push(options.arguments);
+                    return redis.keys.get(options.keys[0]) === options.arguments[0] ? 1 : 0;
+                }
+                if (redis.keys.get(options.keys[0]) === options.arguments[0]) {
+                    redis.keys.delete(options.keys[0]);
+                    return 1;
+                }
+                return 0;
+            },
+        };
+    },
 }));
 
 const tick = (ms: number = 10) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -141,9 +173,106 @@ describe("EasCollectionLease Tests", () => {
         redis.setFails = false;
         const reconnected = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 0 });
         expect(redis.keys.has("eas:lease:k")).toBe(true);
-        // The shared client's error events (it reconnects on its own) never crash the process.
+        // The shared client's error events never crash the process.
         expect(() => redis.errorHandlers.forEach((handler) => handler(new Error("socket closed")))).not.toThrow();
         expect(redis.errorHandlers.length).toBeGreaterThan(0);
         await reconnected!();
+    });
+
+    it("Creates the client without an offline queue and with a reconnect strategy that gives up.", async () => {
+        const release = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 0, redisTimeoutMs: 1234 });
+        await release!();
+
+        const options = redis.clientOptions[0];
+        expect(options.disableOfflineQueue).toBe(true);
+        expect(options.socket.connectTimeout).toBe(1234);
+        expect(typeof options.socket.reconnectStrategy(0)).toBe("number");
+        expect(options.socket.reconnectStrategy(10)).toBeInstanceOf(Error);
+    });
+
+    it("Fails open instead of hanging when a connect never completes, so a Redis outage can't stall Sync.", async () => {
+        redis.connectHangs = true;
+        const started = Date.now();
+
+        const release = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 15_000, redisTimeoutMs: 30 });
+
+        expect(release).toBeDefined();
+        expect(Date.now() - started).toBeLessThan(1_000);
+        await release!();
+        // The in-process lease really was released.
+        expect(await EasCollectionLease.acquire("k", { ttlMs: 1000, waitMs: 0 })).toBeDefined();
+    });
+
+    it("Fails open when a SET never answers, and gives the key back if that SET lands later.", async () => {
+        let open!: () => void;
+        redis.setGate = new Promise<void>((resolve) => (open = resolve));
+
+        const release = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 15_000, redisTimeoutMs: 20 });
+        expect(release).toBeDefined();
+
+        open();
+        await tick(10);
+        expect(redis.setCalls).toBe(1);
+        expect(redis.keys.has("eas:lease:k")).toBe(false);
+        await release!();
+
+        // A late SET that fails instead is swallowed.
+        let fail!: () => void;
+        redis.setGate = new Promise<void>((resolve) => (fail = resolve));
+        const again = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 15_000, redisTimeoutMs: 20 });
+        expect(again).toBeDefined();
+        redis.setFails = true;
+        fail();
+        await tick(10);
+        expect(redis.keys.has("eas:lease:k")).toBe(false);
+        await again!();
+    });
+
+    it("Gives up (not fails open) when Redis answers but the wait for another copy's key runs out mid-SET.", async () => {
+        redis.keys.set("eas:lease:k", "another-server-copy");
+        const acquiring = EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 60, pollMs: 5, redisTimeoutMs: 5_000 });
+        await tick(20);
+        // Every later SET hangs, so the loop's last attempt is cut short by the deadline.
+        redis.setGate = never();
+
+        expect(await acquiring).toBeUndefined();
+    });
+
+    it("Renews a held Redis lease every third of its TTL with its own token, and stops once released.", async () => {
+        const release = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 30, waitMs: 0 });
+        const token = redis.keys.get("eas:lease:k")!;
+
+        await tick(70);
+        expect(redis.renewCalls.length).toBeGreaterThanOrEqual(2);
+        expect(redis.renewCalls.every((args) => args[0] === token && args[1] === "30")).toBe(true);
+
+        await release!();
+        const renewals = redis.renewCalls.length;
+        await tick(40);
+        expect(redis.renewCalls.length).toBe(renewals);
+
+        // A failing renewal is swallowed.
+        const failing = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 30, waitMs: 0 });
+        redis.evalFails = true;
+        await tick(25);
+        await failing!();
+    });
+
+    it("Replaces a client whose reconnects gave up, failing open meanwhile.", async () => {
+        const first = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 0 });
+        await first!();
+        expect(redis.clientsCreated).toBe(1);
+
+        redis.isOpen = false;
+        const closed = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 0 });
+        expect(closed).toBeDefined();
+        expect(redis.keys.has("eas:lease:k")).toBe(false);
+        await closed!();
+
+        redis.isOpen = true;
+        const fresh = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 0 });
+        expect(redis.clientsCreated).toBe(2);
+        expect(redis.keys.has("eas:lease:k")).toBe(true);
+        await fresh!();
     });
 });

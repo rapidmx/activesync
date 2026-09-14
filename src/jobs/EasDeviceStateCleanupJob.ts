@@ -135,9 +135,9 @@ export abstract class EasDeviceStateCleanupJob<D extends DeviceSyncState> extend
                 { ignoreACL: true, limit: this.batchSize },
             );
             for (const state of states) {
-                if (state.chunked) {
-                    await clearHeldSet(state, { repo: this.collectionChunkRepo!, chunkClass: this.collectionChunkClass });
-                }
+                // Regardless of `chunked`: a round that failed while converting a collection to chunks can leave chunk
+                // rows behind a row that still says it isn't chunked.
+                await clearHeldSet(state, { repo: this.collectionChunkRepo!, chunkClass: this.collectionChunkClass });
                 await this.collectionStateRepo!.delete(state.uid, { ignoreACL: true, purge: true });
             }
             if (states.length < this.batchSize) {

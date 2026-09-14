@@ -599,32 +599,66 @@ describe("PingCommand Tests", () => {
         const CURSOR = new Date("2026-03-01T00:00:00.000Z");
         const after = new Date("2026-03-01T00:00:01.000Z");
 
-        /** Gives `command` a fake collection state store and an item repo, as PingCommandMongo/SQL would. */
-        function withPendingCheck(command: PingCommand, states: Record<string, any>, rowsByFolder: Record<string, any[]>): { itemRepo: any } {
-            const itemRepo = {
-                find: vi.fn().mockImplementation(async (query: any) => (query.deleted ? [] : (rowsByFolder[query.folderUid] ?? []).slice(0, query.limit))),
-            };
-            (command as any).collectionStateRepo = {
+        /** Evaluates the query shapes the pending-change check sends (`in`/`gte`/`gt`/`range` operands, `$or`,
+         * `deleted`, `sort`, `limit`) over `rows`. */
+        function matches(row: any, query: Record<string, any>): boolean {
+            return Object.entries(query).every(([key, value]) => {
+                if (key === "sort" || key === "limit") return true;
+                if (key === "$or") return (value as any[]).some((sub) => matches(row, sub));
+                if (key === "deleted") return (row.deleted === true) === value;
+                const field = row[key] instanceof Date ? row[key].toISOString() : row[key];
+                const op = /^(gt|gte|range|in)\((.*)\)$/.exec(String(value));
+                if (!op) return field === value;
+                if (op[1] === "in") return op[2].split(",").includes(field);
+                if (op[1] === "gt") return field > op[2];
+                if (op[1] === "gte") return field >= op[2];
+                const [lo, hi] = op[2].split(",");
+                return field >= lo && field <= hi;
+            });
+        }
+
+        function fakeStore(rows: any[], fail?: (query: any) => boolean): any {
+            return {
                 find: vi.fn().mockImplementation(async (query: any) => {
-                    if (query.folderUid === "broken") throw new Error("db down");
-                    return states[query.folderUid] ? [states[query.folderUid]] : [];
+                    if (fail?.(query)) throw new Error("db down");
+                    const effective = "deleted" in query || !("dateModified" in query || "$or" in query) ? query : { ...query, deleted: false };
+                    return rows
+                        .filter((row) => matches(row, effective))
+                        .sort((a, b) => (a.dateModified?.getTime?.() ?? 0) - (b.dateModified?.getTime?.() ?? 0) || (a.uid < b.uid ? -1 : 1))
+                        .slice(0, query.limit);
                 }),
             };
-            (command as any).repos = new Map([["Email", itemRepo]]);
-            return { itemRepo };
+        }
+
+        /** Gives `command` a fake collection state store and item repos, as PingCommandMongo/SQL would. */
+        function withPendingCheck(command: PingCommand, states: Record<string, any>, items: any[], repos: Record<string, any> = {}): { itemRepo: any; stateRepo: any } {
+            const itemRepo = fakeStore(items);
+            const stateRepo = fakeStore(Object.entries(states).map(([folderUid, state]) => ({ mailboxUid: "mbx-1", deviceId: "dev-1", folderUid, ...state })));
+            (command as any).collectionStateRepo = stateRepo;
+            (command as any).repos = new Map([["Email", itemRepo], ...Object.entries(repos)]);
+            return { itemRepo, stateRepo };
         }
         const state = (overrides: Record<string, any> = {}) => ({ collectionClass: "Email", cursorDate: CURSOR, cursorUid: "", echoes: {}, ...overrides });
+        const item = (uid: string, folderUid: string, overrides: Record<string, any> = {}) => ({ uid, folderUid, dateModified: after, ...overrides });
 
         it("Answers Status 2 at once for a folder with a row after its recorded cursor, without Redis.", async () => {
             const command = await createCommand({});
             withPendingCheck(
                 command,
-                { "folder-1": state(), "folder-2": state(), "unsynced-class": state({ collectionClass: "Notes" }) },
-                { "folder-1": [], "folder-2": [{ uid: "m1", folderUid: "folder-2", dateModified: after }] },
+                {
+                    "folder-1": state({ cursorUid: "at-cursor" }),
+                    "folder-2": state(),
+                    "unsynced-class": state({ collectionClass: "Notes" }),
+                    broken: state({ collectionClass: "Broken" }),
+                    // Another device's state for the same folder is never used.
+                    "folder-3": state({ deviceId: "other-device" }),
+                },
+                [item("m1", "folder-2"), item("at-cursor", "folder-1", { dateModified: CURSOR }), item("m3", "folder-3")],
+                { Broken: { find: vi.fn().mockRejectedValue(new Error("db down")) } },
             );
             const start = Date.now();
 
-            const response = await command.handle(makeContext(pingRequest(60, ["folder-1", "folder-2", "never-synced", "unsynced-class", "broken"])));
+            const response = await command.handle(makeContext(pingRequest(60, ["folder-1", "folder-2", "never-synced", "unsynced-class", "broken", "folder-3"])));
 
             expect(childText(response!, "Status")).toBe("2");
             expect(findChild(response!, "Folders")!.children.map((f) => f.text)).toEqual(["folder-2"]);
@@ -634,21 +668,20 @@ describe("PingCommand Tests", () => {
         it("Ignores the device's own writes, but counts a full page as a change.", async () => {
             const command = await createCommand({});
             const echoes = { m1: after.toISOString() };
-            withPendingCheck(command, { "folder-1": state({ echoes }), "folder-2": state({ echoes }) }, {
-                "folder-1": [{ uid: "m1", folderUid: "folder-1", dateModified: after }],
-                "folder-2": Array.from({ length: 6 }, (_, i) => ({ uid: "m1", folderUid: "folder-2", dateModified: after, i })),
-            });
+            withPendingCheck(command, { "folder-1": state({ echoes }), "folder-2": state({ echoes }) }, [
+                item("m1", "folder-1"),
+                ...Array.from({ length: 6 }, (_, i) => item("m1", "folder-2", { dateModified: new Date(after.getTime() + i) })),
+            ]);
             const res = makeRes();
 
-            const pending = command.handle(makeContext(pingRequest(60, ["folder-1", "folder-2"]), { res }));
-            const response = await pending;
+            const response = await command.handle(makeContext(pingRequest(60, ["folder-1", "folder-2"]), { res }));
 
             expect(findChild(response!, "Folders")!.children.map((f) => f.text)).toEqual(["folder-2"]);
         });
 
         it("Keeps waiting when nothing is pending, until the request closes.", async () => {
             const command = await createCommand({});
-            withPendingCheck(command, { "folder-1": state({ echoes: { m1: after.toISOString() } }) }, { "folder-1": [{ uid: "m1", folderUid: "folder-1", dateModified: after }] });
+            withPendingCheck(command, { "folder-1": state({ echoes: { m1: after.toISOString() } }) }, [item("m1", "folder-1")]);
             const res = makeRes();
 
             const pending = command.handle(makeContext(pingRequest(60, ["folder-1"]), { res }));
@@ -658,9 +691,56 @@ describe("PingCommand Tests", () => {
             expect(childText((await pending)!, "Status")).toBe("1");
         });
 
+        it("Treats a failed state lookup as nothing pending.", async () => {
+            const command = await createCommand({});
+            withPendingCheck(command, { "folder-1": state() }, [item("m1", "folder-1")]);
+            (command as any).collectionStateRepo = fakeStore([], () => true);
+            const res = makeRes();
+
+            const pending = command.handle(makeContext(pingRequest(60, ["folder-1"]), { res }));
+            await tick(50);
+            res.finish();
+
+            expect(childText((await pending)!, "Status")).toBe("1");
+        });
+
+        it("Checks hundreds of folders with one state query and one pair of change queries per collection class.", async () => {
+            const command = await createCommand({ "mail:eas:ping_max_folders": 300 });
+            const folderUids = Array.from({ length: 300 }, (_, i) => `f-${i}`);
+            const states = Object.fromEntries(folderUids.map((uid, i) => [uid, state({ cursorDate: new Date(CURSOR.getTime() + i) })]));
+            const { itemRepo, stateRepo } = withPendingCheck(command, states, [
+                // Before f-250's own cursor, but after the earliest one: not a change for f-250.
+                item("old", "f-250", { dateModified: new Date(CURSOR.getTime() + 100) }),
+                item("new", "f-299", { dateModified: new Date(CURSOR.getTime() + 5000) }),
+            ]);
+
+            const response = await command.handle(makeContext(pingRequest(60, folderUids)));
+
+            expect(findChild(response!, "Folders")!.children.map((f) => f.text)).toEqual(["f-299"]);
+            expect(stateRepo.find).toHaveBeenCalledTimes(1);
+            expect(itemRepo.find).toHaveBeenCalledTimes(2);
+        });
+
+        it("Falls back to a per-folder scan for folders a full batch page can't decide, and for folder uids that can't be listed.", async () => {
+            const command = await createCommand({});
+            const busy = Array.from({ length: 501 }, (_, i) => item(`busy-${String(i).padStart(3, "0")}`, "busy", { dateModified: new Date(CURSOR.getTime() + 1000 + i) }));
+            const { itemRepo } = withPendingCheck(
+                command,
+                { busy: state(), quiet: state(), late: state(), "odd,uid": state() },
+                [...busy, item("late-row", "late", { dateModified: new Date(CURSOR.getTime() + 999_999) }), item("odd-row", "odd,uid")],
+            );
+
+            const response = await command.handle(makeContext(pingRequest(60, ["busy", "quiet", "late", "odd,uid"])));
+
+            expect(findChild(response!, "Folders")!.children.map((f) => f.text)).toEqual(["busy", "late", "odd,uid"]);
+            // The batch pair, then scanAfter's pair for each undecided folder (quiet, late) and for "odd,uid".
+            expect(itemRepo.find).toHaveBeenCalledTimes(8);
+            expect(itemRepo.find.mock.calls.some(([query]: any[]) => String(query.folderUid).startsWith("in(") && String(query.folderUid).includes("odd"))).toBe(false);
+        });
+
         it("Checks once subscribed to Redis, releasing the subscription, and also when the Redis connect fails.", async () => {
             const command = await createCommand(REDIS_CONFIG);
-            withPendingCheck(command, { "folder-1": state() }, { "folder-1": [{ uid: "m1", folderUid: "folder-1", dateModified: after }] });
+            withPendingCheck(command, { "folder-1": state() }, [item("m1", "folder-1")]);
 
             const response = await command.handle(makeContext(pingRequest(5, ["folder-1"])));
             expect(childText(response!, "Status")).toBe("2");
@@ -676,10 +756,10 @@ describe("PingCommand Tests", () => {
         it("Changes nothing when a publish already answered the Ping before the check completes.", async () => {
             const command = await createCommand(REDIS_CONFIG);
             const gate = deferred();
-            const { itemRepo } = withPendingCheck(command, { "folder-1": state() }, {});
+            const { itemRepo } = withPendingCheck(command, { "folder-1": state() }, []);
             itemRepo.find.mockImplementation(async (query: any) => {
                 await gate.promise;
-                return query.deleted ? [] : [{ uid: "m1", folderUid: "folder-1", dateModified: after }];
+                return query.deleted ? [] : [item("m1", "folder-1")];
             });
 
             const pending = command.handle(makeContext(pingRequest(5, ["folder-1", "folder-2"])));

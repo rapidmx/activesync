@@ -365,6 +365,17 @@ describe("EmailSyncAdapter Tests", () => {
             }
         });
 
+        it("Refuses a Body change on a delivered message that was moved into Drafts (it carries a scan result).", async () => {
+            const { adapter, put } = buildAdapter(FolderType.DRAFTS);
+            await expect(
+                adapter.fromApplicationData(
+                    appData([element(WbxmlCodePage.AirSyncBase, "Body", [textElement(WbxmlCodePage.AirSyncBase, "Data", "Forged")])]),
+                    { ...baseMessage, scanResultUid: "scan-1" },
+                ),
+            ).rejects.toMatchObject({ status: 400 });
+            expect(put).not.toHaveBeenCalled();
+        });
+
         it("Still applies a non-body Change (Read) to a message outside the Drafts folder.", async () => {
             const { adapter, put, folderFindOne } = buildAdapter(FolderType.INBOX);
             const partial = await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "Read", "1")]), baseMessage);

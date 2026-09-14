@@ -5,6 +5,7 @@
 import { ComposeMailCommand } from "./ComposeMailCommand.js";
 import type { EasCommandContext } from "../EasCommandHandler.js";
 import type { Message } from "@rapidmx/restapi";
+import { asEntity } from "../RestapiCompat.js";
 
 /**
  * Handles EAS `SmartReply`: relays a freshly composed message threaded to (and referencing) the original via
@@ -19,7 +20,7 @@ export abstract class SmartReplyCommand extends ComposeMailCommand {
     protected override async markOriginal(ctx: EasCommandContext, original: Message & { uid: string; version: number }): Promise<void> {
         await this.messageRepo!.update(
             { uid: original.uid, version: original.version, flags: { ...original.flags, answered: true } } as any,
-            original,
+            asEntity(this.messageRepo!, original),
             { ignoreACL: true, user: ctx.user },
         );
     }

@@ -27,7 +27,8 @@
         "@rapidrest/service-core": "2.x"
     },
     "dependencies": {
-        "mailparser": "^3.9.23"
+        "mailparser": "^3.9.23",
+        "nodemailer": "^10.0.1"
     },
     "devDependencies": {
         "@rapidmx/restapi": "^0.9.0",

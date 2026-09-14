@@ -49,6 +49,105 @@ Keep entries terse — this is a reference, not a transcript.
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
 
+### 2026-09-14 (5) — Round-5 review fixes (sender spoofing, Drafts forgery, query injection, version locks, Redis, chunks)
+
+All 14 findings re-checked against the code and fixed. Uncommitted, no version bump. Builds against
+`@rapidmx/restapi` 0.9.0, so restapi helpers it lacks are **inline copies** to replace once the dependency is bumped:
+`src/RestapiCompat.ts` (`boundIndexedValue`, `asEntity`, copied exactly) and `src/MimeHeaderUtils.ts`
+(`checkOriginatorHeaders` with `rejectAddressLikeDisplayNames`, `hasAddressLikeDisplayName`, copied from restapi's
+in-progress source that runs the display-name rule on the lexer's own From/Sender values). `nodemailer` (`^10.0.1`,
+already in the lockfile via mailparser/restapi) is now a declared dependency, for `nodemailer/lib/addressparser`.
+
+- **1 SendMail/SmartReply/SmartForward spoofing**: `countHeader` is gone. The raw MIME goes through
+  `checkOriginatorHeaders` before `simpleParser`, so all the reported forms are 403: `<me> <victim>`, `"ceo@y" <me>`,
+  `me (victim@y)`, `Victim Name, me`, a bare CR hiding a second From, and encoded-word or fullwidth `@` names. One lexer
+  (`lexHeaderFields`) backs both the sender check and `stripHeader`. It ends the block at the first CRLFCRLF/LFLF,
+  splits lines on CRLF/LF/bare CR, and trims field names, so it sees at least every field mailsplit sees (mailsplit
+  trims names and splits on LF only). So `Bcc :` is stripped too. Two plugin-side additions go beyond restapi. A MIME
+  with no From at all stays **400**. **An empty group (`victims:;, me`) is refused**, since restapi's flattened parse
+  accepts it.
+- **13 Sent Items copy** now stores `scanAndRelay`'s `messageId`/`conversationId` (bounded) and `encrypted`. The
+  stored blob keeps Bcc. When the relay injected a `Message-ID`, the same header is prepended to the stored copy.
+- **2 Drafts forgery** (`src/MessageMoveRules.ts`, shared by MoveItems, ItemOperations Move and Sync delete-as-move):
+  - Moves into **Outbox** are always refused.
+  - Moves into **Drafts** are allowed only from Drafts or Outbox. MoveItems answers Status 2, ItemOperations counts
+    it as a failed message (3/17).
+  - Leaving Outbox sets `scheduledSendTime: null`, and nulls `scheduledSendAttempts`/`scheduledSendError` only where
+    the row has them (restapi 0.9.0's SQL model has no such columns). A row with `scheduledSendRelayedAt` is refused:
+    MoveItems 7, Sync Delete 6.
+  - EAS body changes need `isGenuineDraft` (in Drafts and no `scanResultUid`). REST still allows moves into Drafts,
+    and a delivered message there still can't be rewritten over EAS. **Residual:** a REST-moved Sent Items copy
+    (no `scanResultUid`) would count as a draft. That's restapi's REST rule to close.
+- **3 MeetingResponse UID**: looked up as `boundIndexedValue(uid)` and exact-matched in memory
+  (`row.icalUid === key`, same mailbox), mirroring restapi's `ScanQueueJob.findCalendarEventRows`.
+- **Grep for other client/sender strings in `find()`**:
+  - `DeviceId` is now validated in `BaseEasRoute`: at most 128 visible ASCII characters, no `(`, `)` or `,`, else 400.
+  - `EmptyFolderContents` resolves the folder and queries by the stored uid (404 if missing).
+  - Ping's batched `in(...)` and reconcile only list `isListableUid` values (EasSyncKeyUtils).
+  - Other folder-uid queries already went through a `findOne` (exact) first. Label uids were already UUID-guarded.
+- **4 ItemOperations conversation Move**: bounded `conversationId`, exact in-memory match (`conversationId` and
+  `mailboxUid`).
+- **5 Version locks**: `asEntity(repo, row)` is now the `existing` for every plugin update. That covers MoveItems,
+  ItemOperations Move, MeetingResponse (both writes), Sync Change/Delete/stamp, SmartReply/SmartForward
+  `markOriginal`, Settings Oof, `persistDeviceSyncState`, chunk updates and the state row. On Mongo these now bump
+  `version`/`dateModified` and 409 on conflict. The route test checks `version + 1` after a MoveItems move.
+- **6 Delegate MeetingResponse**: organizer-ness is judged against `event.mailboxUid`'s mailbox (loaded when it isn't
+  the caller's). An organizer copy in another mailbox gets Status 2. The owner mailbox missing also gets 2.
+  Own-mailbox behaviour is unchanged.
+- **7 Redis outage** (`EasCollectionLease`): the client is created with `disableOfflineQueue`, `connectTimeout` and a
+  reconnect strategy that gives up after 3 tries. A client whose reconnects gave up (`isOpen === false`) is replaced
+  next time. Connect and each SET are raced against `redisTimeoutMs` (default 2 s), capped by the wait deadline, and
+  fail open. A SET that lands late is released. A timeout that only happened because the deadline ran out while Redis
+  was answering (another copy holds the key) returns `undefined`, not fail-open.
+- **10 Lease renewal**: every `ttlMs/3`, a token-checked `PEXPIRE` script (unref'd interval, cleared on release).
+- **8/9 Chunks**: when a round will touch chunk rows (already chunked, or converting), `saveState` first updates the
+  state row to `chunked: true`, `syncKey: ""`, `previous.syncKey: ""`. Then it writes the chunks, then the final row
+  on the returned version. Any failure after that leaves no key that matches, even if the Status 3 response is lost,
+  so the device must send SyncKey 0. SyncKey 0 and `EasDeviceStateCleanupJob` now truncate chunks unconditionally. A
+  conversion also truncates leftovers first, so an orphan can't hit the unique `chunkIndex`. The blank-key option
+  was chosen over copy-on-write generations. Cost: one extra state write per chunked round.
+- **11 Reconcile**: uids failing `isListableUid` (comma, parens, `me`, `null`) are checked one by one with `findOne`.
+  Results are exact-matched on `folderUid`.
+- **12 Remote wipe**: doc comments in `DeviceSyncState.blocked`, `ProvisionCommand` and `BaseDeviceSyncStateRoute`
+  now say the wipe and block are per client-supplied `DeviceId`. A non-compliant client can re-pair under a new id,
+  and stopping it means revoking credentials. No token revocation was built.
+- **14 Ping queries**:
+  - State rows: one `in(...)` query per 500 folders.
+  - Per collection class: one live + one deleted query for rows `gte(earliest cursor)`, limit 501. When neither page
+    is full, every folder is decided in memory with exactly `scanAfter`'s rule.
+  - When a page is full, folders already shown pending are reported and the rest fall back to per-folder
+    `scanAfter`.
+  - Idle 300 folders is about 3 queries (was about 900).
+  - A failed state lookup now means "nothing pending" for the whole Ping (was per folder).
+- **Not done (as instructed)**: the chunk-sorting performance item, and the version bump.
+- Tests: new `test/MimeHeaderUtils.test.ts` and `test/MessageMoveRules.test.ts`. Also extended the Lease, Ping,
+  SyncCommand, MeetingResponse, ItemOperations, EasCollectionSync, EmailSyncAdapter, BaseEasRoute and cleanup-job
+  tests, plus Mongo/SQL route tests (originator spoofs, `Bcc :` + relay Message-ID filing, Outbox/Drafts moves with
+  the version bump, operator-shaped ConversationId).
+- **Follow-up for restapi "part A"** (contract changes landed while round 5 was in progress):
+  - **Sender checks.** `MimeHeaderUtils` now carries an exact copy of restapi's `extractOriginatorHeaders`,
+    `hasAddressLikeDisplayName` (including look-alike `@`) and `checkOriginatorHeaders(raw, isAllowed, options)`, with
+    their private helpers. The plugin-only rules moved to a separate `checkComposedOriginators()`, which runs restapi's
+    check with `rejectAddressLikeDisplayNames: true` and then refuses two more cases:
+    - a `From`/`Sender` that the byte-preserving lexer counts but restapi's regex doesn't (for example, a leading
+      space on the first line, or `Sender\f:` - mailsplit reads both);
+    - an empty group in `From`/`Sender`.
+
+    `stripHeader` still uses the byte-preserving lexer.
+  - **No recipients.** Like restapi's `send()` 400, but in the ActiveSync form: a composed message with no
+    To/Cc/Bcc address gets `<SendMail|SmartReply|SmartForward><Status>119</Status>` (MessageHasNoRecipient) over
+    HTTP 200, and nothing is relayed. A message with no `From` at all is still HTTP 400.
+  - **Send lease.** `planMessageMove` refuses to move a message anywhere while `scheduledSendLeaseExpiresAt` is
+    still in the future. MoveItems answers 7, Sync delete answers 6, and ItemOperations counts it as failed. This
+    matches restapi's `assertNotInFlight()`. On a move out of Outbox the lease field is cleared too (only where the
+    row has it; restapi 0.9.0's SQL model has no column for it). `toValidDate` is copied inline.
+    Only unit-tested: restapi 0.9.0's `MessageMongo`/`RepoUtils` drop the unknown field on read, so no route test
+    against 0.9.0 can see a live lease. The check starts working end to end once restapi is bumped.
+  - **Bounded writes.** All the plugin's `messageId`/`conversationId`/`icalUid` writes now go through
+    `boundIndexedValue`: the Sent Items copy, the Email Add `messageId` default and the Calendar Add `icalUid` default.
+  - **Checks.** Final run: 34 files / 778 tests, coverage 100% statements/lines/functions and 97.66% branches.
+    `yarn lint` and `tsc --noEmit` are clean.
+
 ### 2026-09-14 (4) — Round-4 review fixes (held-set chunks, leases, overlap/reconcile, wipe block, meeting copies)
 
 All findings checked against HEAD `88290ce`. 14 fixed, finding 6 (move stream per device) noted rather than

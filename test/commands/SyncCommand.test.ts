@@ -106,7 +106,7 @@ async function buildCommand(
     const command = await objectFactory.newInstance<SyncCommandMongo>(SyncCommandMongo, { initialize: false });
     const stateRepo = {
         find: vi.fn().mockResolvedValue(options.state === null ? [] : [options.state ?? storedState()]),
-        update: vi.fn().mockResolvedValue(undefined),
+        update: vi.fn().mockImplementation(async (obj: any) => ({ ...obj, version: (obj.version ?? 0) + 1 })),
         create: vi.fn().mockResolvedValue(undefined),
     };
     const folderRepo = {
@@ -116,7 +116,7 @@ async function buildCommand(
     const chunkRepo = {
         find: vi.fn().mockResolvedValue([]),
         create: vi.fn().mockResolvedValue(undefined),
-        update: vi.fn().mockResolvedValue(undefined),
+        update: vi.fn().mockImplementation(async (obj: any) => ({ ...obj, version: (obj.version ?? 0) + 1 })),
         delete: vi.fn().mockResolvedValue(undefined),
         truncate: vi.fn().mockResolvedValue(undefined),
     };
@@ -161,7 +161,7 @@ function responseStatus(response: WbxmlElement | undefined, kind: string): strin
 }
 
 function savedState(stateRepo: any): any {
-    return (stateRepo.update.mock.calls[0] ?? stateRepo.create.mock.calls[0])[0];
+    return (stateRepo.update.mock.calls.at(-1) ?? stateRepo.create.mock.calls[0])[0];
 }
 
 describe("SyncCommand Tests (guard clause only)", () => {
@@ -914,6 +914,117 @@ describe("SyncCommand Tests (isolated)", () => {
             });
             const { command: failing } = await buildCommand("Fake", fakeAdapter(), failingRepo);
             expect(responseStatus(await failing.handle(buildContext(request).ctx), "Delete")).toBe("6");
+        });
+    });
+
+    describe("Round 5", () => {
+        const newItemRepo = (uid: string = "one-more") =>
+            fakeRepo({
+                find: vi.fn().mockImplementation(async (query: any) =>
+                    !query.deleted && query.folderUid === FOLDER_UID && !String(query.dateModified).startsWith("range")
+                        ? [{ uid, folderUid: FOLDER_UID, dateModified: new Date("2026-02-01T00:00:00.000Z") }]
+                        : [],
+                ),
+            });
+
+        it("Blanks the current and previous SyncKey (marking the row chunked) before any chunk write, so a failed chunk round leaves no key to retry.", async () => {
+            const chunkRows = [{ uid: "chunk-0", version: 1, mailboxUid: "mbx-1", deviceId: "dev-1", folderUid: FOLDER_UID, chunkIndex: 0, ids: ["held-1"] }];
+            const stored = storedState({ chunked: true, previous: { syncKey: PREVIOUS_KEY, addedIds: [], removedIds: [], echoes: {}, clientIds: [] } });
+            const { command, stateRepo, chunkRepo, logger } = await buildCommand("Fake", fakeAdapter(), newItemRepo(), { state: stored });
+            chunkRepo.find.mockResolvedValue(chunkRows);
+            chunkRepo.update.mockRejectedValue(new Error("chunk write failed"));
+
+            const response = await command.handle(buildContext(syncRequest("Fake", [])).ctx);
+
+            expect(childText(collection(response!), "Status")).toBe("3");
+            expect(stateRepo.update).toHaveBeenCalledTimes(1);
+            const [invalidation, existing] = stateRepo.update.mock.calls[0];
+            expect(invalidation).toEqual({ uid: "state-1", version: 4, syncKey: "", previous: expect.objectContaining({ syncKey: "" }), serverIds: [], chunked: true });
+            expect(existing).toBe(stored);
+            expect(stateRepo.update.mock.invocationCallOrder[0]).toBeLessThan(chunkRepo.update.mock.invocationCallOrder[0]);
+            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("chunk write failed"));
+
+            // Neither the key the device holds nor the previous one matches the invalidated row.
+            for (const key of [STORED_KEY, PREVIOUS_KEY]) {
+                const { command: next } = await buildCommand("Fake", fakeAdapter(), fakeRepo(), { state: { ...stored, ...invalidation } });
+                expect(childText(collection((await next.handle(buildContext(syncRequest("Fake", [], [], key)).ctx))!), "Status")).toBe("3");
+            }
+        });
+
+        it("A successful chunked round writes the final state on top of the invalidated row's version.", async () => {
+            const chunkRows = [{ uid: "chunk-0", version: 1, mailboxUid: "mbx-1", deviceId: "dev-1", folderUid: FOLDER_UID, chunkIndex: 0, ids: ["held-1"] }];
+            const { command, stateRepo, chunkRepo } = await buildCommand("Fake", fakeAdapter(), newItemRepo(), { state: storedState({ chunked: true }) });
+            chunkRepo.find.mockResolvedValue(chunkRows);
+
+            const response = await command.handle(buildContext(syncRequest("Fake", [])).ctx);
+
+            expect(childText(collection(response!), "Status")).toBe("1");
+            expect(stateRepo.update).toHaveBeenCalledTimes(2);
+            expect(stateRepo.update.mock.calls[0][0].previous).toBeUndefined();
+            expect(stateRepo.update.mock.calls[1][0]).toEqual(
+                expect.objectContaining({ version: 5, syncKey: childText(collection(response!), "SyncKey"), chunked: true }),
+            );
+            expect(chunkRepo.update.mock.calls[0][0].ids).toEqual(["held-1", "one-more"]);
+        });
+
+        it("Clears leftover chunk rows before converting an inline held set to chunks, and on every SyncKey 0.", async () => {
+            const held = Array.from({ length: INLINE_HELD_LIMIT }, (_, i) => `held-${i}`);
+            const { command, chunkRepo } = await buildCommand("Fake", fakeAdapter(), newItemRepo(), { state: storedState({ serverIds: held }) });
+
+            await command.handle(buildContext(syncRequest("Fake", [])).ctx);
+
+            expect(chunkRepo.truncate).toHaveBeenCalledWith({ mailboxUid: "mbx-1", deviceId: "dev-1", folderUid: FOLDER_UID }, { ignoreACL: true });
+            expect(chunkRepo.truncate.mock.invocationCallOrder[0]).toBeLessThan(chunkRepo.create.mock.invocationCallOrder[0]);
+
+            // A row that says it isn't chunked (orphans from a failed conversion) is still cleared by SyncKey 0.
+            const { command: restart, chunkRepo: restartChunks } = await buildCommand("Fake", fakeAdapter(), fakeRepo(), { state: storedState({ chunked: false }) });
+            await restart.handle(buildContext(syncRequest("Fake", [], [], "0")).ctx);
+            expect(restartChunks.truncate).toHaveBeenCalledTimes(1);
+        });
+
+        it("A delete (as a move) out of Outbox cancels the scheduled send, and is refused once the message was relayed.", async () => {
+            const request = syncRequest("Email", [element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", "msg-1")])]);
+            const outbox = { uid: FOLDER_UID, mailboxUid: "mbx-1", type: FolderType.OUTBOX };
+            const queued = { uid: "msg-1", version: 3, folderUid: FOLDER_UID, scheduledSendTime: new Date(), scheduledSendAttempts: 2 };
+
+            const repo = fakeRepo({ findOne: vi.fn().mockResolvedValue(queued), update: vi.fn().mockResolvedValue({}) });
+            const { command } = await buildCommand("Email", fakeAdapter(), repo, { state: storedState({ collectionClass: "Email" }), folder: outbox });
+            await command.handle(buildContext(request).ctx);
+            expect(repo.update.mock.calls[0][0]).toEqual({
+                uid: "msg-1",
+                version: 3,
+                folderUid: "deleted-items",
+                scheduledSendTime: null,
+                scheduledSendAttempts: null,
+            });
+
+            const relayedRepo = fakeRepo({ findOne: vi.fn().mockResolvedValue({ ...queued, scheduledSendRelayedAt: new Date() }), update: vi.fn() });
+            const { command: relayed } = await buildCommand("Email", fakeAdapter(), relayedRepo, { state: storedState({ collectionClass: "Email" }), folder: outbox });
+            expect(responseStatus(await relayed.handle(buildContext(request).ctx), "Delete")).toBe("6");
+            expect(relayedRepo.update).not.toHaveBeenCalled();
+        });
+
+        it("Hands every update a version-checked entity when the repository has a model class.", async () => {
+            class FakeEntity {
+                constructor(row: any) {
+                    Object.assign(this, row);
+                }
+            }
+            const existing = { uid: "item-1", version: 1, folderUid: FOLDER_UID };
+            const repo = fakeRepo({ modelClass: FakeEntity, findOne: vi.fn().mockResolvedValue(existing), update: vi.fn().mockResolvedValue({ uid: "item-1" }) });
+            const { command, stateRepo } = await buildCommand("Fake", fakeAdapter({ fromApplicationData: vi.fn().mockReturnValue({}) }), repo);
+            (stateRepo).modelClass = FakeEntity;
+
+            await command.handle(
+                buildContext(
+                    syncRequest("Fake", [
+                        element(WbxmlCodePage.AirSync, "Change", [textElement(WbxmlCodePage.AirSync, "ServerId", "item-1"), element(WbxmlCodePage.AirSync, "ApplicationData", [])]),
+                    ]),
+                ).ctx,
+            );
+
+            expect(repo.update.mock.calls[0][1]).toBeInstanceOf(FakeEntity);
+            expect(stateRepo.update.mock.calls[0][1]).toBeInstanceOf(FakeEntity);
         });
     });
 });

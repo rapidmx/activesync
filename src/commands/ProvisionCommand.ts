@@ -46,7 +46,9 @@ const STATUS_DEVICE_BLOCKED = "129";
  * - **A blocked device** (one that acknowledged a wipe) is refused every Provision request with Status 129
  * (DeviceIsBlockedForThisUser) - and `BaseEasRoute` refuses its other commands - until an administrator clears the
  * flag (`BaseDeviceSyncStateRoute.unblock`). Otherwise a device (or whoever holds it) could acknowledge the wipe
- * without wiping anything and simply provision again. `remoteWipeAccountOnly` is recorded for admin audit only; the wire directive sent to the
+ * without wiping anything and simply provision again. The block (like the wipe itself) is keyed on the client-supplied
+ * `DeviceId`: a client that ignores the directive can pair again under another `DeviceId` with the same credentials -
+ * see `DeviceSyncState.blocked`; revoking the account's credentials is what stops that. `remoteWipeAccountOnly` is recorded for admin audit only; the wire directive sent to the
  * device is identical either way (a real "wipe just this account's data" vs. "wipe the whole device"
  * distinction would require an MDM-capable client extension this library doesn't implement).
  *

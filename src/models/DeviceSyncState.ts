@@ -46,8 +46,12 @@ export interface DeviceSyncState extends BaseEntity {
     /** When the device most recently acknowledged a remote wipe request. */
     remoteWipeAcknowledgedAt?: Date;
 
-    /** `true` once the device has acknowledged a remote wipe: every further request from it (including a fresh
-     * `Provision`) is refused until an administrator clears the flag (`BaseDeviceSyncStateRoute.unblock`), so a
-     * device can't acknowledge the wipe and then simply provision again. */
+    /** `true` once the device has acknowledged a remote wipe: every further request carrying this row's `DeviceId`
+     * (including a fresh `Provision`) is refused until an administrator clears the flag
+     * (`BaseDeviceSyncStateRoute.unblock`), so a client can't acknowledge the wipe and then simply provision again under
+     * the same id. **The block is per `DeviceId`, not per physical device or credential**: `DeviceId` is chosen by the
+     * client, so a client that ignores the wipe and sends a different `DeviceId` with the same user's token pairs as a
+     * new device. Cutting a device off entirely means revoking the account's tokens/password, which this plugin
+     * doesn't do. */
     blocked?: boolean;
 }

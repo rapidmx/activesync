@@ -46,6 +46,7 @@ function fakeRepo(rows: Row[]): any {
             return field >= lo && field <= hi;
         });
     return {
+        findOne: vi.fn().mockImplementation(async (uid: string) => rows.find((row) => row.uid === uid && row.deleted !== true)),
         find: vi.fn().mockImplementation(async (query: any) => {
             const effective = "deleted" in query ? query : { ...query, deleted: false };
             const descending = String(query.sort ?? "").includes("DESC");
@@ -357,6 +358,33 @@ describe("EasCollectionSync Tests", () => {
             expect(partial.commands).toEqual([{ kind: "Delete", uid: "x-purged" }]);
             expect(partial.moreAvailable).toBe(true);
             expect(s.reconcileCursor).toBe("x-purged");
+        });
+
+        it("Checks held ids that can't be listed in an in(...) operand (commas, me, null) one by one by exact uid.", async () => {
+            const repo = fakeRepo([
+                { uid: "a,b", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(1) },
+                { uid: "a", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(1) },
+                { uid: "me", folderUid: "archive", mailboxUid: "mbx", dateModified: t(1) },
+            ]);
+            const s = state({
+                serverIds: new Set(["a,b", "gone,too", "me", "null"]),
+                cursor: { date: t(5), uid: "" },
+                moveCursor: { date: t(5), uid: "" },
+                recent: new Map(),
+            });
+
+            const { commands } = await enumerateCollection(s, { ...base, repo, windowSize: 10, overlapMs: 0, reconcileLimit: 10 });
+
+            expect(commands).toEqual([
+                { kind: "Delete", uid: "gone,too" },
+                { kind: "Delete", uid: "me" },
+                { kind: "Delete", uid: "null" },
+            ]);
+            expect([...s.serverIds]).toEqual(["a,b"]);
+            // Nothing unlistable ever reached an in(...) query.
+            for (const [query] of repo.find.mock.calls) {
+                expect(String(query.uid ?? "")).not.toMatch(/in\(.*(,b|me|null)/);
+            }
         });
     });
 

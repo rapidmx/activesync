@@ -4677,6 +4677,50 @@ describe("Route:EasRouteSQL Tests", () => {
                 expect((await blobStore().get(saved!.bodyBlobKey)).toString("utf-8")).toContain("Bcc: hidden@example.com");
             });
 
+            it("Refuses restapi's originator spoofs before relaying anything.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const me = mailbox.primarySmtpAddress;
+
+                for (const from of [
+                    [`From: <${me}> <victim@example.org>`],
+                    [`From: "ceo@example.org" <${me}>`],
+                    [`From: ${me} (victim@example.org)`],
+                    [`From: Victim Name, ${me}`],
+                    [`From: victims:;, ${me}`],
+                    [`From: =?utf-8?q?ceo=40example.org?= <${me}>`],
+                    [`From: ${me}\rFrom: victim@example.org`],
+                    [`From: ${me}`, "From : victim@example.org"],
+                ]) {
+                    expect((await send(mime([...from, "To: to@example.com"]))).status).toBe(403);
+                }
+                expect(transport().sent.length).toBe(0);
+            });
+
+            it("Strips a Bcc header written with whitespace before its colon, and files the relay's Message-ID and conversation.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+
+                const result = await send(
+                    mime([`From: ${mailbox.primarySmtpAddress}`, "To: to@example.com", "Bcc : hidden@example.com"]),
+                    "SendMail",
+                    [element(WbxmlCodePage.ComposeMail, "SaveInSentItems", [])],
+                );
+
+                expect(result.status).toBe(200);
+                const sent = transport().sent[0];
+                expect(sent.envelopeTo.sort()).toEqual(["hidden@example.com", "to@example.com"]);
+                const relayed = sent.raw.toString("utf-8");
+                expect(relayed).not.toContain("hidden@example.com");
+                const relayedId = /^Message-ID:\s*<([^>]+)>/im.exec(relayed)![1];
+                const saved: any = await messageRepo.findOne({ where: { subject: "Round 3" } });
+                expect(saved.messageId).toBe(relayedId);
+                expect(saved.conversationId).toBe(relayedId);
+                const stored = (await blobStore().get(saved.bodyBlobKey)).toString("utf-8");
+                expect(stored).toContain(`Message-ID: <${relayedId}>`);
+                expect(stored).toContain("Bcc : hidden@example.com");
+            });
+
             it("Still answers a SmartReply whose original can't be flagged afterwards.", async () => {
                 const mailbox = await createMailbox(owner.uid);
                 await provisionDevice("dev1");
@@ -4785,6 +4829,61 @@ describe("Route:EasRouteSQL Tests", () => {
                 const response = await postWbxml("MoveItems", "dev1", element(WbxmlCodePage.Move, "MoveItems", [move(otherInbox.uid)]));
                 expect(childText(findChild(response, "Response")!, "Status")).toBe("2");
                 expect((await messageRepo.findOne({ where: { uid: message.uid } }))?.folderUid).toBe(inbox.uid);
+            });
+
+            it("MoveItems refuses Outbox and Drafts for a message that isn't a draft, and a move out of Outbox cancels the send with a version-checked write.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const drafts = await createFolderWithAcl(mailbox.uid, { name: "Drafts", type: FolderType.DRAFTS });
+                const outbox = await createFolderWithAcl(mailbox.uid, { name: "Outbox", type: FolderType.OUTBOX });
+                const archive = await createFolderWithAcl(mailbox.uid, { name: "Archive", type: FolderType.USER });
+                const received = await createMessage(mailbox.uid, inbox.uid);
+                const queued = await createMessage(mailbox.uid, outbox.uid, { scheduledSendTime: new Date(Date.now() + 3_600_000) });
+                const move = (message: { uid: string; folderUid: string }, dst: string) =>
+                    element(WbxmlCodePage.Move, "Move", [
+                        textElement(WbxmlCodePage.Move, "SrcMsgId", message.uid),
+                        textElement(WbxmlCodePage.Move, "SrcFldId", message.folderUid),
+                        textElement(WbxmlCodePage.Move, "DstFldId", dst),
+                    ]);
+
+                const refused = await postWbxml("MoveItems", "dev1", element(WbxmlCodePage.Move, "MoveItems", [move(received, drafts.uid), move(received, outbox.uid)]));
+                expect(findChildren(refused, "Response").map((r) => childText(r, "Status"))).toEqual(["2", "2"]);
+                expect((await messageRepo.findOne({ where: { uid: received.uid } }))?.folderUid).toBe(inbox.uid);
+
+                const before: any = await messageRepo.findOne({ where: { uid: queued.uid } });
+                const cancelled = await postWbxml("MoveItems", "dev1", element(WbxmlCodePage.Move, "MoveItems", [move(queued, archive.uid)]));
+                expect(childText(findChild(cancelled, "Response")!, "Status")).toBe("3");
+                const after: any = await messageRepo.findOne({ where: { uid: queued.uid } });
+                expect(after.folderUid).toBe(archive.uid);
+                expect(after.scheduledSendTime ?? null).toBeNull();
+                // The update went through the optimistic lock: version and dateModified moved, so other devices see it.
+                expect(after.version).toBe(before.version + 1);
+                expect(new Date(after.dateModified).getTime()).toBeGreaterThanOrEqual(new Date(before.dateModified).getTime());
+            });
+
+            it("ItemOperations Move never selects another conversation by an operator-shaped ConversationId.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const archive = await createFolderWithAcl(mailbox.uid, { name: "Archive", type: FolderType.USER });
+                const target = await createMessage(mailbox.uid, inbox.uid, { conversationId: "ne(abc)" });
+                const unrelated = await createMessage(mailbox.uid, inbox.uid, { conversationId: "abc-other" });
+
+                const response = await postWbxmlBinary(
+                    "ItemOperations",
+                    "dev1",
+                    element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                        element(WbxmlCodePage.ItemOperations, "Move", [
+                            opaqueElement(WbxmlCodePage.ItemOperations, "ConversationId", Buffer.from("ne(abc)", "utf8")),
+                            textElement(WbxmlCodePage.ItemOperations, "DstFldId", archive.uid),
+                        ]),
+                    ]),
+                );
+
+                expect(childText(findChild(findChild(response, "Response")!, "Move")!, "Status")).toBe("1");
+                expect((await messageRepo.findOne({ where: { uid: target.uid } }))?.folderUid).toBe(archive.uid);
+                expect((await messageRepo.findOne({ where: { uid: unrelated.uid } }))?.folderUid).toBe(inbox.uid);
             });
         });
 

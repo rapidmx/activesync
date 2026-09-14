@@ -5,6 +5,7 @@
 import { ApiError } from "@rapidrest/core";
 import { ApiErrors, type RecoverableBaseEntity, type RepoUtils } from "@rapidrest/service-core";
 import type { DeviceSyncState } from "./models/DeviceSyncState.js";
+import { asEntity } from "./RestapiCompat.js";
 
 /**
  * A position in a `(dateModified, uid)`-ordered change stream. `dateModified` alone is not a total order - several
@@ -15,6 +16,12 @@ import type { DeviceSyncState } from "./models/DeviceSyncState.js";
 export interface ChangeCursor {
     date: Date;
     uid: string;
+}
+
+/** Whether `uid` can be listed in an `in(...)` query operand as itself: no comma (the operand separator), no parentheses
+ * or other punctuation, and not one of the literals the query parser substitutes (`me`, `null`). */
+export function isListableUid(uid: string): boolean {
+    return /^[A-Za-z0-9_.:@+-]+$/.test(uid) && uid !== "me" && uid !== "null";
 }
 
 /** The cursor that precedes every row ever written. */
@@ -130,7 +137,7 @@ export async function persistDeviceSyncState(
         try {
             const updated = await deviceSyncStateRepo.update(
                 { uid: deviceSyncState.uid, version: (deviceSyncState as any).version, ...values } as any,
-                deviceSyncState,
+                asEntity(deviceSyncStateRepo, deviceSyncState),
                 { ignoreACL: true, skipPush: true },
             );
             Object.assign(deviceSyncState, updated);

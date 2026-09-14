@@ -11,18 +11,43 @@ export type LeaseRelease = () => Promise<void>;
 export interface LeaseOptions {
     /** Redis to hold the lease in across server copies (`datastores:cache`); in-process only without it. */
     redisUrl?: string;
-    /** How long a Redis lease lives if its holder never releases it (a crashed server copy). */
+    /** How long a Redis lease lives if its holder never releases it (a crashed server copy). While held, it's renewed
+     * every third of this. */
     ttlMs: number;
     /** How long to wait for a held lease before giving up. */
     waitMs: number;
     /** Delay between Redis acquisition attempts. */
     pollMs?: number;
+    /** Longest a single Redis connect or command may take before the lease fails open (capped by `waitMs`'s deadline). */
+    redisTimeoutMs?: number;
 }
 
 /** Deletes the lease key only while it still carries this holder's token, so an expired-and-retaken lease survives. */
 const RELEASE_SCRIPT = 'if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end';
 
+/** Extends the lease key's expiry only while it still carries this holder's token. */
+const RENEW_SCRIPT = 'if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pexpire", KEYS[1], ARGV[2]) else return 0 end';
+
+/** Default `LeaseOptions.redisTimeoutMs`. */
+const DEFAULT_REDIS_TIMEOUT_MS = 2_000;
+
+/** Reconnect attempts after which a lost Redis connection gives up (and a later lease creates a fresh client). */
+const MAX_RECONNECT_ATTEMPTS = 3;
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Sentinel a timed-out Redis call resolves with. */
+const TIMED_OUT: unique symbol = Symbol("timed out");
+
+/** Resolves with `promise`'s value, or `TIMED_OUT` after `ms` (a rejection still rejects). */
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+        return await Promise.race([promise, new Promise<typeof TIMED_OUT>((resolve) => (timer = setTimeout(() => resolve(TIMED_OUT), Math.max(0, ms))))]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
 
 /**
  * A short exclusive lease on one key - `SyncCommand` holds one per (mailbox, device, folder) for the duration of a
@@ -31,8 +56,15 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  * other's result.
  *
  * Always taken in-process first (a per-key promise chain), then - when a Redis URL is configured - as a `SET NX PX`
- * key shared by every server copy, released with a token check. Redis being unreachable fails open to the
- * in-process lease alone rather than refusing every `Sync`.
+ * key shared by every server copy, released with a token check and renewed (token-checked `PEXPIRE`) every
+ * `ttlMs / 3` while held, so a round that outlasts `ttlMs` doesn't lose it to another copy.
+ *
+ * **Redis being unreachable fails open** to the in-process lease alone rather than refusing - or hanging - every
+ * `Sync`: the client is created with `disableOfflineQueue` (a command fails at once while disconnected instead of
+ * waiting in a queue) and a bounded `reconnectStrategy` (so `connect()` rejects instead of retrying forever), and
+ * every connect/`SET` is additionally raced against `redisTimeoutMs`, capped by the `waitMs` deadline. A `SET` that
+ * times out but lands later is released again straight away. A client whose reconnects gave up is replaced on the
+ * next lease.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -48,22 +80,32 @@ export class EasCollectionLease {
         EasCollectionLease.clients.clear();
     }
 
-    private static getClient(url: string): Promise<RedisClientType> {
+    private static getClient(url: string, connectTimeoutMs: number): Promise<RedisClientType> {
         let pending = EasCollectionLease.clients.get(url);
         if (!pending) {
-            const client = createClient({ url }) as RedisClientType;
-            // An unhandled `error` event would crash the process; the client reconnects on its own.
+            const client = createClient({
+                url,
+                disableOfflineQueue: true,
+                socket: {
+                    connectTimeout: connectTimeoutMs,
+                    reconnectStrategy: (retries: number) =>
+                        retries >= MAX_RECONNECT_ATTEMPTS ? new Error("Redis unreachable") : Math.min(100 * 2 ** retries, 1_000),
+                },
+            }) as RedisClientType;
+            // An unhandled `error` event would crash the process.
             client.on("error", () => undefined);
             const connecting: Promise<RedisClientType> = client.connect().then(() => client);
-            connecting.catch(() => {
-                if (EasCollectionLease.clients.get(url) === connecting) {
-                    EasCollectionLease.clients.delete(url);
-                }
-            });
+            connecting.catch(() => EasCollectionLease.forgetClient(url, connecting));
             EasCollectionLease.clients.set(url, connecting);
             pending = connecting;
         }
         return pending;
+    }
+
+    private static forgetClient(url: string, pending: Promise<RedisClientType>): void {
+        if (EasCollectionLease.clients.get(url) === pending) {
+            EasCollectionLease.clients.delete(url);
+        }
     }
 
     /** Waits for `key`'s in-process holder (if any) to release, up to `deadline`, then takes it over with `held` - the
@@ -103,18 +145,54 @@ export class EasCollectionLease {
             }
             resolveLocal();
         };
+        const failOpen: LeaseRelease = async () => releaseLocal();
 
         if (!options.redisUrl) {
-            return async () => releaseLocal();
+            return failOpen;
         }
 
+        const url: string = options.redisUrl;
+        const redisTimeoutMs: number = options.redisTimeoutMs ?? DEFAULT_REDIS_TIMEOUT_MS;
+        // Never waits past the deadline for Redis; with no time left at all, a call still gets the current tick.
+        const callTimeout = (): number => Math.min(redisTimeoutMs, Math.max(0, deadline - Date.now()));
         const redisKey = `eas:lease:${key}`;
         const token: string = crypto.randomUUID();
+        const releaseRedis = async (client: RedisClientType): Promise<void> => {
+            try {
+                await client.eval(RELEASE_SCRIPT, { keys: [redisKey], arguments: [token] });
+            } catch {
+                // The key expires on its own.
+            }
+        };
+
         let client: RedisClientType;
         try {
-            client = await EasCollectionLease.getClient(options.redisUrl);
+            const pending: Promise<RedisClientType> = EasCollectionLease.getClient(url, redisTimeoutMs);
+            const connected = await withTimeout(pending, callTimeout());
+            if (connected === TIMED_OUT) {
+                return failOpen;
+            }
+            client = connected;
+            if ((client as any).isOpen === false) {
+                // Its reconnects gave up: the next lease starts a fresh client.
+                EasCollectionLease.forgetClient(url, pending);
+                return failOpen;
+            }
+            let answered = false;
             for (;;) {
-                const reply = await client.set(redisKey, token, { condition: "NX", expiration: { type: "PX", value: options.ttlMs } });
+                const setting = client.set(redisKey, token, { condition: "NX", expiration: { type: "PX", value: options.ttlMs } });
+                const reply = await withTimeout(setting, callTimeout());
+                if (reply === TIMED_OUT) {
+                    // Give back the key should the SET still land.
+                    setting.then((late) => (late === "OK" ? releaseRedis(client) : undefined)).catch(() => undefined);
+                    if (answered && Date.now() >= deadline) {
+                        // Redis is up and another copy holds the key - only the wait ran out.
+                        releaseLocal();
+                        return undefined;
+                    }
+                    return failOpen;
+                }
+                answered = true;
                 if (reply === "OK") {
                     break;
                 }
@@ -126,15 +204,20 @@ export class EasCollectionLease {
             }
         } catch {
             // Redis unreachable: fail open to the in-process lease.
-            return async () => releaseLocal();
+            return failOpen;
         }
 
+        const renewal: NodeJS.Timeout = setInterval(
+            () => {
+                client.eval(RENEW_SCRIPT, { keys: [redisKey], arguments: [token, String(options.ttlMs)] }).catch(() => undefined);
+            },
+            Math.max(1, Math.floor(options.ttlMs / 3)),
+        );
+        renewal.unref?.();
+
         return async () => {
-            try {
-                await client.eval(RELEASE_SCRIPT, { keys: [redisKey], arguments: [token] });
-            } catch {
-                // The key expires on its own.
-            }
+            clearInterval(renewal);
+            await releaseRedis(client);
             releaseLocal();
         };
     }

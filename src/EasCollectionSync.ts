@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import type { RecoverableBaseEntity, RepoUtils } from "@rapidrest/service-core";
 import { FolderType } from "@rapidmx/restapi";
-import { type ChangeCursor, compareCursor, cursorOf, parseSyncKey, scanAfter, scanOverlap } from "./EasSyncKeyUtils.js";
+import { type ChangeCursor, compareCursor, cursorOf, isListableUid, parseSyncKey, scanAfter, scanOverlap } from "./EasSyncKeyUtils.js";
 import type { EasCollectionRound, EasCollectionState } from "./models/EasCollectionState.js";
 
 /** How far before a round's start the out-of-folder cursor is fast-forwarded while the device holds nothing -
@@ -296,11 +296,23 @@ async function reconcile<T extends RecoverableBaseEntity>(
         state.reconcileCursor = "";
         return false;
     }
-    const found: T[] = await options.repo.find({ folderUid: options.folderUid, uid: `in(${slice.join(",")})`, limit: slice.length } as any, {
-        ignoreACL: true,
-        limit: slice.length,
-    });
-    const present = new Set(found.map((row) => row.uid));
+    // Only plain uids go into the `in(...)` operand, which the query parser splits on commas and coerces per value (`me`
+    // is the caller, `null` is null); any other held id is checked on its own by exact uid.
+    const listable: string[] = slice.filter(isListableUid);
+    const found: T[] =
+        listable.length === 0
+            ? []
+            : await options.repo.find({ folderUid: options.folderUid, uid: `in(${listable.join(",")})`, limit: listable.length } as any, {
+                  ignoreACL: true,
+                  limit: listable.length,
+              });
+    const present = new Set(found.filter((row: any) => row.folderUid === options.folderUid).map((row) => row.uid));
+    for (const uid of slice.filter((id) => !isListableUid(id))) {
+        const row: any = await options.repo.findOne(uid, { ignoreACL: true });
+        if (row && row.uid === uid && row.folderUid === options.folderUid) {
+            present.add(uid);
+        }
+    }
     for (const uid of slice) {
         if (!present.has(uid)) {
             if (budget === 0) {

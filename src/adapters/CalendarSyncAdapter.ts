@@ -7,6 +7,7 @@ import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import { fromCompactDateTime, toCompactDateTime } from "../CompactDateTime.js";
 import type { EasCollectionSyncAdapter } from "./EasCollectionSyncAdapter.js";
+import { boundIndexedValue } from "../RestapiCompat.js";
 import {
     AttendeeResponseStatus,
     AttendeeRole,
@@ -266,7 +267,7 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
      * MAPI's identical `RopSaveChangesMessageHandler` pattern (`${crypto.randomUUID()}@mapi`), `@eas` suffix
      * instead. */
     public newEntityDefaults(): Partial<CalendarEvent> {
-        return { icalUid: `${crypto.randomUUID()}@eas`, sequence: 0 };
+        return { icalUid: boundIndexedValue(`${crypto.randomUUID()}@eas`), sequence: 0 };
     }
 
     private attendeeFromElement(el: WbxmlElement, existingAttendees: Attendee[] = []): Attendee {

@@ -8,6 +8,8 @@ import { ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, opaqueElement, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCollectionSyncAdapter } from "./EasCollectionSyncAdapter.js";
+import { isGenuineDraft } from "../MessageMoveRules.js";
+import { boundIndexedValue } from "../RestapiCompat.js";
 import {
     type BlobStore,
     type Folder,
@@ -300,10 +302,12 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
         return partial;
     }
 
-    /** Whether `message` currently lives in its mailbox's Drafts folder. */
+    /** Whether `message` is a genuine draft (`MessageMoveRules.isGenuineDraft`): in its mailbox's Drafts folder, and
+     * never delivered. Moving any other message into Drafts is refused over ActiveSync, so its body can't be rewritten
+     * here by first moving it there. */
     private async isDraft(message: Message): Promise<boolean> {
         const folder: Folder | undefined = await this.folderRepo!.findOne(message.folderUid, { ignoreACL: true });
-        return folder?.type === FolderType.DRAFTS;
+        return isGenuineDraft(message, folder?.type);
     }
 
     /** Defaults for a brand-new Draft created via a client-originated `Add` - `from` is the caller's own
@@ -312,7 +316,7 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
      * it's reused here as a harmless placeholder). */
     public newEntityDefaults(mailbox: Mailbox): Partial<Message> {
         return {
-            messageId: `<${crypto.randomUUID()}@eas>`,
+            messageId: boundIndexedValue(`<${crypto.randomUUID()}@eas>`),
             subject: "",
             from: { address: mailbox.primarySmtpAddress, displayName: mailbox.displayName, type: RecipientType.TO },
             recipients: [],

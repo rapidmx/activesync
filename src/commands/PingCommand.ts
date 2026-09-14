@@ -9,7 +9,7 @@ import { RecoverableRepoUtils } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
-import { scanAfter } from "../EasSyncKeyUtils.js";
+import { compareCursor, cursorOf, isListableUid, scanAfter } from "../EasSyncKeyUtils.js";
 import type { EasCollectionState } from "../models/EasCollectionState.js";
 const { Config, Init, Inject } = ObjectDecorators;
 
@@ -21,12 +21,21 @@ const STATUS_CHANGES_FOUND = "2";
 const STATUS_MISSING_PARAMETERS = "3";
 const STATUS_TOO_MANY_FOLDERS = "6";
 
-/** How many `ACLUtils.hasPermission()` checks (and pending-change lookups) run concurrently. */
+/** How many `ACLUtils.hasPermission()` checks run concurrently. */
 const ACL_CHECK_CHUNK_SIZE = 25;
 
 /** Rows read per folder when looking for changes a device hasn't synced yet - enough to see past a few of the
  * device's own writes (`echoes`); a full page is reported as a change regardless. */
 const PENDING_CHANGE_SCAN_LIMIT = 5;
+
+/** Folder uids per batched `EasCollectionState` lookup, and folders per batched pending-change check. */
+const STATE_LOOKUP_CHUNK = 500;
+
+/** Rows per stream (live, soft-deleted) one batched pending-change check reads before falling back to per-folder scans. */
+const PENDING_BATCH_ROW_LIMIT = 500;
+
+/** The `(dateModified, uid)` stream order, as `scanAfter()` reads it. */
+const PENDING_BATCH_SORT = JSON.stringify({ dateModified: "ASC", uid: "ASC" });
 
 /** Binds one MS-ASCMD `Class` value to the entity class whose rows a `Ping` checks for pending changes. */
 export interface PingCollectionBinding {
@@ -192,32 +201,120 @@ export class PingCommand implements EasCommandHandler {
         return result;
     }
 
-    /** The subset of `folderUids` whose change stream has a row the device hasn't synced yet (after its collection's
-     * recorded cursor, other than the device's own writes). A failed lookup counts as "no pending change". */
+    /**
+     * The subset of `folderUids` whose change stream has a row the device hasn't synced yet (after its collection's
+     * recorded cursor, other than the device's own writes). A failed lookup counts as "no pending change".
+     *
+     * Batched, so a `Ping` watching hundreds of folders costs a handful of queries rather than three per folder: every
+     * folder's `EasCollectionState` is read in one `in(...)` query per `STATE_LOOKUP_CHUNK`, and each collection class's
+     * folders are checked together (`pendingInClass()`); only a folder that batch can't decide is scanned on its own.
+     */
     private async pendingChanges(ctx: EasCommandContext, folderUids: string[]): Promise<string[]> {
         if (!this.collectionStateRepo) {
             return [];
         }
-        const changed: string[] = [];
-        for (let i = 0; i < folderUids.length; i += ACL_CHECK_CHUNK_SIZE) {
-            const chunk = folderUids.slice(i, i + ACL_CHECK_CHUNK_SIZE);
-            const results = await Promise.all(chunk.map((folderUid) => this.hasPendingChange(ctx, folderUid).catch(() => false)));
-            changed.push(...chunk.filter((_uid, j) => results[j]));
+        let states: Map<string, EasCollectionState>;
+        try {
+            states = await this.loadStates(ctx, folderUids);
+        } catch {
+            return [];
         }
-        return changed;
+        const byClass = new Map<string, EasCollectionState[]>();
+        for (const folderUid of folderUids) {
+            const state: EasCollectionState | undefined = states.get(folderUid);
+            if (state && this.repos.has(state.collectionClass)) {
+                byClass.set(state.collectionClass, [...(byClass.get(state.collectionClass) ?? []), state]);
+            }
+        }
+        const changed = new Set<string>();
+        for (const [collectionClass, classStates] of byClass) {
+            for (let i = 0; i < classStates.length; i += STATE_LOOKUP_CHUNK) {
+                const found: string[] = await this.pendingInClass(this.repos.get(collectionClass)!, classStates.slice(i, i + STATE_LOOKUP_CHUNK)).catch(
+                    () => [],
+                );
+                found.forEach((uid) => changed.add(uid));
+            }
+        }
+        return folderUids.filter((uid) => changed.has(uid));
     }
 
-    private async hasPendingChange(ctx: EasCommandContext, folderUid: string): Promise<boolean> {
-        const state: EasCollectionState | undefined = (
-            await this.collectionStateRepo!.find({ mailboxUid: ctx.mailboxUid, deviceId: ctx.deviceId, folderUid } as any, { ignoreACL: true, limit: 1 })
-        )[0];
-        const repo = state ? this.repos.get(state.collectionClass) : undefined;
-        if (!state || !repo) {
-            return false;
+    /** Every requested folder's collection state for this device, keyed by folder uid - one query per chunk of plain
+     * folder uids (exact-matched in memory), and one query per folder uid that can't be listed in `in(...)`. */
+    private async loadStates(ctx: EasCommandContext, folderUids: string[]): Promise<Map<string, EasCollectionState>> {
+        const wanted = new Set(folderUids);
+        const states = new Map<string, EasCollectionState>();
+        const keep = (rows: EasCollectionState[]): void => {
+            for (const row of rows) {
+                if (wanted.has(row.folderUid) && row.mailboxUid === ctx.mailboxUid && row.deviceId === ctx.deviceId && !states.has(row.folderUid)) {
+                    states.set(row.folderUid, row);
+                }
+            }
+        };
+        const listable: string[] = folderUids.filter(isListableUid);
+        for (let i = 0; i < listable.length; i += STATE_LOOKUP_CHUNK) {
+            const chunk: string[] = listable.slice(i, i + STATE_LOOKUP_CHUNK);
+            const limit: number = Math.min(chunk.length * 2, 1000);
+            keep(
+                await this.collectionStateRepo!.find(
+                    { mailboxUid: ctx.mailboxUid, deviceId: ctx.deviceId, folderUid: `in(${chunk.join(",")})`, limit } as any,
+                    { ignoreACL: true, limit },
+                ),
+            );
         }
-        const { rows, more } = await scanAfter<any>(repo, { folderUid }, { date: new Date(state.cursorDate), uid: state.cursorUid }, PENDING_CHANGE_SCAN_LIMIT);
-        const echoes: Record<string, string> = state.echoes ?? {};
-        return more || rows.some((row) => echoes[row.uid] !== new Date(row.dateModified).toISOString());
+        for (const folderUid of folderUids.filter((uid) => !isListableUid(uid))) {
+            keep(await this.collectionStateRepo!.find({ mailboxUid: ctx.mailboxUid, deviceId: ctx.deviceId, folderUid } as any, { ignoreACL: true, limit: 1 }));
+        }
+        return states;
+    }
+
+    /**
+     * The folders among `states` (all of one collection class, stored in `repo`) with a pending change. One pair of
+     * queries (live and soft-deleted rows) reads, across all of them, the rows at or after the earliest cursor, in
+     * stream order, up to `PENDING_BATCH_ROW_LIMIT`. When neither page is full, that is every row that could be pending
+     * for any of the folders, so each folder is decided exactly in memory - the same rule as a per-folder `scanAfter()`.
+     * When a page is full, a folder with a pending row among the rows read is still pending; any other folder is scanned
+     * on its own, as before. A folder uid that can't be listed in `in(...)` is always scanned on its own.
+     */
+    private async pendingInClass(repo: RepoUtils<any>, states: EasCollectionState[]): Promise<string[]> {
+        const cursorFor = (state: EasCollectionState) => ({ date: new Date(state.cursorDate), uid: state.cursorUid });
+        const isPending = (state: EasCollectionState, rows: any[], complete: boolean): boolean | undefined => {
+            const echoes: Record<string, string> = state.echoes ?? {};
+            const after: any[] = rows.filter((row) => row.folderUid === state.folderUid && compareCursor(cursorOf(row), cursorFor(state)) > 0);
+            if (after.length > PENDING_CHANGE_SCAN_LIMIT || after.some((row) => echoes[row.uid] !== new Date(row.dateModified).toISOString())) {
+                return true;
+            }
+            return complete ? false : undefined;
+        };
+
+        const listed: EasCollectionState[] = states.filter((state) => isListableUid(state.folderUid));
+        let rows: any[] = [];
+        let complete = false;
+        if (listed.length > 0) {
+            const earliest: Date = new Date(Math.min(...listed.map((state) => new Date(state.cursorDate).getTime())));
+            const query: any = {
+                folderUid: `in(${listed.map((state) => state.folderUid).join(",")})`,
+                dateModified: `gte(${earliest.toISOString()})`,
+                sort: PENDING_BATCH_SORT,
+                limit: PENDING_BATCH_ROW_LIMIT + 1,
+            };
+            const options: any = { ignoreACL: true, limit: PENDING_BATCH_ROW_LIMIT + 1 };
+            const [live, deleted] = await Promise.all([repo.find(query, options), repo.find({ ...query, deleted: true }, options)]);
+            rows = [...live, ...deleted];
+            complete = live.length <= PENDING_BATCH_ROW_LIMIT && deleted.length <= PENDING_BATCH_ROW_LIMIT;
+        }
+
+        const changed: string[] = [];
+        for (const state of states) {
+            let pending: boolean | undefined = isListableUid(state.folderUid) ? isPending(state, rows, complete) : undefined;
+            if (pending === undefined) {
+                const scanned = await scanAfter<any>(repo, { folderUid: state.folderUid }, cursorFor(state), PENDING_CHANGE_SCAN_LIMIT);
+                pending = isPending(state, scanned.rows, true) || scanned.more;
+            }
+            if (pending) {
+                changed.push(state.folderUid);
+            }
+        }
+        return changed;
     }
 
     /** Returns the process-wide subscriber client for `url`, connecting it on first use. A failed connect is

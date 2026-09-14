@@ -115,6 +115,22 @@ describe("BaseEasRoute Tests (guard clauses only)", () => {
         expect((route as any).mailboxRepo.find).not.toHaveBeenCalled();
     });
 
+    it("dispatch() rejects a DeviceId the query parser could read as an operator or a list, before any lookup.", async () => {
+        const { route, handle } = provisionedRoute();
+
+        for (const deviceId of ["ne(dev1)", "a,b", "has space", "x".repeat(129), ""]) {
+            await expect(route.dispatch({ query: { Cmd: "NoOp", DeviceId: deviceId }, headers: {} } as any, makeRes(), { uid: "user-1" } as any)).rejects.toMatchObject({
+                status: 400,
+            });
+        }
+        expect(handle).not.toHaveBeenCalled();
+        expect((route as any).deviceSyncStateRepo.find).not.toHaveBeenCalled();
+
+        const tolerant = makeRes();
+        await route.dispatch({ query: { Cmd: "NoOp", DeviceId: "Appl-F4_1.x:y", PolicyKey: "pk-1" }, headers: {} } as any, tolerant, { uid: "user-1" } as any);
+        expect(tolerant.status).toHaveBeenCalledWith(200);
+    });
+
     it("dispatch() answers 449 when a provisioned device presents a missing or stale policy key, accepting the PolicyKey query value too.", async () => {
         const { route, handle } = provisionedRoute();
 

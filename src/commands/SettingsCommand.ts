@@ -8,6 +8,7 @@ import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 import type { Mailbox } from "@rapidmx/restapi";
+import { asEntity } from "../RestapiCompat.js";
 const { Init } = ObjectDecorators;
 
 /**
@@ -145,7 +146,7 @@ export abstract class SettingsCommand implements EasCommandHandler {
                 oofStartTime: timed ? new Date(startTime) : null,
                 oofEndTime: timed ? new Date(endTime) : null,
             } as any,
-            mailbox,
+            asEntity(this.mailboxRepo!, mailbox),
             { ignoreACL: true, user: ctx.user },
         );
 

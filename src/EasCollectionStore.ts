@@ -5,6 +5,7 @@
 import type { RepoUtils } from "@rapidrest/service-core";
 import type { EasCollectionChunk } from "./models/EasCollectionChunk.js";
 import type { EasCollectionState } from "./models/EasCollectionState.js";
+import { asEntity } from "./RestapiCompat.js";
 
 /** Largest held set kept inline on the `EasCollectionState` row (`serverIds`) - past it the set moves to chunk rows. */
 export const INLINE_HELD_LIMIT = 2000;
@@ -125,7 +126,7 @@ export async function saveHeldSet(
         if (chunkIds.length === 0) {
             await store.repo.delete(chunk.uid, { ignoreACL: true, purge: true, skipPush: true });
         } else {
-            await store.repo.update({ uid: chunk.uid, version: chunk.version, ids: chunkIds } as any, chunk, {
+            await store.repo.update({ uid: chunk.uid, version: chunk.version, ids: chunkIds } as any, asEntity(store.repo, chunk), {
                 ignoreACL: true,
                 skipPush: true,
             });

@@ -216,6 +216,8 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
             new EasCollectionStateSQL({ mailboxUid: stale.mailboxUid, deviceId: stale.deviceId, folderUid: "f4", collectionClass: "Email", syncKey: "1:x", chunked: true }) as any,
         );
         await collectionChunkRepo.save(new EasCollectionChunkSQL({ mailboxUid: stale.mailboxUid, deviceId: stale.deviceId, folderUid: "f4", chunkIndex: 0, ids: ["a"] }) as any);
+        // Orphaned by a failed inline-to-chunked conversion: the row (f1) still says it isn't chunked.
+        await collectionChunkRepo.save(new EasCollectionChunkSQL({ mailboxUid: stale.mailboxUid, deviceId: stale.deviceId, folderUid: "f1", chunkIndex: 0, ids: ["b"] }) as any);
         await collectionChunkRepo.save(new EasCollectionChunkSQL({ mailboxUid: recent.mailboxUid, deviceId: recent.deviceId, folderUid: "f4", chunkIndex: 0, ids: ["a"] }) as any);
 
         await job.run();

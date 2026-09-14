@@ -5,11 +5,13 @@
 import { simpleParser } from "mailparser";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
-import { BlobStore, RecoverableRepoUtils, type Attachment, type Folder, type Message } from "@rapidmx/restapi";
+import { BlobStore, RecoverableRepoUtils, type Attachment, type Folder, type FolderType, type Message } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, opaqueElement, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import { decodeConversationId } from "../adapters/EmailSyncAdapter.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
+import { type MessageMovePlan, planMessageMove } from "../MessageMoveRules.js";
+import { asEntity, boundIndexedValue } from "../RestapiCompat.js";
 const { Config, Init, Inject } = ObjectDecorators;
 
 /** Caps how many messages `emptyFolderContents`/`moveConversation` process per backing `find()`/delete-batch
@@ -67,7 +69,10 @@ function truncateUtf8(text: string, maxBytes: number): string {
  * `MoveItems` command's per-message `SrcFldId`/`SrcMsgId`/`DstFldId` shape. Every `Message` sharing the
  * decoded `conversationId` across the whole mailbox (not just one folder) that the caller has `UPDATE` on is
  * relocated to `DstFldId`; one lacking permission is silently skipped rather than failing the whole move (a
- * conversation can legitimately span folders the caller doesn't control, e.g. a shared mailbox's Inbox). An
+ * conversation can legitimately span folders the caller doesn't control, e.g. a shared mailbox's Inbox). The
+ * `ConversationId` is looked up bounded and exact-matched in memory (it derives from sender-controlled headers), and
+ * each message's move follows `MessageMoveRules.planMessageMove` (never into Outbox, into Drafts only for drafts, out of
+ * Outbox cancels the scheduled send) - a refused message counts as failed. An
  * optional `MoveAlways` (a hint to keep auto-moving future messages in this conversation) is accepted but not
  * acted on - this library's `MailFilterRule` has no conversation-scoped condition to key an ongoing rule off
  * of, a documented simplification, not silent data loss (the move itself still happens).
@@ -279,8 +284,8 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         // Reuses AirSync's own `CollectionId` (the same tag `Sync`/`Fetch` responses already reference a
         // folder by) rather than a page-specific tag - `WbxmlCodePage.ItemOperations` has no `FolderId` token
         // of its own at all, confirmed against its own tag table.
-        const folderUid = childText(emptyEl, "CollectionId");
-        if (!folderUid) {
+        const requestedFolderUid = childText(emptyEl, "CollectionId");
+        if (!requestedFolderUid) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "EmptyFolderContents requires a CollectionId.");
         }
         const optionsEl = findChild(emptyEl, "Options");
@@ -288,9 +293,16 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
             // Documented gap, not silently ignored - see this class's own doc comment.
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "DeleteSubFolders is not supported.");
         }
-        if (!(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.DELETE))) {
+        if (!(await this.aclUtils!.hasPermission(ctx.user, requestedFolderUid, ACLAction.DELETE))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
+        // The batch query below uses the stored folder's own uid, never the client's string, which a query parser
+        // could otherwise read as an operator (`ne(x)`) and match every other folder's messages with.
+        const folder: Folder | undefined = await this.folderRepo!.findOne(requestedFolderUid, { ignoreACL: true });
+        if (!folder) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        const folderUid: string = (folder as any).uid;
 
         // Processed in bounded batches rather than one unbounded `find()` - a folder with a very large number
         // of messages would otherwise force the whole set into memory at once. Deletes within a batch still run
@@ -355,13 +367,18 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
             return this.moveResponse("3");
         }
 
-        const conversationId = decodeConversationId(conversationIdEl.opaque);
+        // The ConversationId is the device's echo of `Message.conversationId`, which comes from sender-controlled
+        // `References`/`In-Reply-To` headers: looked up bounded (as restapi stores it) and exact-matched in memory, so a
+        // value shaped like a query operator (`ne(x)`) can never select other conversations' messages.
+        const conversationId: string = boundIndexedValue(decodeConversationId(conversationIdEl.opaque));
         // Capped rather than an unbounded `find()` - an unusually long-running thread could otherwise return an
         // unbounded number of rows for one request.
-        const messages: Message[] = await this.messageRepo!.find(
-            { mailboxUid: ctx.mailboxUid, conversationId, limit: this.batchSize } as any,
-            { ignoreACL: true, limit: this.batchSize },
-        );
+        const messages: Message[] = (
+            await this.messageRepo!.find({ mailboxUid: ctx.mailboxUid, conversationId, limit: this.batchSize } as any, {
+                ignoreACL: true,
+                limit: this.batchSize,
+            })
+        ).filter((message: Message) => message.conversationId === conversationId && message.mailboxUid === ctx.mailboxUid);
         if (messages.length === 0) {
             return this.moveResponse("3");
         }
@@ -372,17 +389,27 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         // transaction within a transaction" (confirmed against real SQL test failures, not theoretical) -
         // updates run sequentially in a plain loop instead.
         const permitted = await Promise.all(messages.map((message) => this.aclUtils!.hasPermission(ctx.user, message.folderUid, ACLAction.UPDATE)));
+        const folderTypes = new Map<string, FolderType | undefined>();
         let moved = 0;
         let failed = 0;
         for (let i = 0; i < messages.length; i++) {
+            const message = messages[i];
             if (!permitted[i]) {
                 continue;
             }
-            const message = messages[i];
+            if (!folderTypes.has(message.folderUid)) {
+                folderTypes.set(message.folderUid, ((await this.folderRepo!.findOne(message.folderUid, { ignoreACL: true })) as Folder | undefined)?.type);
+            }
+            // Outbox, or Drafts for a message that isn't a draft, is refused per message - see `planMessageMove()`.
+            const plan: MessageMovePlan = planMessageMove(message, folderTypes.get(message.folderUid), destFolder.type);
+            if (!plan.allowed) {
+                failed++;
+                continue;
+            }
             try {
                 await this.messageRepo!.update(
-                    { uid: (message as any).uid, version: (message as any).version, folderUid: dstFldId } as any,
-                    message,
+                    { uid: (message as any).uid, version: (message as any).version, folderUid: dstFldId, ...plan.patch } as any,
+                    asEntity(this.messageRepo!, message),
                     { ignoreACL: true, user: ctx.user },
                 );
                 moved++;
