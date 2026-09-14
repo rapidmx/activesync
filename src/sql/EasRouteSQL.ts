@@ -7,7 +7,7 @@ import { RouteDecorators } from "@rapidrest/service-core";
 import { DeviceSyncStateSQL } from "../models/sql/DeviceSyncStateSQL.js";
 import { BaseEasRoute } from "../BaseEasRoute.js";
 import { ProvisionCommand } from "../commands/ProvisionCommand.js";
-import { PingCommand } from "../commands/PingCommand.js";
+import { PingCommandSQL } from "../commands/sql/PingCommandSQL.js";
 import { FolderSyncCommandSQL } from "../commands/sql/FolderSyncCommandSQL.js";
 import { SyncCommandSQL } from "../commands/sql/SyncCommandSQL.js";
 import { SendMailCommandSQL } from "../commands/sql/SendMailCommandSQL.js";
@@ -43,7 +43,7 @@ export class EasRouteSQL extends BaseEasRoute<DeviceSyncStateSQL, MailboxSQL> {
         SearchCommandSQL,
         MeetingResponseCommandSQL,
         SettingsCommandSQL,
-        PingCommand,
+        PingCommandSQL,
         GetItemEstimateCommandSQL,
         MoveItemsCommandSQL,
         ResolveRecipientsCommandSQL,

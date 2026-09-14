@@ -12,7 +12,7 @@ import config from "../config.js";
 import { ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { SendMailCommandMongo } from "../../src/commands/mongo/SendMailCommandMongo.js";
-import { stripHeader } from "../../src/commands/ComposeMailCommand.js";
+import { countHeader, stripHeader } from "../../src/commands/ComposeMailCommand.js";
 import { element, opaqueElement } from "../../src/codec/WbxmlElement.js";
 import { WbxmlCodePage } from "../../src/codec/WbxmlCodePages.js";
 import type { EasCommandContext } from "../../src/EasCommandHandler.js";
@@ -56,6 +56,34 @@ describe("ComposeMailCommand Tests (guard clauses only)", () => {
 
         await expect((command as any).handle({ mailboxUid: "gone", request })).rejects.toThrow(/no resource could be found/i);
         expect(send).not.toHaveBeenCalled();
+    });
+
+    it("handle() refuses a message with more than one From or Sender header with 403, before relaying anything.", async () => {
+        const send = vi.fn();
+        const mailboxRepo = { findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "me@example.com", aliasAddresses: [] }) };
+        for (const headers of [
+            ["From: me@example.com", "from : ceo@example.com"],
+            ["From: me@example.com", "Sender: me@example.com", "SENDER:ceo@example.com"],
+        ]) {
+            const command = objectFactory.newInstance<SendMailCommandMongo>(SendMailCommandMongo, { initialize: false });
+            Object.assign(command as any, { folderRepo: {}, messageRepo: {}, mailboxRepo, blobStore: {}, mailTransport: { send }, scanPipeline: {} });
+            const mime = Buffer.from([...headers, "To: you@example.com", "Subject: Hi", "", "Body"].join("\r\n"));
+            const request = element(WbxmlCodePage.ComposeMail, "SendMail", [opaqueElement(WbxmlCodePage.ComposeMail, "MIME", mime)]);
+
+            await expect((command as any).handle({ mailboxUid: "mbx", request })).rejects.toMatchObject({ status: 403 });
+        }
+        expect(send).not.toHaveBeenCalled();
+    });
+
+    describe("countHeader", () => {
+        it("Counts header fields case-insensitively, allowing whitespace before the colon, ignoring folded lines, look-alike names and the body.", () => {
+            const raw = Buffer.from(
+                ["From: a@example.com", " From: folded continuation", "From-Address: x", "FROM\t: b@example.com", "Subject: hi", "", "From: in the body"].join("\r\n"),
+            );
+            expect(countHeader(raw, "From")).toBe(2);
+            expect(countHeader(raw, "sender")).toBe(0);
+            expect(countHeader(Buffer.from("From: a\nFrom: b"), "from")).toBe(2);
+        });
     });
 
     describe("stripHeader", () => {

@@ -12,4 +12,5 @@ export { EasRouteSQL } from "./sql/EasRouteSQL.js";
 export { DeviceSyncStateRouteSQL } from "./sql/DeviceSyncStateRouteSQL.js";
 export { DeviceSyncStateSQL } from "./models/sql/DeviceSyncStateSQL.js";
 export { EasCollectionStateSQL } from "./models/sql/EasCollectionStateSQL.js";
+export { EasCollectionChunkSQL } from "./models/sql/EasCollectionChunkSQL.js";
 export { EasDeviceStateCleanupJobSQL } from "./jobs/sql/EasDeviceStateCleanupJobSQL.js";

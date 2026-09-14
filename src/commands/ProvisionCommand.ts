@@ -12,6 +12,9 @@ const { Config } = ObjectDecorators;
 
 const DEFAULT_POLICY_TYPE = "MS-EAS-Provisioning-WBXML";
 
+/** [MS-ASCMD] common status 129 (DeviceIsBlockedForThisUser). */
+const STATUS_DEVICE_BLOCKED = "129";
+
 /**
  * Handles the two-request EAS `Provision` handshake (MS-ASPROV) every client must complete before any other
  * command is honored (see `BaseEasRoute`'s provisioning gate), plus the three-step `RemoteWipe` sub-flow that
@@ -38,10 +41,12 @@ const DEFAULT_POLICY_TYPE = "MS-EAS-Provisioning-WBXML";
  * `X-MS-PolicyKey` doesn't match the stored key, so a device can't keep syncing on its old key.
  * - **RemoteWipe acknowledgement**: after wiping itself, a device sends a bare `<Provision><RemoteWipe>
  * <Status>1</Status></RemoteWipe></Provision>` (no `Policies`). Detected first, ahead of the normal
- * issue/acknowledge branching, and ignored (Status 2) unless a wipe is actually pending. Clears `remoteWipeRequested` and stamps `remoteWipeAcknowledgedAt` for audit,
- * but deliberately leaves `provisioned` untouched (`false`, from when the wipe was requested) - the device
- * must complete a genuine fresh Provision handshake to re-add the account, it does not fall straight back into
- * "provisioned". `remoteWipeAccountOnly` is recorded for admin audit only; the wire directive sent to the
+ * issue/acknowledge branching, and ignored (Status 2) unless a wipe is actually pending. Clears `remoteWipeRequested`,
+ * stamps `remoteWipeAcknowledgedAt` for audit and sets `blocked`, leaving `provisioned` `false`.
+ * - **A blocked device** (one that acknowledged a wipe) is refused every Provision request with Status 129
+ * (DeviceIsBlockedForThisUser) - and `BaseEasRoute` refuses its other commands - until an administrator clears the
+ * flag (`BaseDeviceSyncStateRoute.unblock`). Otherwise a device (or whoever holds it) could acknowledge the wipe
+ * without wiping anything and simply provision again. `remoteWipeAccountOnly` is recorded for admin audit only; the wire directive sent to the
  * device is identical either way (a real "wipe just this account's data" vs. "wipe the whole device"
  * distinction would require an MDM-capable client extension this library doesn't implement).
  *
@@ -66,6 +71,9 @@ export class ProvisionCommand implements EasCommandHandler {
     private allowSimplePassword: boolean = false;
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
+        if (ctx.deviceSyncState.blocked) {
+            return element(WbxmlCodePage.Provision, "Provision", [textElement(WbxmlCodePage.Provision, "Status", STATUS_DEVICE_BLOCKED)]);
+        }
         if (ctx.request && findChild(ctx.request, "RemoteWipe")) {
             return await this.acknowledgeRemoteWipe(ctx);
         }
@@ -160,8 +168,8 @@ export class ProvisionCommand implements EasCommandHandler {
         ]);
     }
 
-    /** The device has wiped itself and is acknowledging - clear the pending flag but leave `provisioned`
-     * alone (still `false`, from when the wipe was requested) so a genuine re-provision is required. */
+    /** The device has wiped itself and is acknowledging - clear the pending flag and block the device until an
+     * administrator unblocks it; `provisioned` stays `false` (from when the wipe was requested). */
     private async acknowledgeRemoteWipe(ctx: EasCommandContext): Promise<WbxmlElement> {
         // Only a wipe that was actually requested can be acknowledged; an unsolicited acknowledgement changes nothing.
         if (!ctx.deviceSyncState.remoteWipeRequested) {
@@ -170,6 +178,7 @@ export class ProvisionCommand implements EasCommandHandler {
         await persistDeviceSyncState(ctx.deviceSyncState, ctx.deviceSyncStateRepo, {
             remoteWipeRequested: false,
             remoteWipeAcknowledgedAt: new Date(),
+            blocked: true,
         });
         return element(WbxmlCodePage.Provision, "Provision", [textElement(WbxmlCodePage.Provision, "Status", "1")]);
     }

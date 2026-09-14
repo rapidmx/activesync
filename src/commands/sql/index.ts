@@ -11,3 +11,4 @@ export * from "./ItemOperationsCommandSQL.js";
 export * from "./SearchCommandSQL.js";
 export * from "./MeetingResponseCommandSQL.js";
 export * from "./SettingsCommandSQL.js";
+export * from "./PingCommandSQL.js";

@@ -176,6 +176,37 @@ export async function scanAfter<T extends RecoverableBaseEntity>(
     return { rows: merged.slice(0, limit), more: merged.length > limit };
 }
 
+/** The JSON sort expression for the newest-first `(dateModified, uid)` ordering `scanOverlap` reads with. */
+const CURSOR_SORT_DESC = JSON.stringify({ dateModified: "DESC", uid: "DESC" });
+
+/**
+ * Reads the rows matching `criteria` at or before `cursor` whose `dateModified` lies within `windowMs` of it - the
+ * part of the stream a cursor has already passed but where a row committed out of order (another replica stamped
+ * `dateModified` before this one read past it, but committed after) can still appear. At most `limit` rows, the
+ * newest ones, returned in ascending `(dateModified, uid)` order; live and soft-deleted rows merged as `scanAfter`
+ * does. Returns nothing for the epoch cursor (nothing has been passed yet).
+ */
+export async function scanOverlap<T extends RecoverableBaseEntity>(
+    repo: RepoUtils<T>,
+    criteria: Record<string, unknown>,
+    cursor: ChangeCursor,
+    windowMs: number,
+    limit: number,
+): Promise<T[]> {
+    if (cursor.date.getTime() === 0 || windowMs <= 0 || limit <= 0) {
+        return [];
+    }
+    const from = new Date(Math.max(0, cursor.date.getTime() - windowMs)).toISOString();
+    const query: any = { ...criteria, dateModified: `range(${from},${cursor.date.toISOString()})`, sort: CURSOR_SORT_DESC, limit };
+    const options: any = { ignoreACL: true, limit };
+    const [live, deleted] = await Promise.all([repo.find(query, options), repo.find({ ...query, deleted: true }, options)]);
+    return [...live, ...deleted]
+        .filter((row: any) => compareCursor(cursorOf(row), cursor) <= 0)
+        .sort((a: any, b: any) => compareCursor(cursorOf(b), cursorOf(a)))
+        .slice(0, limit)
+        .reverse();
+}
+
 /** One page of enumerated changes for a `RecoverableBaseEntity` collection scoped by a single field. */
 export interface ChangeSet<T extends RecoverableBaseEntity> {
     adds: T[];

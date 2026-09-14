@@ -50,10 +50,21 @@ export interface EasCollectionSyncAdapter<T extends RecoverableBaseEntity> {
      * @param existing The item being changed, for a `Change` command; `undefined` for `Add`. Adapters that
      * need to know the item's current field values to correctly interpret a partial update - `EmailSyncAdapter`
      * uses this to refuse a `Body` change on anything but a Draft, and to carry over unchanged MIME headers.
-     * @param mailbox The caller's own mailbox - `CalendarSyncAdapter` uses it so a device can never make someone
-     * else the organizer of an event it creates.
+     * @param mailbox For an `Add`, the caller's own mailbox - `CalendarSyncAdapter` uses it so a device can never
+     * make someone else the organizer of an event it creates. For a `Change`, the mailbox that owns the item (the
+     * synced folder's mailbox) - `CalendarSyncAdapter` uses it to tell the organizer's copy of a meeting from an
+     * attendee's copy.
      */
     fromApplicationData?(el: WbxmlElement, existing?: T, mailbox?: Mailbox): Partial<T> | Promise<Partial<T>>;
+
+    /**
+     * Fields to stamp on an item just before a client-originated `Delete` removes it, or `undefined` for none.
+     * `CalendarSyncAdapter` marks an attendee's copy of a meeting as already cancelled, so deleting your own copy
+     * never makes restapi's `MeetingSchedulingJob` mail a cancellation to everyone on the organizer's behalf.
+     *
+     * @param mailbox The mailbox that owns the item.
+     */
+    beforeDelete?(existing: T, mailbox: Mailbox): Partial<T> | undefined;
 
     /**
      * Supplies default field values for a brand-new entity created via a client-originated `Add`, applied

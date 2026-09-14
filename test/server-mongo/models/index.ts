@@ -17,3 +17,4 @@ export {
 // This plugin's own model.
 export { DeviceSyncStateMongo } from "../../../src/models/mongo/DeviceSyncStateMongo.js";
 export { EasCollectionStateMongo } from "../../../src/models/mongo/EasCollectionStateMongo.js";
+export { EasCollectionChunkMongo } from "../../../src/models/mongo/EasCollectionChunkMongo.js";

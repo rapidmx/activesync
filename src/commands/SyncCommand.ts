@@ -26,6 +26,8 @@ import {
     workingStateFromRound,
     workingStateFromRow,
 } from "../EasCollectionSync.js";
+import { type ChunkStore, clearHeldSet, type HeldSet, loadHeldSet, saveHeldSet } from "../EasCollectionStore.js";
+import { EasCollectionLease, type LeaseRelease } from "../EasCollectionLease.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 import type { EasCollectionSyncAdapter } from "../adapters/EasCollectionSyncAdapter.js";
 import type { EasCollectionState } from "../models/EasCollectionState.js";
@@ -47,8 +49,22 @@ export const MAX_SYNC_COMMANDS_PER_COLLECTION = 512;
 /** Rows read per round from the stream of items outside a collection's folder (see `enumerateCollection`). */
 const DEFAULT_MOVE_SCAN_LIMIT = 1000;
 
+/** Held ids checked against the store per caught-up round (see `enumerateCollection`'s reconcile). */
+const DEFAULT_RECONCILE_LIMIT = 100;
+
 /** Slack subtracted from "now" when a collection is (re)started, for the out-of-folder cursor. */
 const MOVE_CURSOR_SLACK_MS = 60_000;
+
+/** How long a `Sync` waits for another request's lease on the same collection before answering Status 16. */
+const LEASE_WAIT_MS = 15_000;
+
+/** How long a collection lease lives in Redis if its holder dies without releasing it. */
+const LEASE_TTL_MS = 120_000;
+
+/** [MS-ASCMD] `Sync` Status values this command reports beyond success. */
+const STATUS_INVALID_SYNC_KEY = "3";
+const STATUS_SERVER_ERROR = "5";
+const STATUS_RETRY = "16";
 
 /** Binds one MS-ASCMD `Class` value (`"Email"`, `"Contacts"`, ...) to the concrete entity class `SyncCommand`
  * should build a `RepoUtils` for, and the adapter class that maps that entity to/from `ApplicationData`.
@@ -71,6 +87,8 @@ interface CollectionRound {
     clientIds: Map<string, string>;
     deletesAsMoves: boolean;
     getMailbox: () => Promise<Mailbox>;
+    /** The mailbox that owns the synced folder (the caller's own, unless the folder is shared). */
+    getFolderMailbox: () => Promise<Mailbox>;
 }
 
 /**
@@ -78,15 +96,26 @@ interface CollectionRound {
  *
  * **Per-collection state** lives in its own `EasCollectionState` row per (mailbox, device, folder) - see that
  * model - rather than in `DeviceSyncState`, so concurrent `Sync`s of different folders never contend for one row.
- * Besides the issued `SyncKey`, the row records exactly which items the device holds (`serverIds`). That is what
- * makes the reported commands correct rather than guessed: an item the device doesn't hold is always an `Add`
- * (including on the first round after `SyncKey 0`), an item it holds is a `Change`, and an item it holds that has
- * been deleted *or moved to another folder* is a `Delete` - see `EasCollectionSync.enumerateCollection`.
+ * Besides the issued `SyncKey`, the row records exactly which items the device holds (inline in `serverIds` while
+ * small, in `EasCollectionChunk` rows once large - see `EasCollectionStore`). That is what makes the reported
+ * commands correct rather than guessed: an item the device doesn't hold is always an `Add` (including on the first
+ * round after `SyncKey 0`), an item it holds is a `Change`, and an item it holds that has been deleted *or moved to
+ * another folder* is a `Delete` - see `EasCollectionSync.enumerateCollection`.
+ *
+ * **One round per collection at a time**: each collection's round runs under a lease on (mailbox, device, folder)
+ * (`EasCollectionLease`: in-process, plus Redis `datastores:cache` across server copies when configured), and its
+ * state is read only once the lease is held - a second `Sync` of the same collection waits for the first to finish
+ * and then sees its result (typically answering the now-previous `SyncKey` as a retry), instead of both computing a
+ * round from the same state. A lease not acquired within `LEASE_WAIT_MS` is answered with Status 16 (retry).
  *
  * **Round order**: the client's own `Commands` are applied first, then server changes are enumerated. The device's
  * own writes are not echoed back: each successful `Add`/`Change` records the resulting `dateModified` in the row's
  * `echoes`, and a changed row still carrying exactly that timestamp is skipped. The cursor itself only ever advances
  * past rows actually enumerated, never past a pending server change.
+ *
+ * **Lost state**: a round's state that can't be saved is answered with the collection's Status 3 (and a failed
+ * `SyncKey 0` restart with Status 5), never with a `SyncKey` the server doesn't have - the device re-syncs from
+ * scratch instead of continuing from a key whose held set was never recorded.
  *
  * **Retries**: a client that never received a response re-sends the `SyncKey` it still holds. The row keeps the
  * previous round's key and delta (`previous`), so that key is accepted and the round is recomputed from the state
@@ -94,10 +123,16 @@ interface CollectionRound {
  * `Delete` of an item that round already removed succeeds silently.
  *
  * **Options honoured**: `WindowSize` (capped by `mail:eas:sync_window_size` and 512), `FilterType` (age window for
- * `Email`/`Calendar`, incomplete-only for `Tasks`; applied to items the device doesn't hold yet - a request whose
- * `FilterType` differs from the one the collection was synced with gets Status 3 so the client re-syncs from 0),
- * `DeletesAsMoves` (default `true`: an `Email` delete moves the message to Deleted Items; a delete inside Deleted
- * Items, or with `DeletesAsMoves` `0`, deletes it) and `GetChanges` `0` (no server changes this round).
+ * `Email`/`Calendar`, incomplete-only for `Tasks`; applied to items the device doesn't hold yet). A collection
+ * started without `Options` has no filter recorded, and the first `FilterType` sent while the device still holds
+ * nothing is adopted (clients commonly send `Options` only from the second request on); a `FilterType` differing
+ * from the recorded one otherwise gets Status 3 so the client re-syncs from 0. `DeletesAsMoves` (default `true`: an
+ * `Email` delete moves the message to Deleted Items; a delete inside Deleted Items, or with `DeletesAsMoves` `0`,
+ * deletes it) and `GetChanges` `0` (no server changes this round).
+ *
+ * **Meetings**: a device deleting or editing an attendee's copy of someone else's meeting never makes restapi's
+ * `MeetingSchedulingJob` send cancellations/invitations as the organizer - see `CalendarSyncAdapter.beforeDelete`
+ * and its `fromApplicationData`.
  *
  * **Access**: every `CollectionId` needs `READ` on the folder (otherwise Status 4, indistinguishable from an unknown
  * collection); `Add`/`Change`/`Delete` additionally need `CREATE`/`UPDATE`/`DELETE`, and a `ServerId` that resolves
@@ -118,11 +153,19 @@ export abstract class SyncCommand implements EasCommandHandler {
     protected abstract mailboxClass: any;
     protected abstract folderClass: any;
     protected abstract collectionStateClass: any;
+    protected abstract collectionChunkClass: any;
 
     @Config("mail:eas:sync_window_size", DEFAULT_WINDOW_SIZE)
     private windowSize: number = DEFAULT_WINDOW_SIZE;
 
+    // `null` rather than the decorator's `undefined` default: a deployment without a `datastores:cache` Redis is
+    // legitimate (leases are then in-process only).
+    @Config("datastores:cache", null)
+    private cacheConfig: any;
+
     protected moveScanLimit: number = DEFAULT_MOVE_SCAN_LIMIT;
+    protected reconcileLimit: number = DEFAULT_RECONCILE_LIMIT;
+    protected leaseWaitMs: number = LEASE_WAIT_MS;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -138,6 +181,7 @@ export abstract class SyncCommand implements EasCommandHandler {
     private mailboxRepo?: RepoUtils<any>;
     private folderRepo?: RecoverableRepoUtils<any>;
     private collectionStateRepo?: RepoUtils<any>;
+    private collectionChunkRepo?: RepoUtils<any>;
 
     @Init
     public async init(): Promise<void> {
@@ -153,6 +197,10 @@ export abstract class SyncCommand implements EasCommandHandler {
             name: this.collectionStateClass.name,
             args: [this.collectionStateClass],
         });
+        this.collectionChunkRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.collectionChunkClass.name,
+            args: [this.collectionChunkClass],
+        });
         for (const [collectionClass, binding] of Object.entries(this.collectionBindings)) {
             // RecoverableRepoUtils: a soft-delete must bump `dateModified`/`version`, or the change stream this
             // class enumerates would never see it.
@@ -167,14 +215,18 @@ export abstract class SyncCommand implements EasCommandHandler {
         }
     }
 
-    /** Resolves the caller's own `Mailbox` at most once per request, and only if actually needed. */
-    private mailboxLoader(ctx: EasCommandContext): () => Promise<Mailbox> {
+    private get chunkStore(): ChunkStore {
+        return { repo: this.collectionChunkRepo!, chunkClass: this.collectionChunkClass };
+    }
+
+    /** Resolves a mailbox at most once per request, and only if actually needed. */
+    private mailboxLoader(mailboxUid: string): () => Promise<Mailbox> {
         let cached: Mailbox | undefined;
         return async () => {
             if (!cached) {
-                cached = await this.mailboxRepo!.findOne(ctx.mailboxUid, { ignoreACL: true });
+                cached = await this.mailboxRepo!.findOne(mailboxUid, { ignoreACL: true });
                 if (!cached) {
-                    throw new ApiError(ApiErrors.NOT_FOUND, 404, "The caller's own mailbox no longer exists.");
+                    throw new ApiError(ApiErrors.NOT_FOUND, 404, "The mailbox no longer exists.");
                 }
             }
             return cached;
@@ -182,7 +234,7 @@ export abstract class SyncCommand implements EasCommandHandler {
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
-        if (!this.aclUtils || !this.folderRepo || !this.collectionStateRepo) {
+        if (!this.aclUtils || !this.folderRepo || !this.collectionStateRepo || !this.collectionChunkRepo) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         const collections = ctx.request ? findChild(ctx.request, "Collections") : undefined;
@@ -195,7 +247,7 @@ export abstract class SyncCommand implements EasCommandHandler {
         }
 
         const requestWindowSize: string | undefined = childText(ctx.request!, "WindowSize");
-        const getMailbox = this.mailboxLoader(ctx);
+        const getMailbox = this.mailboxLoader(ctx.mailboxUid);
         const collectionElements: WbxmlElement[] = [];
         for (const collectionEl of collectionEls) {
             collectionElements.push(await this.processCollection(ctx, collectionEl, getMailbox, requestWindowSize));
@@ -230,6 +282,33 @@ export abstract class SyncCommand implements EasCommandHandler {
             return this.collectionResponse(requestedClass, folderUid, "4", clientSyncKey);
         }
 
+        const release: LeaseRelease | undefined = await EasCollectionLease.acquire(JSON.stringify([ctx.mailboxUid, ctx.deviceId, folderUid]), {
+            redisUrl: this.cacheConfig?.url,
+            ttlMs: LEASE_TTL_MS,
+            waitMs: this.leaseWaitMs,
+        });
+        if (!release) {
+            return this.collectionResponse(requestedClass, folderUid, STATUS_RETRY, clientSyncKey);
+        }
+        try {
+            return await this.processLocked(ctx, collectionEl, folder, getMailbox, requestWindowSize);
+        } finally {
+            await release();
+        }
+    }
+
+    /** The rest of `processCollection`, run while holding the collection's lease. */
+    private async processLocked(
+        ctx: EasCommandContext,
+        collectionEl: WbxmlElement,
+        folder: Folder & { uid: string },
+        getMailbox: () => Promise<Mailbox>,
+        requestWindowSize: string | undefined,
+    ): Promise<WbxmlElement> {
+        const folderUid: string = folder.uid;
+        const requestedClass: string | undefined = childText(collectionEl, "Class");
+        const clientSyncKey: string | undefined = childText(collectionEl, "SyncKey");
+
         const stored: (EasCollectionState & { version: number }) | undefined = (
             await this.collectionStateRepo!.find({ mailboxUid: ctx.mailboxUid, deviceId: ctx.deviceId, folderUid } as any, {
                 ignoreACL: true,
@@ -248,25 +327,38 @@ export abstract class SyncCommand implements EasCommandHandler {
         const requestedFilter: string | undefined = optionsEl ? childText(optionsEl, "FilterType") : undefined;
 
         if (!clientSyncKey || clientSyncKey === "0") {
-            return await this.startCollection(ctx, stored, folderUid, collectionClass, requestedFilter ?? "0");
+            return await this.startCollection(ctx, stored, folderUid, collectionClass, requestedFilter);
         }
 
+        let held: HeldSet;
+        try {
+            held = await loadHeldSet(stored, this.chunkStore);
+        } catch (err: any) {
+            this.logger?.warn(`SyncCommand: failed to load sync state for folder ${folderUid}: ${err?.message}`);
+            return this.collectionResponse(collectionClass, folderUid, STATUS_SERVER_ERROR, clientSyncKey);
+        }
         let working: CollectionWorkingState;
         let retry: CollectionRound["retry"];
         if (stored && clientSyncKey === stored.syncKey) {
-            working = workingStateFromRow(stored);
+            working = workingStateFromRow(stored, held.ids);
         } else if (stored?.previous && clientSyncKey === stored.previous.syncKey) {
-            working = workingStateFromRound(stored, stored.previous);
+            working = workingStateFromRound(stored, stored.previous, held.ids);
             retry = {
                 removedIds: new Set(stored.previous.removedIds),
                 clientIds: new Map(stored.previous.clientIds.map((entry) => [entry.clientId, entry.serverId])),
             };
         } else {
-            return this.collectionResponse(collectionClass, folderUid, "3", undefined);
+            return this.collectionResponse(collectionClass, folderUid, STATUS_INVALID_SYNC_KEY, undefined);
         }
         if (requestedFilter !== undefined && requestedFilter !== working.filterType) {
-            // The window the device's items were selected with no longer matches - restart from SyncKey 0.
-            return this.collectionResponse(collectionClass, folderUid, "3", undefined);
+            if (working.filterType === undefined && (working.serverIds.size === 0 || working.generation <= 1)) {
+                // Started without Options: adopt the first FilterType while the device still holds nothing it was
+                // selected without.
+                working.filterType = requestedFilter;
+            } else {
+                // The window the device's items were selected with no longer matches - restart from SyncKey 0.
+                return this.collectionResponse(collectionClass, folderUid, STATUS_INVALID_SYNC_KEY, undefined);
+            }
         }
 
         const base: CollectionWorkingState = cloneWorkingState(working);
@@ -281,6 +373,7 @@ export abstract class SyncCommand implements EasCommandHandler {
             clientIds: new Map(),
             deletesAsMoves: childText(collectionEl, "DeletesAsMoves") !== "0",
             getMailbox,
+            getFolderMailbox: folder.mailboxUid === ctx.mailboxUid ? getMailbox : this.mailboxLoader(folder.mailboxUid),
         };
 
         const responseEntries: WbxmlElement[] = [];
@@ -309,11 +402,12 @@ export abstract class SyncCommand implements EasCommandHandler {
                       folderMailboxUid: folder.mailboxUid,
                       windowSize: this.effectiveWindowSize(childText(collectionEl, "WindowSize") ?? requestWindowSize),
                       moveScanLimit: this.moveScanLimit,
+                      reconcileLimit: this.reconcileLimit,
                       include: filterPredicate(collectionClass, working.filterType),
                   });
 
         const newKey = formatSyncKey({ generation: working.generation + 1, watermark: working.cursor.date, uid: working.cursor.uid });
-        await this.saveState(stored, {
+        const saved: boolean = await this.saveState(stored, { loaded: held, ids: working.serverIds }, {
             mailboxUid: ctx.mailboxUid,
             deviceId: ctx.deviceId,
             folderUid,
@@ -323,11 +417,15 @@ export abstract class SyncCommand implements EasCommandHandler {
             cursorUid: working.cursor.uid,
             moveCursorDate: working.moveCursor.date,
             moveCursorUid: working.moveCursor.uid,
-            serverIds: [...working.serverIds],
             echoes: Object.fromEntries(working.echoes),
-            filterType: working.filterType,
+            ...(working.recent ? { recent: Object.fromEntries(working.recent) } : {}),
+            reconcileCursor: working.reconcileCursor,
+            filterType: working.filterType ?? (null as any),
             previous: roundRecord(clientSyncKey, base, working, round.clientIds),
         });
+        if (!saved) {
+            return this.collectionResponse(collectionClass, folderUid, STATUS_INVALID_SYNC_KEY, undefined);
+        }
 
         const upserts = commands.filter((c): c is { kind: "Add" | "Change"; item: any } => c.kind !== "Delete");
         const applicationData: WbxmlElement[] =
@@ -359,11 +457,11 @@ export abstract class SyncCommand implements EasCommandHandler {
         stored: (EasCollectionState & { version: number }) | undefined,
         folderUid: string,
         collectionClass: string,
-        filterType: string,
+        filterType: string | undefined,
     ): Promise<WbxmlElement> {
         const epoch = new Date(0);
         const newKey = formatSyncKey({ generation: 1, watermark: epoch });
-        await this.saveState(stored, {
+        const saved: boolean = await this.saveState(stored, "restart", {
             mailboxUid: ctx.mailboxUid,
             deviceId: ctx.deviceId,
             folderUid,
@@ -373,32 +471,53 @@ export abstract class SyncCommand implements EasCommandHandler {
             cursorUid: "",
             moveCursorDate: new Date(Date.now() - MOVE_CURSOR_SLACK_MS),
             moveCursorUid: "",
-            serverIds: [],
             echoes: {},
-            filterType,
+            recent: {},
+            reconcileCursor: "",
+            // `null` (not `undefined`) so a restart without Options clears a FilterType recorded earlier on SQL too.
+            filterType: filterType ?? (null as any),
             previous: undefined,
         });
+        if (!saved) {
+            return this.collectionResponse(collectionClass, folderUid, STATUS_SERVER_ERROR, undefined);
+        }
         return this.collectionResponse(collectionClass, folderUid, "1", newKey);
     }
 
-    /** Creates or updates the collection's state row. A lost race (another request for the same collection wrote
-     * the row first) is logged rather than failing a request whose side effects already happened - the client's
-     * next request then simply gets Status 3 and re-syncs. */
+    /**
+     * Writes the held set (`held.ids`, given the set `held.loaded` the round started from) and then creates or
+     * updates the collection's state row. Returns `false` - after logging - when anything failed (including losing a
+     * race for the row): the caller must then not hand out the new key. A `"restart"` empties the held set, removing
+     * the chunk rows of a chunked collection.
+     */
     private async saveState(
         stored: (EasCollectionState & { version: number }) | undefined,
-        values: Omit<EasCollectionState, "uid" | "version" | "dateCreated" | "dateModified">,
-    ): Promise<void> {
+        held: { loaded: HeldSet; ids: Set<string> } | "restart",
+        values: Omit<EasCollectionState, "uid" | "version" | "dateCreated" | "dateModified" | "serverIds" | "chunked">,
+    ): Promise<boolean> {
         try {
+            let heldValues: { serverIds: string[]; chunked: boolean };
+            if (held === "restart") {
+                if (stored?.chunked) {
+                    await clearHeldSet(values, this.chunkStore);
+                }
+                heldValues = { serverIds: [], chunked: false };
+            } else {
+                heldValues = await saveHeldSet(values, held.loaded, held.ids, !!stored?.chunked, this.chunkStore);
+            }
+            const row = { ...values, ...heldValues };
             if (stored) {
-                await this.collectionStateRepo!.update({ ...values, uid: stored.uid, version: stored.version } as any, stored, {
+                await this.collectionStateRepo!.update({ ...row, uid: stored.uid, version: stored.version } as any, stored, {
                     ignoreACL: true,
                     skipPush: true,
                 });
             } else {
-                await this.collectionStateRepo!.create(new this.collectionStateClass(values), { ignoreACL: true, skipPush: true });
+                await this.collectionStateRepo!.create(new this.collectionStateClass(row), { ignoreACL: true, skipPush: true });
             }
+            return true;
         } catch (err: any) {
             this.logger?.warn(`SyncCommand: failed to save sync state for folder ${values.folderUid}: ${err?.message}`);
+            return false;
         }
     }
 
@@ -491,7 +610,7 @@ export abstract class SyncCommand implements EasCommandHandler {
             return this.statusResponseElement("Change", serverId, "6");
         }
         try {
-            const partial = await adapter.fromApplicationData(appData, existing, await round.getMailbox());
+            const partial = await adapter.fromApplicationData(appData, existing, await round.getFolderMailbox());
             const updated = await repo.update({ uid: existing.uid, version: existing.version, ...partial }, existing, { ignoreACL: true });
             this.noteWrite(round, updated);
             return undefined;
@@ -504,7 +623,7 @@ export abstract class SyncCommand implements EasCommandHandler {
     }
 
     private async applyDelete(round: CollectionRound, el: WbxmlElement): Promise<WbxmlElement | undefined> {
-        const { ctx, repo, folder } = round;
+        const { ctx, adapter, repo, folder } = round;
         const serverId = childText(el, "ServerId");
         if (!serverId) {
             return undefined;
@@ -535,6 +654,10 @@ export abstract class SyncCommand implements EasCommandHandler {
                     user: ctx.user,
                 });
             } else {
+                const stamp = adapter.beforeDelete ? adapter.beforeDelete(existing, await round.getFolderMailbox()) : undefined;
+                if (stamp) {
+                    await repo.update({ uid: existing.uid, version: existing.version, ...stamp }, existing, { ignoreACL: true });
+                }
                 await repo.delete(existing.uid, { ignoreACL: true });
             }
             round.working.serverIds.delete(serverId);

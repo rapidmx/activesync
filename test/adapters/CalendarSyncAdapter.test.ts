@@ -226,6 +226,43 @@ describe("CalendarSyncAdapter Tests", () => {
         });
     });
 
+    describe("attendee copies (never mistaken for the organizer by MeetingSchedulingJob)", () => {
+        const mailbox: any = { primarySmtpAddress: "me@example.com", aliasAddresses: ["alias@example.com"], displayName: "Me" };
+        const attendeeCopy = (overrides: Record<string, any> = {}): any => ({
+            ...baseEvent(),
+            organizer: { address: "boss@example.com", type: RecipientType.TO },
+            sequence: 3,
+            inviteSequenceSent: 2,
+            ...overrides,
+        });
+
+        it("Leaves the sequence alone on a scheduling change to an attendee's copy, keeping inviteSequenceSent level with it.", () => {
+            const partial = adapter.fromApplicationData(appData([cal("StartTime", "20260101T090000Z")]), attendeeCopy(), mailbox);
+            expect(partial.sequence).toBeUndefined();
+            expect(partial.inviteSequenceSent).toBe(3);
+
+            const inSync = adapter.fromApplicationData(appData([cal("Location", "Room 9")]), attendeeCopy({ inviteSequenceSent: 3 }), mailbox);
+            expect("inviteSequenceSent" in inSync).toBe(false);
+            expect(inSync.sequence).toBeUndefined();
+
+            const unset = adapter.fromApplicationData(appData([cal("Subject", "x")]), attendeeCopy({ sequence: undefined, inviteSequenceSent: 1 }), mailbox);
+            expect(unset.inviteSequenceSent).toBe(0);
+        });
+
+        it("Still bumps the sequence on the organizer's own copy (matched on any of the mailbox's addresses, or no organizer at all).", () => {
+            const own = attendeeCopy({ organizer: { address: "ALIAS@example.com", type: RecipientType.TO } });
+            expect(adapter.fromApplicationData(appData([cal("StartTime", "20260101T090000Z")]), own, mailbox).sequence).toBe(4);
+            const noOrganizer = attendeeCopy({ organizer: undefined });
+            expect(adapter.fromApplicationData(appData([cal("StartTime", "20260101T090000Z")]), noOrganizer, { ...mailbox, aliasAddresses: undefined }).sequence).toBe(4);
+        });
+
+        it("Stamps cancelNoticeSentAt before an attendee's copy is deleted, but never on the organizer's copy or twice.", () => {
+            expect(adapter.beforeDelete(attendeeCopy(), mailbox)).toEqual({ cancelNoticeSentAt: expect.any(Date) });
+            expect(adapter.beforeDelete(attendeeCopy({ cancelNoticeSentAt: new Date() }), mailbox)).toBeUndefined();
+            expect(adapter.beforeDelete(attendeeCopy({ organizer: { address: "me@example.com", type: RecipientType.TO } }), mailbox)).toBeUndefined();
+        });
+    });
+
     describe("Change merging", () => {
         it("Keeps an existing attendee's unsent fields and marks a new attendee with defaults.", () => {
             const existing: any = {

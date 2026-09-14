@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { MessageSQL, ContactSQL, CalendarEventSQL, TaskSQL, MailboxSQL, FolderSQL } from "@rapidmx/restapi/sql";
 import { EasCollectionStateSQL } from "../../models/sql/EasCollectionStateSQL.js";
+import { EasCollectionChunkSQL } from "../../models/sql/EasCollectionChunkSQL.js";
 import { EmailSyncAdapterSQL } from "../../adapters/sql/EmailSyncAdapterSQL.js";
 import { ContactsSyncAdapter } from "../../adapters/ContactsSyncAdapter.js";
 import { CalendarSyncAdapter } from "../../adapters/CalendarSyncAdapter.js";
@@ -17,6 +18,7 @@ export class SyncCommandSQL extends SyncCommand {
     protected mailboxClass: any = MailboxSQL;
     protected folderClass: any = FolderSQL;
     protected collectionStateClass: any = EasCollectionStateSQL;
+    protected collectionChunkClass: any = EasCollectionChunkSQL;
     protected collectionBindings: Record<string, SyncCollectionBinding<any>> = {
         Email: { entityClass: MessageSQL, adapterClass: EmailSyncAdapterSQL },
         Contacts: { entityClass: ContactSQL, adapterClass: ContactsSyncAdapter },

@@ -15,6 +15,7 @@ import { FolderType } from "@rapidmx/restapi";
 import { childText, element, findChild, findChildren, textElement } from "../../src/codec/WbxmlElement.js";
 import { WbxmlCodePage } from "../../src/codec/WbxmlCodePages.js";
 import { formatSyncKey } from "../../src/EasSyncKeyUtils.js";
+import { MAX_SYNC_COLLECTIONS } from "../../src/commands/SyncCommand.js";
 
 describe("GetItemEstimateCommand Tests (guard clause only)", () => {
     it("handle() throws INTERNAL_ERROR when a required dependency is not set.", async () => {
@@ -39,23 +40,46 @@ describe("GetItemEstimateCommand Tests (guard clause only)", () => {
                 findOne: vi.fn().mockResolvedValue(options.folder === null ? undefined : (options.folder ?? { uid: "f1", mailboxUid: "m1", type: FolderType.TASKS })),
             };
             command.collectionStateRepo = { find: vi.fn().mockResolvedValue(options.state ? [options.state] : []), update: vi.fn() };
+            command.collectionChunkRepo = { find: vi.fn().mockResolvedValue([]) };
             command.repos = new Map([["Tasks", repo]]);
             return { command, repo };
         }
 
+        function collectionEl(syncKey: string, collectionClass?: string, folderUid: string | null = "f1") {
+            return element(WbxmlCodePage.AirSync, "Collection", [
+                ...(collectionClass ? [textElement(WbxmlCodePage.AirSync, "Class", collectionClass)] : []),
+                textElement(WbxmlCodePage.AirSync, "SyncKey", syncKey),
+                ...(folderUid !== null ? [textElement(WbxmlCodePage.AirSync, "CollectionId", folderUid)] : []),
+            ]);
+        }
+
         function estimateRequest(syncKey: string, collectionClass?: string) {
             return element(WbxmlCodePage.ItemEstimate, "GetItemEstimate", [
-                element(WbxmlCodePage.AirSync, "Collections", [
-                    element(WbxmlCodePage.AirSync, "Collection", [
-                        ...(collectionClass ? [textElement(WbxmlCodePage.AirSync, "Class", collectionClass)] : []),
-                        textElement(WbxmlCodePage.AirSync, "SyncKey", syncKey),
-                        textElement(WbxmlCodePage.AirSync, "CollectionId", "f1"),
-                    ]),
-                ]),
+                element(WbxmlCodePage.AirSync, "Collections", [collectionEl(syncKey, collectionClass)]),
             ]);
         }
 
         const ctx = (request: any) => ({ user: { uid: "u1" }, mailboxUid: "m1", deviceId: "d1", request }) as any;
+
+        it("Refuses more collections than one Sync may carry, estimates a repeated CollectionId once, and caps a SyncKey 0 count.", async () => {
+            const { command, repo } = build();
+            const many = element(WbxmlCodePage.ItemEstimate, "GetItemEstimate", [
+                element(WbxmlCodePage.AirSync, "Collections", Array.from({ length: MAX_SYNC_COLLECTIONS + 1 }, () => collectionEl("0"))),
+            ]);
+            const refused = await command.handle(ctx(many));
+            expect(findChildren(refused, "Response").map((r: any) => childText(r, "Status"))).toEqual(["2"]);
+            expect(repo.count).not.toHaveBeenCalled();
+
+            command.maxCount = 5;
+            const repeated = element(WbxmlCodePage.ItemEstimate, "GetItemEstimate", [
+                element(WbxmlCodePage.AirSync, "Collections", [collectionEl("0"), collectionEl("0"), collectionEl("0", undefined, null)]),
+            ]);
+            const response = await command.handle(ctx(repeated));
+            const responses = findChildren(response, "Response");
+            expect(responses.map((r: any) => childText(r, "Status"))).toEqual(["1", "2"]);
+            expect(childText(findChild(responses[0], "Collection")!, "Estimate")).toBe("5");
+            expect(repo.count).toHaveBeenCalledTimes(1);
+        });
 
         it("Reports Status 2 when the folder no longer exists.", async () => {
             const { command } = build({ folder: null });
@@ -84,15 +108,19 @@ describe("GetItemEstimateCommand Tests (guard clause only)", () => {
                 serverIds: [],
                 echoes: {},
                 filterType: "8",
+                chunked: true,
             };
             const rows = [
                 { uid: "t1", folderUid: "f1", dateModified: new Date("2026-02-01T00:00:00.000Z"), completed: false },
                 { uid: "t2", folderUid: "f1", dateModified: new Date("2026-02-02T00:00:00.000Z"), completed: true },
             ];
             const { command } = build({ state, rows });
+            // A chunked held set is read from its chunk rows: t1 is an Add (t2 is outside the filter), and the held id that no
+            // longer exists in the folder is a reconciled Delete.
+            command.collectionChunkRepo.find.mockResolvedValue([{ uid: "c0", chunkIndex: 0, ids: ["t9-held-elsewhere"] }]);
 
             const response = await command.handle(ctx(estimateRequest(key)));
-            expect(childText(findChild(findChild(response, "Response")!, "Collection")!, "Estimate")).toBe("1");
+            expect(childText(findChild(findChild(response, "Response")!, "Collection")!, "Estimate")).toBe("2");
             expect(command.collectionStateRepo.update).not.toHaveBeenCalled();
 
             const stale = await command.handle(ctx(estimateRequest("1:2020-01-01T00:00:00.000Z", "Tasks")));

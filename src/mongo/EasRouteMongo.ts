@@ -7,7 +7,7 @@ import { RouteDecorators } from "@rapidrest/service-core";
 import { DeviceSyncStateMongo } from "../models/mongo/DeviceSyncStateMongo.js";
 import { BaseEasRoute } from "../BaseEasRoute.js";
 import { ProvisionCommand } from "../commands/ProvisionCommand.js";
-import { PingCommand } from "../commands/PingCommand.js";
+import { PingCommandMongo } from "../commands/mongo/PingCommandMongo.js";
 import { FolderSyncCommandMongo } from "../commands/mongo/FolderSyncCommandMongo.js";
 import { SyncCommandMongo } from "../commands/mongo/SyncCommandMongo.js";
 import { SendMailCommandMongo } from "../commands/mongo/SendMailCommandMongo.js";
@@ -43,7 +43,7 @@ export class EasRouteMongo extends BaseEasRoute<DeviceSyncStateMongo, MailboxMon
         SearchCommandMongo,
         MeetingResponseCommandMongo,
         SettingsCommandMongo,
-        PingCommand,
+        PingCommandMongo,
         GetItemEstimateCommandMongo,
         MoveItemsCommandMongo,
         ResolveRecipientsCommandMongo,

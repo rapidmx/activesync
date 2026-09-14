@@ -6,10 +6,12 @@ import { Raw } from "typeorm";
 import { EasDeviceStateCleanupJob } from "../EasDeviceStateCleanupJob.js";
 import { DeviceSyncStateSQL } from "../../models/sql/DeviceSyncStateSQL.js";
 import { EasCollectionStateSQL } from "../../models/sql/EasCollectionStateSQL.js";
+import { EasCollectionChunkSQL } from "../../models/sql/EasCollectionChunkSQL.js";
 
 export class EasDeviceStateCleanupJobSQL extends EasDeviceStateCleanupJob<DeviceSyncStateSQL> {
     protected deviceSyncStateClass: any = DeviceSyncStateSQL;
     protected collectionStateClass: any = EasCollectionStateSQL;
+    protected collectionChunkClass: any = EasCollectionChunkSQL;
 
     /** SQL's `column != true` is never true for a `NULL` column, so "no pending wipe" needs an explicit `IS NULL`. */
     protected noPendingWipeQueryValue(): any {

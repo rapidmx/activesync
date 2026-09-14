@@ -12,4 +12,5 @@ export { EasRouteMongo } from "./mongo/EasRouteMongo.js";
 export { DeviceSyncStateRouteMongo } from "./mongo/DeviceSyncStateRouteMongo.js";
 export { DeviceSyncStateMongo } from "./models/mongo/DeviceSyncStateMongo.js";
 export { EasCollectionStateMongo } from "./models/mongo/EasCollectionStateMongo.js";
+export { EasCollectionChunkMongo } from "./models/mongo/EasCollectionChunkMongo.js";
 export { EasDeviceStateCleanupJobMongo } from "./jobs/mongo/EasDeviceStateCleanupJobMongo.js";

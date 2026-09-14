@@ -44,8 +44,10 @@ const MS_AS_PROTOCOL_VERSIONS = "14.0,14.1,16.0,16.1";
  * attachments), far below the host-wide body limit. The WBXML decoder's own element limits bound memory further. */
 const DEFAULT_MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 
-/** Commands a device may send before it is provisioned (and without a policy key). */
-const COMMANDS_WITHOUT_PROVISIONING = new Set(["Provision", "Settings"]);
+/** Settings request elements a device may send before it is provisioned (and without a policy key): the first-run
+ * `UserInformation` lookup and `DeviceInformation` report. Anything else - `Oof` in particular, which writes the
+ * mailbox's automatic replies - needs a provisioned device. */
+const SETTINGS_WITHOUT_PROVISIONING = new Set(["UserInformation", "DeviceInformation"]);
 
 function firstQueryValue(value: string | string[] | undefined): string | undefined {
     return Array.isArray(value) ? value[0] : value;
@@ -66,8 +68,10 @@ function firstQueryValue(value: string | string[] | undefined): string | undefin
  *
  * **Dispatch flow**: reject a body over `mail:eas:max_request_bytes` (413), resolve the caller's own `Mailbox` (never
  * a client-supplied one — `resolveCallerMailboxUid`), find-or-create that (mailbox, device) pair's `DeviceSyncState`,
- * enforce the provisioning gate (provisioned *and* presenting the stored policy key, else 449), decode the WBXML
- * request body (if any; malformed or over the decoder's element limits -> 400), dispatch to the matching registered
+ * refuse a `blocked` device (one that acknowledged a remote wipe) with 403 for anything but `Provision` (which
+ * answers Status 129 itself), decode the WBXML request body (if any; malformed or over the decoder's element limits
+ * -> 400), enforce the provisioning gate (provisioned *and* presenting the stored policy key, else 449 - only
+ * `Provision` and a `Settings` request limited to `UserInformation`/`DeviceInformation` are exempt), dispatch to the matching registered
  * `EasCommandHandler`, record `lastSyncAt` (best-effort), and encode the handler's response back to WBXML.
  *
  * **Command handlers** are supplied via `commandHandlerClasses` (empty by default — this class alone is just
@@ -176,13 +180,24 @@ export abstract class BaseEasRoute<D extends DeviceSyncState, M extends Mailbox 
 
         const deviceSyncState: D = await this.findOrCreateDeviceSyncState(mailboxUid, deviceId, deviceType);
 
-        // Every command except the two that must work on an unprovisioned device (Provision itself, and
-        // Settings - real clients query Settings/DeviceInformation as part of first-run setup, before
-        // provisioning completes) requires the device to be provisioned AND to present the policy key it
-        // acknowledged ([MS-ASPROV]: `X-MS-PolicyKey`, or the `PolicyKey` query value). A missing or stale key -
-        // e.g. one from before an admin-requested remote wipe, which clears the stored key - is sent back through
-        // Provision with the same 449 rather than being served.
-        if (!COMMANDS_WITHOUT_PROVISIONING.has(cmd)) {
+        // A device that acknowledged a remote wipe stays locked out until an administrator unblocks it.
+        if (deviceSyncState.blocked && cmd !== "Provision") {
+            res.status(403).send();
+            return;
+        }
+
+        const handler: EasCommandHandler | undefined = this.handlers.get(cmd);
+
+        // Settings is decoded ahead of the provisioning gate, which needs to see what it asks for; everything else is
+        // only decoded once the gate has passed.
+        let request: WbxmlElement | undefined = cmd === "Settings" && handler ? this.decodeRequest(req) : undefined;
+
+        // Every command except what must work on an unprovisioned device (Provision itself, and the first-run
+        // Settings lookups real clients make before provisioning completes) requires the device to be provisioned AND
+        // to present the policy key it acknowledged ([MS-ASPROV]: `X-MS-PolicyKey`, or the `PolicyKey` query value).
+        // A missing or stale key - e.g. one from before an admin-requested remote wipe, which clears the stored key -
+        // is sent back through Provision with the same 449 rather than being served.
+        if (!this.exemptFromProvisioning(cmd, request)) {
             const presentedKey: string | undefined = firstQueryValue(req.headers["x-ms-policykey"]) ?? policyKey;
             if (!deviceSyncState.provisioned || !deviceSyncState.policyKey || presentedKey !== deviceSyncState.policyKey) {
                 res.status(HTTP_STATUS_RETRY_WITH).send();
@@ -190,20 +205,12 @@ export abstract class BaseEasRoute<D extends DeviceSyncState, M extends Mailbox 
             }
         }
 
-        const handler: EasCommandHandler | undefined = this.handlers.get(cmd);
         if (!handler) {
             res.status(501).send();
             return;
         }
-
-        let request: WbxmlElement | undefined;
-        try {
-            request = req.rawBody && req.rawBody.length > 0 ? new WbxmlDecoder().decode(req.rawBody) : undefined;
-        } catch (err) {
-            if (err instanceof WbxmlDecodeError) {
-                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `Malformed WBXML request: ${err.message}`);
-            }
-            throw err;
+        if (cmd !== "Settings") {
+            request = this.decodeRequest(req);
         }
 
         const response: WbxmlElement | undefined = await handler.handle({
@@ -238,6 +245,26 @@ export abstract class BaseEasRoute<D extends DeviceSyncState, M extends Mailbox 
             .setHeader("Content-Length", buffer.length)
             .status(200)
             .send(buffer);
+    }
+
+    /** Decodes the WBXML request body, if any (malformed or over the decoder's element limits -> 400). */
+    private decodeRequest(req: HttpRequest): WbxmlElement | undefined {
+        try {
+            return req.rawBody && req.rawBody.length > 0 ? new WbxmlDecoder().decode(req.rawBody) : undefined;
+        } catch (err) {
+            if (err instanceof WbxmlDecodeError) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `Malformed WBXML request: ${err.message}`);
+            }
+            throw err;
+        }
+    }
+
+    /** `Provision`, and a `Settings` request whose every element is one `SETTINGS_WITHOUT_PROVISIONING` allows. */
+    private exemptFromProvisioning(cmd: string, request: WbxmlElement | undefined): boolean {
+        if (cmd === "Provision") {
+            return true;
+        }
+        return cmd === "Settings" && (request?.children ?? []).every((child) => SETTINGS_WITHOUT_PROVISIONING.has(child.tag));
     }
 
     private async findOrCreateDeviceSyncState(mailboxUid: string, deviceId: string, deviceType: string): Promise<D> {

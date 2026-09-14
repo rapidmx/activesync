@@ -23,6 +23,15 @@ const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
 /** [MS-ASCMD] ItemOperations Status 11: the requested data size is too large. */
 const STATUS_TOO_LARGE = "11";
 
+/** [MS-ASCMD] ItemOperations Status 3: server error. */
+const STATUS_SERVER_ERROR = "3";
+
+/** [MS-ASCMD] ItemOperations Status 17: the operation completed partially. */
+const STATUS_PARTIAL = "17";
+
+/** Most batches (of `mail:eas:itemoperations_batch_size` messages) one `EmptyFolderContents` deletes per request. */
+export const MAX_EMPTY_FOLDER_BATCHES = 20;
+
 /** One `Fetch` response element and the content bytes it embeds (counted against the response cap). */
 interface FetchResult {
     element: WbxmlElement;
@@ -79,6 +88,11 @@ function truncateUtf8(text: string, maxBytes: number): string {
  * - `EmptyFolderContents`'s `DeleteSubFolders` option is rejected outright rather than silently ignored -
  * recursive subfolder deletion is out of scope for this pragmatic subset; emptying a single folder's own
  * `Message`s is the common case this implements.
+ *
+ * **Bulk operations are bounded and per item**: `EmptyFolderContents` deletes at most `MAX_EMPTY_FOLDER_BATCHES`
+ * batches per request, and `Move` at most one batch; a message that fails to delete or move (e.g. a concurrent
+ * edit's version conflict) is skipped rather than failing the request, and the operation then reports Status 17
+ * (partial success) - or Status 3 when nothing at all succeeded - so the client can retry for the rest.
  *
  * `folderClass`/`messageClass`/`attachmentClass` are supplied by the Mongo/SQL concrete subclasses.
  *
@@ -286,22 +300,34 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         // theoretical). Looping (rather than a single pass) still empties the folder completely, however large -
         // a deleted row no longer matches this same `find()` (soft-deleted rows are excluded from an ordinary
         // query by default), so the loop always terminates once truly empty.
-        for (;;) {
+        //
+        // Bounded per request (`MAX_EMPTY_FOLDER_BATCHES`), and a message that fails to delete is remembered and skipped:
+        // a batch in which nothing new could be deleted ends the loop instead of spinning on the same failing rows.
+        const failed = new Set<string>();
+        let deleted = 0;
+        let complete = false;
+        for (let round = 0; round < MAX_EMPTY_FOLDER_BATCHES; round++) {
             const batch = await this.messageRepo!.find({ folderUid, limit: this.batchSize } as any, {
                 ignoreACL: true,
                 limit: this.batchSize,
             });
-            if (batch.length === 0) {
+            const pending = batch.filter((message: any) => !failed.has(message.uid));
+            if (pending.length === 0) {
+                complete = batch.length === 0;
                 break;
             }
-            for (const message of batch) {
-                await this.messageRepo!.delete(message.uid, { ignoreACL: true, user: ctx.user });
+            for (const message of pending) {
+                try {
+                    await this.messageRepo!.delete(message.uid, { ignoreACL: true, user: ctx.user });
+                    deleted++;
+                } catch {
+                    failed.add(message.uid);
+                }
             }
         }
 
-        return element(WbxmlCodePage.ItemOperations, "EmptyFolderContents", [
-            textElement(WbxmlCodePage.ItemOperations, "Status", "1"),
-        ]);
+        const status: string = complete && failed.size === 0 ? "1" : deleted === 0 ? STATUS_SERVER_ERROR : STATUS_PARTIAL;
+        return element(WbxmlCodePage.ItemOperations, "EmptyFolderContents", [textElement(WbxmlCodePage.ItemOperations, "Status", status)]);
     }
 
     /**
@@ -346,25 +372,30 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         // transaction within a transaction" (confirmed against real SQL test failures, not theoretical) -
         // updates run sequentially in a plain loop instead.
         const permitted = await Promise.all(messages.map((message) => this.aclUtils!.hasPermission(ctx.user, message.folderUid, ACLAction.UPDATE)));
-        let movedAny = false;
+        let moved = 0;
+        let failed = 0;
         for (let i = 0; i < messages.length; i++) {
             if (!permitted[i]) {
                 continue;
             }
             const message = messages[i];
-            await this.messageRepo!.update(
-                { uid: (message as any).uid, version: (message as any).version, folderUid: dstFldId } as any,
-                message,
-                { ignoreACL: true, user: ctx.user },
-            );
-            movedAny = true;
+            try {
+                await this.messageRepo!.update(
+                    { uid: (message as any).uid, version: (message as any).version, folderUid: dstFldId } as any,
+                    message,
+                    { ignoreACL: true, user: ctx.user },
+                );
+                moved++;
+            } catch {
+                failed++;
+            }
         }
-        if (!movedAny) {
+        if (moved === 0) {
             return this.moveResponse("3");
         }
 
         return element(WbxmlCodePage.ItemOperations, "Move", [
-            textElement(WbxmlCodePage.ItemOperations, "Status", "1"),
+            textElement(WbxmlCodePage.ItemOperations, "Status", failed > 0 ? STATUS_PARTIAL : "1"),
             textElement(WbxmlCodePage.ItemOperations, "DstFldId", dstFldId),
             opaqueElement(WbxmlCodePage.ItemOperations, "ConversationId", conversationIdEl.opaque),
         ]);

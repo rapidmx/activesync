@@ -18,7 +18,9 @@ import {
     type Message,
     parseIcsEvent,
     RecoverableRepoUtils,
+    type TransportResult,
 } from "@rapidmx/restapi";
+import { isOrganizedBy } from "../adapters/CalendarSyncAdapter.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 const { Init, Inject, Logger } = ObjectDecorators;
 
@@ -37,6 +39,7 @@ const USER_RESPONSE_DECLINED = "3";
 const STATUS_SUCCESS = "1";
 const STATUS_INVALID_REQUEST = "2";
 const STATUS_MAILBOX_ERROR = "3";
+const STATUS_SERVER_ERROR = "4";
 
 /** Most `Request` elements one `MeetingResponse` may carry. */
 export const MAX_MEETING_RESPONSES = 100;
@@ -56,12 +59,16 @@ type StoredEvent = CalendarEvent & { uid: string; version: number };
  * the caller's `Attendee.responseStatus`. A decline removes the caller's own copy of the event (matching Exchange)
  * when the caller also has `DELETE` on the folder, and otherwise just records the declined status - a delegate
  * with edit-only rights can't delete. Each mailbox has its own event row, so neither touches the organizer's or
- * any other attendee's copy. `CalendarId` is omitted for a removed event.
+ * any other attendee's copy. `CalendarId` is omitted for a removed event. Since the caller's copy is an attendee's copy
+ * of someone else's meeting, neither write may look like the organizer acting to restapi's `MeetingSchedulingJob`:
+ * a removed copy is stamped `cancelNoticeSentAt` first (no CANCEL mailed as the organizer), and an updated copy keeps
+ * `inviteSequenceSent` equal to its `sequence` (no REQUEST).
  *
  * **Reply to the organizer**: in protocol 16.x the client asks the server to notify the organizer with
  * `SendResponse`; when it's present an iTIP `REPLY` (built with restapi's `buildEventIcs`, the same payload
  * `BaseCalendarEventRoute.respond` sends) is mailed from the caller's attendee address to the organizer,
- * best-effort. Without it (14.x clients send their own reply via `SendMail`) nothing is mailed, so the organizer
+ * and a transport that accepts none of it (or rejects the organizer) is reported as Status 4 - the response itself is
+ * already recorded, so a retry only re-sends the reply. Without it (14.x clients send their own reply via `SendMail`) nothing is mailed, so the organizer
  * never receives two replies.
  *
  * Failures are per request: an unknown/unresolvable meeting, a meeting the caller may not respond to, or a
@@ -162,14 +169,23 @@ export abstract class MeetingResponseCommand implements EasCommandHandler {
         }
         const updatedAttendee: Attendee = { ...event.attendees[attendeeIndex], responseStatus: USER_RESPONSE_STATUS[userResponse] };
 
+        const attendeeCopy: boolean = !isOrganizedBy(event, mailbox);
         let removed = false;
         try {
             if (userResponse === USER_RESPONSE_DECLINED && (await this.aclUtils!.hasPermission(ctx.user, event.folderUid, ACLAction.DELETE))) {
+                if (attendeeCopy && event.cancelNoticeSentAt == null) {
+                    await this.calendarEventRepo!.update({ uid: event.uid, version: event.version, cancelNoticeSentAt: new Date() } as any, event, {
+                        ignoreACL: true,
+                        user: ctx.user,
+                    });
+                }
                 await this.calendarEventRepo!.delete(event.uid, { ignoreACL: true, user: ctx.user });
                 removed = true;
             } else {
                 const attendees = event.attendees.map((attendee, i) => (i === attendeeIndex ? updatedAttendee : attendee));
-                await this.calendarEventRepo!.update({ uid: event.uid, version: event.version, attendees } as any, event, {
+                const inviteSequence =
+                    attendeeCopy && event.inviteSequenceSent !== event.sequence ? { inviteSequenceSent: event.sequence ?? 0 } : {};
+                await this.calendarEventRepo!.update({ uid: event.uid, version: event.version, attendees, ...inviteSequence } as any, event, {
                     ignoreACL: true,
                     user: ctx.user,
                 });
@@ -179,8 +195,8 @@ export abstract class MeetingResponseCommand implements EasCommandHandler {
             return this.result(requestId, STATUS_MAILBOX_ERROR);
         }
 
-        if (findChild(requestEl, "SendResponse")) {
-            await this.sendReply(mailbox, event, updatedAttendee, userResponse);
+        if (findChild(requestEl, "SendResponse") && !(await this.sendReply(mailbox, event, updatedAttendee, userResponse))) {
+            return this.result(requestId, STATUS_SERVER_ERROR, removed ? undefined : event.uid);
         }
 
         return this.result(requestId, STATUS_SUCCESS, removed ? undefined : event.uid);
@@ -220,9 +236,11 @@ export abstract class MeetingResponseCommand implements EasCommandHandler {
         }
     }
 
-    /** Mails an iTIP `REPLY` for `attendee`'s response to the event's organizer. Best-effort: the response itself is
-     * already recorded, so a transport failure is only logged. */
-    private async sendReply(mailbox: Mailbox, event: StoredEvent, attendee: Attendee, userResponse: string): Promise<void> {
+    /** Mails an iTIP `REPLY` for `attendee`'s response to the event's organizer. Returns `false` (after logging) when
+     * the transport threw or didn't accept the message for the organizer - checked the way restapi's `sendOrThrow`
+     * does, since every bundled transport reports a relay failure through `TransportResult.rejected` rather than
+     * throwing. */
+    private async sendReply(mailbox: Mailbox, event: StoredEvent, attendee: Attendee, userResponse: string): Promise<boolean> {
         try {
             const ics = buildEventIcs({ ...event, attendees: [attendee] }, "REPLY", { onlyAttendee: attendee });
             const boundary = `eas-${crypto.randomUUID()}`;
@@ -248,9 +266,19 @@ export abstract class MeetingResponseCommand implements EasCommandHandler {
                 `--${boundary}--`,
                 "",
             ].join("\r\n");
-            await this.mailTransport.send({ raw: Buffer.from(raw, "utf-8"), envelopeFrom: attendee.address, envelopeTo: [event.organizer.address] });
+            const result: TransportResult | undefined = await this.mailTransport.send({
+                raw: Buffer.from(raw, "utf-8"),
+                envelopeFrom: attendee.address,
+                envelopeTo: [event.organizer.address],
+            });
+            if (!result || (result.accepted ?? []).length === 0 || (result.rejected ?? []).length > 0) {
+                this.logger?.warn(`MeetingResponseCommand: the mail transport did not accept the iTIP REPLY for event ${event.uid}`);
+                return false;
+            }
+            return true;
         } catch (err: any) {
             this.logger?.warn(`MeetingResponseCommand: failed to send iTIP REPLY for event ${event.uid}: ${err?.message}`);
+            return false;
         }
     }
 }

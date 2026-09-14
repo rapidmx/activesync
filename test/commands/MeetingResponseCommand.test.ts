@@ -63,7 +63,7 @@ function build(overrides: { calendarEventRepo?: any; messageRepo?: any; aclUtils
         update: vi.fn().mockResolvedValue({}),
         delete: vi.fn().mockResolvedValue(undefined),
     };
-    const mailTransport = overrides.mailTransport ?? { send: vi.fn().mockResolvedValue({ accepted: [], rejected: [] }) };
+    const mailTransport = overrides.mailTransport ?? { send: vi.fn().mockImplementation(async (message: any) => ({ accepted: message.envelopeTo, rejected: [] })) };
     (command as any).calendarEventRepo = calendarEventRepo;
     (command as any).messageRepo = overrides.messageRepo ?? { findOne: vi.fn().mockResolvedValue(undefined) };
     (command as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue("mailbox" in overrides ? overrides.mailbox : MAILBOX) };
@@ -135,7 +135,7 @@ describe("MeetingResponseCommand Tests (isolated)", () => {
         expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("conflict"));
     });
 
-    it("Mails an iTIP REPLY to the organizer only when SendResponse is present, and survives a transport failure.", async () => {
+    it("Mails an iTIP REPLY to the organizer only when SendResponse is present, and reports Status 4 when the transport fails.", async () => {
         const { command, mailTransport } = build();
 
         await command.handle(ctx(request(reply("2", "event-1"))));
@@ -152,8 +152,66 @@ describe("MeetingResponseCommand Tests (isolated)", () => {
         expect(raw).toContain("PARTSTAT=TENTATIVE");
 
         const failing = build({ mailTransport: { send: vi.fn().mockRejectedValue(new Error("smtp down")) }, mailbox: { ...MAILBOX, displayName: undefined } });
-        expect(statuses(await failing.command.handle(ctx(request(reply("1", "event-1", true)))))).toEqual(["1"]);
+        const failed = await failing.command.handle(ctx(request(reply("1", "event-1", true))));
+        expect(statuses(failed)).toEqual(["4"]);
+        // The response itself was recorded, so the event is still named.
+        expect(childText(findChild(failed!, "Result")!, "CalendarId")).toBe("event-1");
         expect(failing.logger.warn).toHaveBeenCalledWith(expect.stringContaining("smtp down"));
+    });
+
+    it("Reports Status 4 when the transport accepts nothing or rejects the organizer, like restapi's sendOrThrow.", async () => {
+        for (const result of [{ accepted: [], rejected: ["boss@example.com"] }, { accepted: ["boss@example.com"], rejected: ["boss@example.com"] }, undefined]) {
+            const { command, logger } = build({ mailTransport: { send: vi.fn().mockResolvedValue(result) } });
+            const response = await command.handle(ctx(request(reply("3", "event-1", true))));
+            expect(statuses(response)).toEqual(["4"]);
+            expect(findChild(findChild(response!, "Result")!, "CalendarId")).toBeUndefined();
+            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("did not accept"));
+        }
+    });
+
+    it("Never lets the attendee's own copy look like the organizer cancelling or re-inviting to MeetingSchedulingJob.", async () => {
+        // Decline: the copy is stamped as already cancelled before it's removed.
+        const declined = build({ calendarEventRepo: { findOne: vi.fn().mockResolvedValue(event()), update: vi.fn().mockResolvedValue({}), delete: vi.fn().mockResolvedValue(undefined) } });
+        await declined.command.handle(ctx(request(reply("3", "event-1"))));
+        expect(declined.calendarEventRepo.update).toHaveBeenCalledWith(
+            expect.objectContaining({ uid: "event-1", cancelNoticeSentAt: expect.any(Date) }),
+            expect.anything(),
+            expect.anything(),
+        );
+        expect(declined.calendarEventRepo.update.mock.invocationCallOrder[0]).toBeLessThan(declined.calendarEventRepo.delete.mock.invocationCallOrder[0]);
+
+        // Already stamped: deleted without another write.
+        const stamped = build({
+            calendarEventRepo: { findOne: vi.fn().mockResolvedValue(event({ cancelNoticeSentAt: new Date() })), update: vi.fn(), delete: vi.fn().mockResolvedValue(undefined) },
+        });
+        await stamped.command.handle(ctx(request(reply("3", "event-1"))));
+        expect(stamped.calendarEventRepo.update).not.toHaveBeenCalled();
+        expect(stamped.calendarEventRepo.delete).toHaveBeenCalled();
+
+        // Accept: an out-of-date inviteSequenceSent is brought level with the sequence.
+        const accepted = build({ calendarEventRepo: { findOne: vi.fn().mockResolvedValue(event({ sequence: 3 })), update: vi.fn().mockResolvedValue({}), delete: vi.fn() } });
+        await accepted.command.handle(ctx(request(reply("1", "event-1"))));
+        expect(accepted.calendarEventRepo.update.mock.calls[0][0].inviteSequenceSent).toBe(3);
+
+        const inSync = build({
+            calendarEventRepo: { findOne: vi.fn().mockResolvedValue(event({ sequence: 3, inviteSequenceSent: 3 })), update: vi.fn().mockResolvedValue({}), delete: vi.fn() },
+        });
+        await inSync.command.handle(ctx(request(reply("1", "event-1"))));
+        expect(inSync.calendarEventRepo.update.mock.calls[0][0]).not.toHaveProperty("inviteSequenceSent");
+
+        // The organizer's own copy (organizer is one of the caller's addresses) is left to the job.
+        const own = build({
+            calendarEventRepo: {
+                findOne: vi.fn().mockResolvedValue(event({ sequence: undefined, organizer: { address: "ME@example.com", type: RecipientType.TO } })),
+                update: vi.fn().mockResolvedValue({}),
+                delete: vi.fn().mockResolvedValue(undefined),
+            },
+        });
+        await own.command.handle(ctx(request(reply("1", "event-1"))));
+        expect(own.calendarEventRepo.update.mock.calls[0][0]).not.toHaveProperty("inviteSequenceSent");
+        await own.command.handle(ctx(request(reply("3", "event-1"))));
+        expect(own.calendarEventRepo.update).toHaveBeenCalledTimes(1);
+        expect(own.calendarEventRepo.delete).toHaveBeenCalled();
     });
 
     it("Resolves a meeting request message to the series master of the caller's own event, and treats unreadable or non-meeting messages as not found.", async () => {

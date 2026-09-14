@@ -15,6 +15,7 @@ import config from "../../config.js";
 import { EasDeviceStateCleanupJobMongo } from "../../../src/jobs/mongo/EasDeviceStateCleanupJobMongo.js";
 import { DeviceSyncStateMongo } from "../../../src/models/mongo/DeviceSyncStateMongo.js";
 import { EasCollectionStateMongo } from "../../../src/models/mongo/EasCollectionStateMongo.js";
+import { EasCollectionChunkMongo } from "../../../src/models/mongo/EasCollectionChunkMongo.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
@@ -29,6 +30,7 @@ describe("EasDeviceStateCleanupJobMongo Tests (real DB + DI)", () => {
     let connectionManager: ConnectionManager;
     let job: EasDeviceStateCleanupJobMongo;
     let collectionStateRepo: MongoRepository<EasCollectionStateMongo>;
+    let collectionChunkRepo: MongoRepository<EasCollectionChunkMongo>;
     let deviceSyncStateRepo: MongoRepository<DeviceSyncStateMongo>;
 
     const createDevice = async (data?: Partial<DeviceSyncStateMongo>): Promise<DeviceSyncStateMongo> => {
@@ -54,6 +56,7 @@ describe("EasDeviceStateCleanupJobMongo Tests (real DB + DI)", () => {
         const models = new Map<string, any>();
         models.set("DeviceSyncStateMongo", DeviceSyncStateMongo);
         models.set("EasCollectionStateMongo", EasCollectionStateMongo);
+        models.set("EasCollectionChunkMongo", EasCollectionChunkMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("mongo");
@@ -62,6 +65,7 @@ describe("EasDeviceStateCleanupJobMongo Tests (real DB + DI)", () => {
         }
         deviceSyncStateRepo = conn.getMongoRepository("DeviceSyncStateMongo");
         collectionStateRepo = conn.getMongoRepository("EasCollectionStateMongo");
+        collectionChunkRepo = conn.getMongoRepository("EasCollectionChunkMongo");
 
         // Constructed once via real ObjectFactory DI: `@Init` builds its one real `RepoUtils` against the live
         // connection above.
@@ -83,6 +87,13 @@ describe("EasDeviceStateCleanupJobMongo Tests (real DB + DI)", () => {
         }
         try {
             await collectionStateRepo.clear();
+        } catch (err: any) {
+            if (err.message !== "ns not found") {
+                throw err;
+            }
+        }
+        try {
+            await collectionChunkRepo.clear();
         } catch (err: any) {
             if (err.message !== "ns not found") {
                 throw err;
@@ -143,8 +154,14 @@ describe("EasDeviceStateCleanupJobMongo Tests (real DB + DI)", () => {
         const pendingNeverSynced = await createDevice({ lastSyncAt: undefined, remoteWipeRequested: true });
         const acknowledged = await createDevice({ lastSyncAt: staleDate, remoteWipeRequested: false });
         const unset = await createDevice({ lastSyncAt: staleDate, remoteWipeRequested: undefined });
+        const blocked = await createDevice({ lastSyncAt: staleDate, remoteWipeRequested: false, blocked: true });
+        const unblocked = await createDevice({ lastSyncAt: undefined, blocked: false });
 
         await job.run();
+
+        // A device blocked after acknowledging a wipe is kept too, or it could pair again as a new device.
+        expect(await deviceSyncStateRepo.findOne({ uid: blocked.uid } as any)).not.toBeNull();
+        expect(await deviceSyncStateRepo.findOne({ uid: unblocked.uid } as any)).toBeNull();
 
         expect(await deviceSyncStateRepo.findOne({ uid: pendingStale.uid } as any)).not.toBeNull();
         expect(await deviceSyncStateRepo.findOne({ uid: pendingNeverSynced.uid } as any)).not.toBeNull();
@@ -216,9 +233,16 @@ describe("EasDeviceStateCleanupJobMongo Tests (real DB + DI)", () => {
             await collection(stale, folderUid);
         }
         await collection(recent, "f1");
+        await collectionStateRepo.save(
+            new EasCollectionStateMongo({ mailboxUid: stale.mailboxUid, deviceId: stale.deviceId, folderUid: "f4", collectionClass: "Email", syncKey: "1:x", chunked: true }),
+        );
+        await collectionChunkRepo.save(new EasCollectionChunkMongo({ mailboxUid: stale.mailboxUid, deviceId: stale.deviceId, folderUid: "f4", chunkIndex: 0, ids: ["a"] }));
+        await collectionChunkRepo.save(new EasCollectionChunkMongo({ mailboxUid: recent.mailboxUid, deviceId: recent.deviceId, folderUid: "f4", chunkIndex: 0, ids: ["a"] }));
 
         await job.run();
 
+        expect((await collectionChunkRepo.find({ deviceId: stale.deviceId }).toArray()).length).toBe(0);
+        expect((await collectionChunkRepo.find({ deviceId: recent.deviceId }).toArray()).length).toBe(1);
         expect((await collectionStateRepo.find({ deviceId: stale.deviceId }).toArray()).length).toBe(0);
         expect((await collectionStateRepo.find({ deviceId: recent.deviceId }).toArray()).length).toBe(1);
     });

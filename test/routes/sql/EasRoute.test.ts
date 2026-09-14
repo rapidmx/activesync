@@ -447,6 +447,29 @@ describe("Route:EasRouteSQL Tests", () => {
             expect(result.status).toBeLessThan(300);
         });
 
+        it("Lets an unprovisioned device only read UserInformation and report DeviceInformation through Settings, never set Oof.", async () => {
+            await createMailbox(owner.uid);
+            const settings = (children: WbxmlElement[]) =>
+                request(server.getApplication())
+                    .post(`${baseUrl}?Cmd=Settings&DeviceId=dev1`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                    .send(new WbxmlEncoder().encode(element(WbxmlCodePage.Settings, "Settings", children)));
+
+            const firstRun = await settings([
+                element(WbxmlCodePage.Settings, "UserInformation", [element(WbxmlCodePage.Settings, "Get", [])]),
+                element(WbxmlCodePage.Settings, "DeviceInformation", [element(WbxmlCodePage.Settings, "Set", [])]),
+            ]);
+            expect(firstRun.status).toBe(200);
+
+            const oof = await settings([
+                element(WbxmlCodePage.Settings, "UserInformation", [element(WbxmlCodePage.Settings, "Get", [])]),
+                element(WbxmlCodePage.Settings, "Oof", [element(WbxmlCodePage.Settings, "Set", [textElement(WbxmlCodePage.Settings, "OofState", "1")])]),
+            ]);
+            expect(oof.status).toBe(449);
+            expect((await mailboxRepo.findOne({ where: { ownerUserUid: owner.uid } }))?.oofEnabled).not.toBe(true);
+        });
+
         it("Returns 501 for a recognized-but-deferred command (ValidateCert) once the device is already provisioned.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await deviceSyncStateRepo.save(
@@ -626,8 +649,44 @@ describe("Route:EasRouteSQL Tests", () => {
             const afterAck = await deviceSyncStateRepo.findOne({ where: { mailboxUid: mailbox.uid, deviceId: "dev1" } });
             expect(afterAck?.remoteWipeRequested).toBe(false);
             expect(afterAck?.remoteWipeAcknowledgedAt).toBeTruthy();
-            // Still not provisioned - a genuine fresh handshake is required to re-add the account.
+            // Still not provisioned, and blocked: acknowledging the wipe and provisioning again must not work.
             expect(afterAck?.provisioned).toBe(false);
+            expect(afterAck?.blocked).toBe(true);
+
+            const refused = await postWbxml(
+                "Provision",
+                "dev1",
+                element(WbxmlCodePage.Provision, "Provision", [
+                    element(WbxmlCodePage.Provision, "Policies", [
+                        element(WbxmlCodePage.Provision, "Policy", [textElement(WbxmlCodePage.Provision, "PolicyType", "MS-EAS-Provisioning-WBXML")]),
+                    ]),
+                ]),
+            );
+            expect(childText(refused, "Status")).toBe("129");
+            for (const cmd of ["FolderSync", "Settings"]) {
+                const blocked = await request(server.getApplication())
+                    .post(`${baseUrl}?Cmd=${cmd}&DeviceId=dev1`)
+                    .set("Authorization", "jwt " + ownerToken);
+                expect(blocked.status).toBe(403);
+            }
+
+            // Only an administrator can unblock the device.
+            const notAdmin = await request(server.getApplication())
+                .post(`/sql/device-sync-state/${beforeWipe!.uid}/unblock`)
+                .set("Authorization", "jwt " + ownerToken)
+                .send({});
+            expect(notAdmin.status).toBe(403);
+            const unknown = await request(server.getApplication())
+                .post(`/sql/device-sync-state/${uuid.v4()}/unblock`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({});
+            expect(unknown.status).toBe(404);
+            const unblocked = await request(server.getApplication())
+                .post(`/sql/device-sync-state/${beforeWipe!.uid}/unblock`)
+                .set("Authorization", "jwt " + adminToken)
+                .send({});
+            expect(unblocked.status).toBeLessThan(300);
+            expect((await deviceSyncStateRepo.findOne({ where: { mailboxUid: mailbox.uid, deviceId: "dev1" } }))?.blocked).toBe(false);
 
             await provisionDevice("dev1");
             const afterReprovision = await deviceSyncStateRepo.findOne({ where: { mailboxUid: mailbox.uid, deviceId: "dev1" } });
@@ -813,7 +872,7 @@ describe("Route:EasRouteSQL Tests", () => {
             expect(childText(del, "ServerId")).toBe(folder.uid);
         });
 
-        it("Rejects an incorrect SyncKey with Status 3, forcing the client back to a full resync.", async () => {
+        it("Rejects an incorrect SyncKey with Status 9, forcing the client back to a full resync.", async () => {
             await createMailbox(owner.uid);
             await provisionDevice("dev1");
 
@@ -825,7 +884,30 @@ describe("Route:EasRouteSQL Tests", () => {
                 ]),
             );
 
-            expect(childText(response, "Status")).toBe("3");
+            expect(childText(response, "Status")).toBe("9");
+        });
+
+        it("Accepts the previously issued SyncKey again (a lost response), recomputing that round.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folderSync = (syncKey: string) =>
+                postWbxml("FolderSync", "dev1", element(WbxmlCodePage.FolderHierarchy, "FolderSync", [textElement(WbxmlCodePage.FolderHierarchy, "SyncKey", syncKey)]));
+
+            const first = childText(await folderSync("0"), "SyncKey")!;
+            const second = childText(await folderSync(first), "SyncKey")!;
+            await createFolderWithAcl(mailbox.uid, { name: "Projects", type: FolderType.USER });
+
+            // The response to `first` was lost: the client retries it, and the new folder is still reported.
+            const retried = await folderSync(first);
+            expect(childText(retried, "Status")).toBe("1");
+            expect(findChildren(findChild(retried, "Changes")!, "Add").map((add) => childText(add, "DisplayName"))).toContain("Projects");
+            expect(childText(await folderSync(second), "Status")).toBe("9");
+
+            // Continuing from the retried round works, and the key before that is still the accepted previous one.
+            const third = childText(retried, "SyncKey")!;
+            expect(childText(await folderSync(third), "Status")).toBe("1");
+            expect(childText(await folderSync("0"), "Status")).toBe("1");
+            expect(childText(await folderSync(third), "Status")).toBe("9");
         });
 
         it("Reports no Changes element when nothing changed since the last sync.", async () => {
@@ -3746,7 +3828,7 @@ describe("Route:EasRouteSQL Tests", () => {
             );
         };
 
-        it("Moves a message to another folder, reporting Status 1 and the same DstMsgId.", async () => {
+        it("Moves a message to another folder, reporting Status 3 (success) and the same DstMsgId.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");
             const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
@@ -3760,7 +3842,7 @@ describe("Route:EasRouteSQL Tests", () => {
             );
 
             const resp = findChild(response, "Response")!;
-            expect(childText(resp, "Status")).toBe("1");
+            expect(childText(resp, "Status")).toBe("3");
             expect(childText(resp, "SrcMsgId")).toBe(message.uid);
             expect(childText(resp, "DstMsgId")).toBe(message.uid);
 
@@ -3768,7 +3850,7 @@ describe("Route:EasRouteSQL Tests", () => {
             expect(moved?.folderUid).toBe(archive.uid);
         });
 
-        it("Reports Status 3 when SrcFldId doesn't match the message's actual folder.", async () => {
+        it("Reports Status 1 (invalid source) when SrcFldId doesn't match the message's actual folder.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");
             const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
@@ -3782,12 +3864,12 @@ describe("Route:EasRouteSQL Tests", () => {
                 moveRequest([{ srcMsgId: message.uid, srcFldId: otherFolder.uid, dstFldId: archive.uid }]),
             );
 
-            expect(childText(findChild(response, "Response")!, "Status")).toBe("3");
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("1");
             const unchanged = await messageRepo.findOne({ where: { uid: message.uid } });
             expect(unchanged?.folderUid).toBe(inbox.uid);
         });
 
-        it("Reports Status 3 when the destination folder doesn't belong to the caller's own mailbox.", async () => {
+        it("Reports Status 2 (invalid destination) when the destination folder doesn't belong to the caller's own mailbox.", async () => {
             const mailbox = await createMailbox(owner.uid);
             const otherMailbox = await createMailbox(otherUser.uid);
             await provisionDevice("dev1");
@@ -3801,10 +3883,10 @@ describe("Route:EasRouteSQL Tests", () => {
                 moveRequest([{ srcMsgId: message.uid, srcFldId: inbox.uid, dstFldId: otherFolder.uid }]),
             );
 
-            expect(childText(findChild(response, "Response")!, "Status")).toBe("3");
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("2");
         });
 
-        it("Reports Status 3 for a nonexistent SrcMsgId.", async () => {
+        it("Reports Status 1 for a nonexistent SrcMsgId, and Status 4 when source and destination are the same folder.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");
             const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
@@ -3816,10 +3898,12 @@ describe("Route:EasRouteSQL Tests", () => {
                 moveRequest([{ srcMsgId: "does-not-exist", srcFldId: inbox.uid, dstFldId: archive.uid }]),
             );
 
-            expect(childText(findChild(response, "Response")!, "Status")).toBe("3");
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("1");
+            const same = await postWbxml("MoveItems", "dev1", moveRequest([{ srcMsgId: "does-not-exist", srcFldId: inbox.uid, dstFldId: inbox.uid }]));
+            expect(childText(findChild(same, "Response")!, "Status")).toBe("4");
         });
 
-        it("Reports Status 3 when a Move is missing a required field.", async () => {
+        it("Reports Status 2 when a Move is missing its destination, and Status 1 when it's missing its source.", async () => {
             await createMailbox(owner.uid);
             await provisionDevice("dev1");
 
@@ -3829,10 +3913,12 @@ describe("Route:EasRouteSQL Tests", () => {
                 moveRequest([{ srcMsgId: "some-uid", srcFldId: "some-folder", dstFldId: "" }]),
             );
 
-            expect(childText(findChild(response, "Response")!, "Status")).toBe("3");
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("2");
+            const noSource = await postWbxml("MoveItems", "dev1", moveRequest([{ srcMsgId: "some-uid", srcFldId: "", dstFldId: "some-folder" }]));
+            expect(childText(findChild(noSource, "Response")!, "Status")).toBe("1");
         });
 
-        it("Reports Status 3 when the destination folder's ACL grants access but the Folder record itself is gone.", async () => {
+        it("Reports Status 2 when the destination folder's ACL grants access but the Folder record itself is gone.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");
             const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
@@ -3849,7 +3935,7 @@ describe("Route:EasRouteSQL Tests", () => {
                 moveRequest([{ srcMsgId: message.uid, srcFldId: inbox.uid, dstFldId: archive.uid }]),
             );
 
-            expect(childText(findChild(response, "Response")!, "Status")).toBe("3");
+            expect(childText(findChild(response, "Response")!, "Status")).toBe("2");
         });
     });
 
@@ -4388,7 +4474,7 @@ describe("Route:EasRouteSQL Tests", () => {
                         ]),
                     ]),
                 );
-                expect(childText(findChild(moved, "Response")!, "Status")).toBe("1");
+                expect(childText(findChild(moved, "Response")!, "Status")).toBe("3");
 
                 expect((await syncRound(inboxRound.key, "Email", inbox.uid)).commands).toEqual([`Delete:${message.uid}`]);
                 expect((await syncRound(archiveRound.key, "Email", archive.uid)).commands).toEqual([`Add:${message.uid}`]);
@@ -4697,7 +4783,7 @@ describe("Route:EasRouteSQL Tests", () => {
                 expect(tooMany.status).toBe(400);
 
                 const response = await postWbxml("MoveItems", "dev1", element(WbxmlCodePage.Move, "MoveItems", [move(otherInbox.uid)]));
-                expect(childText(findChild(response, "Response")!, "Status")).toBe("3");
+                expect(childText(findChild(response, "Response")!, "Status")).toBe("2");
                 expect((await messageRepo.findOne({ where: { uid: message.uid } }))?.folderUid).toBe(inbox.uid);
             });
         });

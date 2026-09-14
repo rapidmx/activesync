@@ -43,6 +43,7 @@ describe("DeviceSyncStateMongo", () => {
             remoteWipeRequested: true,
             remoteWipeAccountOnly: true,
             remoteWipeAcknowledgedAt,
+            blocked: true,
         });
 
         expect(obj.mailboxUid).toBe("mailbox-1");
@@ -56,6 +57,7 @@ describe("DeviceSyncStateMongo", () => {
         expect(obj.remoteWipeRequested).toBe(true);
         expect(obj.remoteWipeAccountOnly).toBe(true);
         expect(obj.remoteWipeAcknowledgedAt).toBe(remoteWipeAcknowledgedAt);
+        expect(obj.blocked).toBe(true);
     });
 
     it("DeviceSyncStateMongo preserves class defaults for fields omitted from a partial override object.", () => {
@@ -111,6 +113,7 @@ describe("DeviceSyncStateSQL", () => {
             remoteWipeRequested: true,
             remoteWipeAccountOnly: true,
             remoteWipeAcknowledgedAt,
+            blocked: true,
         });
 
         expect(obj.mailboxUid).toBe("mailbox-1");
@@ -124,6 +127,7 @@ describe("DeviceSyncStateSQL", () => {
         expect(obj.remoteWipeRequested).toBe(true);
         expect(obj.remoteWipeAccountOnly).toBe(true);
         expect(obj.remoteWipeAcknowledgedAt).toBe(remoteWipeAcknowledgedAt);
+        expect(obj.blocked).toBe(true);
     });
 
     it("DeviceSyncStateSQL preserves class defaults for fields omitted from a partial override object.", () => {

@@ -50,6 +50,13 @@ const ROOT_PARENT_ID = "0";
  * real `Folder.uid`, which is exactly why using the mailbox's own uid here would be ambiguous. */
 const FOLDER_HIERARCHY_CURSOR_KEY = "$foldersync";
 
+/** Where the key issued before the current one is kept, so a client that never received the last response can retry
+ * with it. */
+const FOLDER_HIERARCHY_PREVIOUS_KEY = "$foldersyncPrevious";
+
+/** [MS-ASCMD] FolderSync Status 9: the synchronization key is invalid or doesn't match - restart from `SyncKey 0`. */
+const STATUS_INVALID_SYNC_KEY = "9";
+
 /** Caps how many folder changes are enumerated per round - real mailboxes rarely have more than a few dozen
  * folders, so this is generous, not a real-world binding constraint; it exists so `computeChanges()`'s
  * `MoreAvailable` mechanism is exercised the same way it will be for `SyncCommand`'s much larger item
@@ -64,6 +71,10 @@ const MAX_INITIAL_PAGES = 100;
  * since the device's last `FolderSync`, using the shared watermark-based cursor mechanism in
  * `EasSyncKeyUtils.ts` (scoped by `mailboxUid` over the `Folder` collection, rather than `folderUid` over a
  * per-folder item collection the way `SyncCommand` will be).
+ *
+ * **Keys**: an unknown `SyncKey` is answered with Status 9 ([MS-ASCMD] FolderSync: "synchronization key mismatch or
+ * invalid synchronization key"; the client restarts from `0`). The key issued before the current one is still
+ * accepted: the key itself encodes its cursor, so a retry simply recomputes that round's changes.
  *
  * `folderClass` is supplied by the Mongo/SQL concrete subclasses, following the exact one-line-per-backend
  * pattern used throughout this library's other routes/jobs.
@@ -97,12 +108,18 @@ export abstract class FolderSyncCommand<F extends Folder> implements EasCommandH
         }
 
         const clientSyncKey: string | undefined = ctx.request ? childText(ctx.request, "SyncKey") : undefined;
-        const storedSyncKey: string | undefined = ctx.deviceSyncState.folderSyncKeys[FOLDER_HIERARCHY_CURSOR_KEY];
-        const resolution = resolveSyncKey(clientSyncKey, storedSyncKey);
+        const storedSyncKey: string | undefined = ctx.deviceSyncState.folderSyncKeys?.[FOLDER_HIERARCHY_CURSOR_KEY];
+        const previousSyncKey: string | undefined = ctx.deviceSyncState.folderSyncKeys?.[FOLDER_HIERARCHY_PREVIOUS_KEY];
+        let resolution = resolveSyncKey(clientSyncKey, storedSyncKey);
+        let retry = false;
+        if (resolution.kind === "invalid" && previousSyncKey !== undefined) {
+            resolution = resolveSyncKey(clientSyncKey, previousSyncKey);
+            retry = resolution.kind === "valid";
+        }
 
         if (resolution.kind === "invalid") {
             return element(WbxmlCodePage.FolderHierarchy, "FolderSync", [
-                textElement(WbxmlCodePage.FolderHierarchy, "Status", "3"),
+                textElement(WbxmlCodePage.FolderHierarchy, "Status", STATUS_INVALID_SYNC_KEY),
             ]);
         }
 
@@ -143,9 +160,19 @@ export abstract class FolderSyncCommand<F extends Folder> implements EasCommandH
         }
 
         const newKey = formatSyncKey({ generation: generation + 1, watermark: cursor.date, uid: cursor.uid });
-        await persistDeviceSyncState(ctx.deviceSyncState, ctx.deviceSyncStateRepo, (current) => ({
-            folderSyncKeys: { ...current.folderSyncKeys, [FOLDER_HIERARCHY_CURSOR_KEY]: newKey },
-        }));
+        // A retry keeps the previous key as it was; a normal round makes the key just consumed the previous one; a
+        // restart forgets it.
+        const previous: string | undefined = retry ? previousSyncKey : resolution.kind === "valid" ? clientSyncKey : undefined;
+        await persistDeviceSyncState(ctx.deviceSyncState, ctx.deviceSyncStateRepo, (current) => {
+            const { [FOLDER_HIERARCHY_PREVIOUS_KEY]: _dropped, ...rest } = current.folderSyncKeys ?? {};
+            return {
+                folderSyncKeys: {
+                    ...rest,
+                    [FOLDER_HIERARCHY_CURSOR_KEY]: newKey,
+                    ...(previous !== undefined ? { [FOLDER_HIERARCHY_PREVIOUS_KEY]: previous } : {}),
+                },
+            };
+        });
 
         const totalChanges: number = adds.length + updates.length + deletes.length;
         if (totalChanges === 0) {

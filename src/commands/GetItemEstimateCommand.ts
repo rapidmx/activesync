@@ -8,6 +8,8 @@ import { type Folder, RecoverableRepoUtils } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import { classForFolderType, enumerateCollection, filterPredicate, workingStateFromRow } from "../EasCollectionSync.js";
+import { loadHeldSet } from "../EasCollectionStore.js";
+import { MAX_SYNC_COLLECTIONS } from "./SyncCommand.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 import type { EasCollectionState } from "../models/EasCollectionState.js";
 const { Config, Init, Inject } = ObjectDecorators;
@@ -18,6 +20,9 @@ const DEFAULT_MAX_COUNT = 512;
 
 /** Rows read from the out-of-folder stream while estimating (mirrors `SyncCommand`). */
 const MOVE_SCAN_LIMIT = 1000;
+
+/** Held ids reconciled against the store while estimating (mirrors `SyncCommand`). */
+const RECONCILE_LIMIT = 100;
 
 /** Binds one MS-ASCMD `Class` value to the concrete entity class this command counts against. Supplied by the
  * Mongo/SQL concrete subclasses. */
@@ -39,6 +44,9 @@ export interface EstimateCollectionBinding {
  * `mail:eas:item_estimate_max_count`; any other key is Status 2. A request without `Class` falls back to the class
  * remembered for the collection, then to the folder's type.
  *
+ * **Bounded like `Sync`**: at most `MAX_SYNC_COLLECTIONS` collections per request (more is a single Status 2), a
+ * `CollectionId` repeated within one request is estimated once, and a `SyncKey 0` count is capped at the same maximum.
+ *
  * **ACL-checked like `Sync`**: `READ` on the client-supplied `CollectionId` is required before counting anything;
  * a denied folder is reported identically to an unrecognized collection (`Status 2`).
  *
@@ -50,6 +58,7 @@ export abstract class GetItemEstimateCommand implements EasCommandHandler {
     protected abstract collectionBindings: Record<string, EstimateCollectionBinding>;
     protected abstract folderClass: any;
     protected abstract collectionStateClass: any;
+    protected abstract collectionChunkClass: any;
 
     @Config("mail:eas:item_estimate_max_count", DEFAULT_MAX_COUNT)
     private maxCount: number = DEFAULT_MAX_COUNT;
@@ -63,6 +72,7 @@ export abstract class GetItemEstimateCommand implements EasCommandHandler {
     private repos = new Map<string, RepoUtils<any>>();
     private folderRepo?: RepoUtils<any>;
     private collectionStateRepo?: RepoUtils<any>;
+    private collectionChunkRepo?: RepoUtils<any>;
 
     @Init
     public async init(): Promise<void> {
@@ -73,6 +83,10 @@ export abstract class GetItemEstimateCommand implements EasCommandHandler {
         this.collectionStateRepo = await this._objectFactory!.newInstance(RepoUtils, {
             name: this.collectionStateClass.name,
             args: [this.collectionStateClass],
+        });
+        this.collectionChunkRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.collectionChunkClass.name,
+            args: [this.collectionChunkClass],
         });
         for (const [collectionClass, binding] of Object.entries(this.collectionBindings)) {
             this.repos.set(
@@ -86,17 +100,25 @@ export abstract class GetItemEstimateCommand implements EasCommandHandler {
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
-        if (!this.aclUtils || !this.folderRepo || !this.collectionStateRepo) {
+        if (!this.aclUtils || !this.folderRepo || !this.collectionStateRepo || !this.collectionChunkRepo) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         const collections = ctx.request ? findChild(ctx.request, "Collections") : undefined;
         const collectionEls = collections ? findChildren(collections, "Collection") : [];
-        if (collectionEls.length === 0) {
+        if (collectionEls.length === 0 || collectionEls.length > MAX_SYNC_COLLECTIONS) {
             return element(WbxmlCodePage.ItemEstimate, "GetItemEstimate", [this.statusResponse("2")]);
         }
 
         const responses: WbxmlElement[] = [];
+        const seen = new Set<string>();
         for (const collectionEl of collectionEls) {
+            const folderUid: string | undefined = childText(collectionEl, "CollectionId");
+            if (folderUid !== undefined) {
+                if (seen.has(folderUid)) {
+                    continue;
+                }
+                seen.add(folderUid);
+            }
             responses.push(await this.estimateCollection(ctx, collectionEl));
         }
 
@@ -135,15 +157,16 @@ export abstract class GetItemEstimateCommand implements EasCommandHandler {
         let count: number;
         if (!clientSyncKey || clientSyncKey === "0") {
             // Every live item would be an Add on the device's first real Sync round.
-            count = await repo.count({ folderUid } as any, { ignoreACL: true });
+            count = Math.min(await repo.count({ folderUid } as any, { ignoreACL: true }), this.maxCount);
         } else if (stored && clientSyncKey === stored.syncKey) {
-            const working = workingStateFromRow(stored);
+            const working = workingStateFromRow(stored, (await loadHeldSet(stored, { repo: this.collectionChunkRepo!, chunkClass: this.collectionChunkClass })).ids);
             const { commands } = await enumerateCollection(working, {
                 repo,
                 folderUid,
                 folderMailboxUid: folder.mailboxUid,
                 windowSize: this.maxCount,
                 moveScanLimit: MOVE_SCAN_LIMIT,
+                reconcileLimit: RECONCILE_LIMIT,
                 include: filterPredicate(collectionClass, working.filterType),
             });
             count = commands.length;

@@ -78,6 +78,21 @@ export class EasCollectionStateMongo extends BaseMongoEntity implements EasColle
     public echoes: Record<string, string> = {};
 
     @Column()
+    @Description("`true` once the held set is stored in `EasCollectionChunk` rows.")
+    @Nullable
+    public chunked?: boolean;
+
+    @Column()
+    @Description("Item uid to `dateModified` of rows processed within the overlap window before the cursor.")
+    @Nullable
+    public recent?: Record<string, string>;
+
+    @Column()
+    @Description("The last held `ServerId` checked by the periodic reconcile.")
+    @Nullable
+    public reconcileCursor?: string;
+
+    @Column()
     @Description("The `FilterType` the collection was synced with.")
     @Nullable
     public filterType?: string;
@@ -102,6 +117,9 @@ export class EasCollectionStateMongo extends BaseMongoEntity implements EasColle
             this.moveCursorUid = other.moveCursorUid !== undefined ? other.moveCursorUid : this.moveCursorUid;
             this.serverIds = other.serverIds !== undefined ? other.serverIds : this.serverIds;
             this.echoes = other.echoes !== undefined ? other.echoes : this.echoes;
+            this.chunked = "chunked" in other ? other.chunked : this.chunked;
+            this.recent = "recent" in other ? other.recent : this.recent;
+            this.reconcileCursor = "reconcileCursor" in other ? other.reconcileCursor : this.reconcileCursor;
             this.filterType = "filterType" in other ? other.filterType : this.filterType;
             this.previous = "previous" in other ? other.previous : this.previous;
         }

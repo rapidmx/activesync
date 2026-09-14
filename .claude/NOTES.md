@@ -49,6 +49,93 @@ Keep entries terse — this is a reference, not a transcript.
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
 
+### 2026-09-14 (4) — Round-4 review fixes (held-set chunks, leases, overlap/reconcile, wipe block, meeting copies)
+
+All findings checked against HEAD `88290ce`. 14 fixed, finding 6 (move stream per device) noted rather than
+built. Uncommitted, no version/peerDependency changes. Restapi, server, web-client, react-shared and mapi were
+being edited by other agents at the same time and weren't touched.
+
+- **1 (critical, fixed here as a backstop; restapi is fixing `MeetingSchedulingJob` itself)**: the installed job
+  sends a REQUEST for any event with attendees whose `inviteSequenceSent !== sequence`, and a CANCEL for any
+  soft-deleted event with `cancelNoticeSentAt` unset, always as the organizer. So an attendee deleting or editing
+  their own copy of someone else's meeting from a phone mailed everyone. Now `isOrganizedBy(event, mailbox)` in
+  `CalendarSyncAdapter` decides whose copy it is. On an attendee copy a `Change` never bumps `sequence` and sets
+  `inviteSequenceSent = sequence` when they differ. A new optional adapter hook `beforeDelete` stamps
+  `cancelNoticeSentAt` before `SyncCommand` deletes the item. `MeetingResponseCommand` does the same for a decline
+  (stamp, then delete) and for accept/tentative (sets `inviteSequenceSent`). For Sync, "own" is judged against the
+  **folder's** mailbox, not the caller's. A delegate rescheduling the owner's meeting in a shared calendar is still
+  the organizer's copy and still sends invites. So `SyncCommand` now passes the folder-owner mailbox to
+  `fromApplicationData` on `Change` (Add still gets the caller's), and the interface doc says so.
+- **2**: `countHeader()` counts raw top-level `From`/`Sender` field starts (continuation lines don't count,
+  `From :` does). More than one of either is a 403, checked before `simpleParser`, which keeps only one of them.
+- **3**: `scanOverlap()` (EasSyncKeyUtils) re-reads the 5 s before each cursor, newest first, limit 1000. The
+  folder stream dedupes against the new `EasCollectionState.recent` (uid -> dateModified ISO of rows processed
+  inside the window, pruned to the window and 1000 entries). Only a row not recorded there at that timestamp is
+  processed, and it never moves the cursor. Move-stream overlap rows are re-applied without dedupe, since a Delete
+  only happens while the item is held. A legacy row with no `recent` seeds it from whatever is already in the
+  window, so upgrading doesn't re-send anything. The overlap is its own query rather than lowering the cursor:
+  lowering it would never make progress once more than a window's worth of rows share the last 5 s.
+- **4**: without `Options`, SyncKey 0 stores `filterType: null` (null, not undefined, or SQL keeps an old value).
+  The first `FilterType` is adopted while nothing is held or generation <= 1. A mismatch after that is still
+  Status 3. `workingState.filterType` is now optional and `filterPredicate` accepts undefined.
+- **5**: `PingCommand` checks for pending changes (`scanAfter` from the collection's stored cursor, limit 5,
+  ignoring the device's own echoes; a full page counts as a change) once subscribed. It also checks right away when
+  Redis isn't configured and when the connect fails. Any hit answers Status 2 immediately. This needs the entity
+  classes, so there are new `PingCommandMongo`/`PingCommandSQL` subclasses (the base still works without them) and
+  both `EasRoute`s use them.
+- **6 (noted, not built)**: one shared out-of-folder stream per device would mean moving the move cursor from
+  `EasCollectionState` to device level, and rethinking per-collection retries (`previous.moveCursor*`), GetItemEstimate
+  dry runs and SyncKey 0 resets. That isn't contained. The real cost is unindexed change queries, and restapi is adding
+  `(folderUid, dateModified, uid)` / `(mailboxUid, dateModified, uid)` indexes. The move stream only runs while the
+  device holds items, and is capped at 1000 rows per round.
+- **7**: new `EasCollectionLease` takes an in-process per-key lease, plus Redis `SET NX PX` on `datastores:cache`
+  when configured (token-checked Lua release; fails open to in-process if Redis is unreachable). `SyncCommand` holds
+  it per (mailbox, device, folder) and reads the state row only after acquiring it. Waiting more than 15 s gives
+  Status 16. A failed state save now gives Status 3 with no SyncKey (was: log it and return the unsaved key), and a
+  failed SyncKey 0 save gives Status 5. **A race in my own first version, caught by the concurrency test**: the check
+  "is the key free" was separated from "take it" by an `await`, so two waiters could both win. `takeLocal()` now
+  checks and takes in the same tick.
+- **8**: new `EasCollectionChunk` model (`@MailboxScopedData`, unique index `(mailboxUid, deviceId, folderUid,
+  chunkIndex)`, 2000 ids per chunk). It's exported from `./mongo`/`./sql` and registered in both test servers, the
+  cleanup job tests and plugin.test. `EasCollectionStore.saveHeldSet` keeps a held set of 2000 or fewer inline in
+  `serverIds` until it first outgrows that. After that `chunked: true` stays set until SyncKey 0, which truncates the
+  chunks. Each round writes only the difference: removed ids are dropped from their chunk, new ids fill free space
+  before new chunks are appended, only changed chunks are updated, and emptied chunks are deleted. The chunk writes
+  and the state row aren't atomic. That's why a failed save is Status 3 (the device restarts from 0, which clears
+  the chunks). The cleanup job also truncates a forgotten device's chunks. `GetItemEstimate` loads chunks too.
+- **9**: when a round has caught up (no MoreAvailable, window not full), `enumerateCollection` checks up to 100
+  held ids after `reconcileCursor` with `uid in(...)` in the folder. Any that are missing are Deleted: hard purges,
+  and anything the streams missed. The cursor wraps around. It's off by default in `enumerateCollection`; SyncCommand
+  and GetItemEstimate set it. The SyncCommand unit harness sets `reconcileLimit = 0`, because its fake repos find
+  nothing.
+- **10**: after acknowledging a wipe, a device gets `DeviceSyncState.blocked = true`. `ProvisionCommand` answers
+  Status 129 (DeviceIsBlockedForThisUser), `BaseEasRoute` gives 403 for any other command, and the cleanup job
+  never purges a blocked row (otherwise the device could re-pair as new). An admin clears it with
+  `POST /:uid/unblock` on `BaseDeviceSyncStateRoute`. This doesn't cover a device that changes its client-chosen
+  DeviceId; that's inherent to EAS.
+- **11**: confirmed against [MS-ASCMD] Status (FolderSync): 9 means "synchronization key mismatch/invalid". The key
+  before the current one is kept in `folderSyncKeys.$foldersyncPrevious` and accepted again. The key encodes its own
+  cursor, so a retry just recomputes that round, and the previous key stays as it was.
+- **12**: GetItemEstimate refuses more than `MAX_SYNC_COLLECTIONS` collections (a single Status 2), estimates a
+  repeated CollectionId once, and caps the SyncKey 0 `count()` at `item_estimate_max_count`.
+- **13**: the provisioning gate exempts only `Provision`, plus a `Settings` request whose top-level elements are all
+  `UserInformation`/`DeviceInformation`. Settings is decoded before the gate to check that; other commands are still
+  decoded after it. So an unprovisioned (or wiped) device can't `Oof/Set`.
+- **14**: EmptyFolderContents: at most 20 batches per request. A message that fails to delete is skipped, and a
+  batch with nothing new ends the loop. Status 17 (partial) or 3 (nothing deleted), per [MS-ASCMD] ItemOperations
+  statuses. ItemOperations Move: a per-message failure is skipped, Status 17 if any failed, 3 if none moved.
+  MoveItems: a failed update is that move's Status 7. **Also found and fixed while there: MoveItems status codes
+  were inverted.** [MS-ASCMD] 2.2.3.177.10 says 3 = success, 1 = invalid source, 2 = invalid destination, 4 = same
+  folder, 7 = locked. The code sent 1 for success and 3 for every failure, so clients read success as "invalid
+  source" and every failure as success. Route tests updated to match.
+- **15**: `sendOrThrow` exists in restapi's source (`transport/TransportResultUtils.ts`) but **not in the installed
+  published 0.9.0**, and bumping the dependency wasn't allowed. So `MeetingResponseCommand.sendReply` does the same
+  check inline (a result with no accepted recipients, or any rejected ones, counts as a failure). A failed REPLY now
+  gives that Result Status 4 ("error on the server"); the response itself is still recorded. **Follow-up:** switch to
+  `sendOrThrow` once the peer range includes a restapi that exports it.
+- Verified: `yarn vitest run` 733/733 with coverage thresholds met (100/97.9/100/100), `yarn lint` clean,
+  `npx tsc --noEmit -p .` clean.
+
 ### 2026-09-14 (3) — Round-3 review fixes (Sync state redesign, spoofing, DoS bounds, Ping, provisioning)
 
 All 15 findings confirmed against HEAD `9888059` and fixed; nothing skipped. Uncommitted.

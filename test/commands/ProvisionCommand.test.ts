@@ -124,6 +124,8 @@ describe("ProvisionCommand Tests", () => {
         expect(ctx.deviceSyncState.remoteWipeRequested).toBe(false);
         expect(ctx.deviceSyncState.provisioned).toBe(false);
         expect((ctx.deviceSyncState as any).remoteWipeAcknowledgedAt).toBeInstanceOf(Date);
+        // Blocked until an administrator unblocks it, so the device can't simply provision again.
+        expect((ctx.deviceSyncState as any).blocked).toBe(true);
     });
 
     it("Answers an acknowledgement of a policy key issued before a wipe was requested with the RemoteWipe directive, never provisioning.", async () => {
@@ -166,5 +168,25 @@ describe("ProvisionCommand Tests", () => {
         expect(childText(response!, "Status")).toBe("2");
         expect(update).not.toHaveBeenCalled();
         expect((ctx.deviceSyncState as any).remoteWipeAcknowledgedAt).toBeUndefined();
+    });
+
+    it("Refuses every Provision request from a blocked device with Status 129, writing nothing.", async () => {
+        const command = new ProvisionCommand();
+        const update = vi.fn().mockResolvedValue(undefined);
+        for (const request of [
+            undefined,
+            element(WbxmlCodePage.Provision, "Provision", [element(WbxmlCodePage.Provision, "RemoteWipe", [textElement(WbxmlCodePage.Provision, "Status", "1")])]),
+        ]) {
+            const ctx = makeContext({
+                deviceSyncState: { uid: "dss-1", version: 1, provisioned: false, blocked: true, remoteWipeRequested: true } as any,
+                deviceSyncStateRepo: { update } as any,
+                request,
+            });
+            const response = await command.handle(ctx);
+            expect(childText(response!, "Status")).toBe("129");
+            expect(findChild(response!, "Policies")).toBeUndefined();
+            expect(findChild(response!, "RemoteWipe")).toBeUndefined();
+        }
+        expect(update).not.toHaveBeenCalled();
     });
 });

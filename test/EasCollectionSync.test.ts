@@ -28,27 +28,30 @@ interface Row {
     [key: string]: any;
 }
 
-/** Evaluates the `scanAfter` query shapes (`gt`/`range`/`ne` operands, `$or`, `deleted`, `limit`) over `rows`. */
+/** Evaluates the `scanAfter`/`scanOverlap`/reconcile query shapes (`gt`/`range`/`ne`/`in` operands, `$or`, `deleted`,
+ * an ascending or descending `sort`, `limit`) over `rows`. */
 function fakeRepo(rows: Row[]): any {
     const matches = (row: Row, query: Record<string, any>): boolean =>
         Object.entries(query).every(([key, value]) => {
             if (key === "sort" || key === "limit") return true;
             if (key === "$or") return (value as any[]).some((sub) => matches(row, sub));
             if (key === "deleted") return (row.deleted === true) === value;
-            const op = /^(gt|range|ne)\((.*)\)$/.exec(String(value));
+            const op = /^(gt|range|ne|in)\((.*)\)$/.exec(String(value));
             const field = row[key] instanceof Date ? row[key].toISOString() : row[key];
             if (!op) return field === value;
             if (op[1] === "gt") return field > op[2];
             if (op[1] === "ne") return field !== op[2];
+            if (op[1] === "in") return op[2].split(",").includes(field);
             const [lo, hi] = op[2].split(",");
             return field >= lo && field <= hi;
         });
     return {
         find: vi.fn().mockImplementation(async (query: any) => {
             const effective = "deleted" in query ? query : { ...query, deleted: false };
+            const descending = String(query.sort ?? "").includes("DESC");
             return rows
                 .filter((row) => matches(row, effective))
-                .sort((a, b) => a.dateModified.getTime() - b.dateModified.getTime() || (a.uid < b.uid ? -1 : 1))
+                .sort((a, b) => (a.dateModified.getTime() - b.dateModified.getTime() || (a.uid < b.uid ? -1 : 1)) * (descending ? -1 : 1))
                 .slice(0, query.limit);
         }),
     };
@@ -63,6 +66,7 @@ function state(overrides: Partial<CollectionWorkingState> = {}): CollectionWorki
         moveCursor: { date: new Date(0), uid: "" },
         serverIds: new Set(),
         echoes: new Map(),
+        reconcileCursor: "",
         filterType: "0",
         ...overrides,
     };
@@ -215,6 +219,147 @@ describe("EasCollectionSync Tests", () => {
         });
     });
 
+    describe("overlap re-read", () => {
+        it("Processes a folder row that became visible behind the cursor once, and skips rows already reported there.", async () => {
+            const rows: Row[] = [
+                { uid: "already", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(10) },
+                { uid: "cursor-row", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(10) },
+            ];
+            const repo = fakeRepo(rows);
+            const overlapMs = 5 * 60_000;
+            const s = state({
+                cursor: { date: t(10), uid: "cursor-row" },
+                moveCursor: { date: t(900), uid: "" },
+                recent: new Map([
+                    ["already", t(10).toISOString()],
+                    ["cursor-row", t(10).toISOString()],
+                ]),
+            });
+
+            // Nothing new: the window only holds rows already reported.
+            expect((await enumerateCollection(s, { ...base, repo, windowSize: 10, overlapMs })).commands).toEqual([]);
+
+            // Another replica commits a row stamped before the cursor.
+            rows.push({ uid: "late", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(9) });
+            const { commands } = await enumerateCollection(s, { ...base, repo, windowSize: 10, overlapMs });
+            expect(commands.map((c: any) => `${c.kind}:${c.item.uid}`)).toEqual(["Add:late"]);
+            expect(s.cursor).toEqual({ date: t(10), uid: "cursor-row" });
+            expect(s.recent!.get("late")).toBe(t(9).toISOString());
+
+            // Reported once only.
+            expect((await enumerateCollection(s, { ...base, repo, windowSize: 10, overlapMs })).commands).toEqual([]);
+        });
+
+        it("Leaves a late row for a later round when the window is already full.", async () => {
+            const repo = fakeRepo([
+                { uid: "late", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(9) },
+                { uid: "next", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(11) },
+            ]);
+            const s = state({ cursor: { date: t(10), uid: "" }, moveCursor: { date: t(900), uid: "" }, recent: new Map() });
+
+            const { commands, moreAvailable } = await enumerateCollection(s, { ...base, repo, windowSize: 0, overlapMs: 5 * 60_000 });
+
+            expect(commands).toEqual([]);
+            expect(moreAvailable).toBe(true);
+            expect(s.recent!.has("late")).toBe(false);
+            expect(s.cursor).toEqual({ date: t(10), uid: "" });
+        });
+
+        it("Takes everything already in the window as reported for a row saved before overlap tracking existed.", async () => {
+            const repo = fakeRepo([{ uid: "old", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(9) }]);
+            const s = state({ cursor: { date: t(10), uid: "" }, moveCursor: { date: t(900), uid: "" } });
+
+            const { commands } = await enumerateCollection(s, { ...base, repo, windowSize: 10, overlapMs: 5 * 60_000 });
+
+            expect(commands).toEqual([]);
+            expect(s.recent).toEqual(new Map([["old", t(9).toISOString()]]));
+        });
+
+        it("Re-applies a move committed behind the out-of-folder cursor, and stops it when the window is full.", async () => {
+            const repo = fakeRepo([
+                { uid: "moved-late", folderUid: "archive", mailboxUid: "mbx", dateModified: t(19) },
+                { uid: "moved-too", folderUid: "archive", mailboxUid: "mbx", dateModified: t(19) },
+            ]);
+            const s = state({ serverIds: new Set(["moved-late", "moved-too"]), moveCursor: { date: t(20), uid: "" }, recent: new Map() });
+
+            const full = await enumerateCollection(s, { ...base, repo, windowSize: 1, overlapMs: 5 * 60_000 });
+            expect(full.commands).toEqual([{ kind: "Delete", uid: "moved-late" }]);
+            expect(full.moreAvailable).toBe(true);
+            expect(s.moveCursor).toEqual({ date: t(20), uid: "" });
+
+            const rest = await enumerateCollection(s, { ...base, repo, windowSize: 10, overlapMs: 5 * 60_000 });
+            expect(rest.commands).toEqual([{ kind: "Delete", uid: "moved-too" }]);
+        });
+
+        it("Prunes recent to the overlap window and the entry limit, keeping the newest.", async () => {
+            const repo = fakeRepo([
+                { uid: "a", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(1) },
+                { uid: "b", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(30) },
+                { uid: "c", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(31) },
+                { uid: "d", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(31) },
+            ]);
+            const s = state({ moveCursor: { date: t(900), uid: "" }, recent: new Map([["stale", t(0).toISOString()]]) });
+
+            await enumerateCollection(s, { ...base, repo, windowSize: 10, overlapMs: 5 * 60_000, overlapLimit: 2 });
+
+            expect([...s.recent!.keys()].sort()).toEqual(["c", "d"]);
+        });
+
+        it("Does no overlap re-read with a zero window or limit.", async () => {
+            const repo = fakeRepo([{ uid: "late", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(9) }]);
+            const s = state({ cursor: { date: t(10), uid: "" }, moveCursor: { date: t(900), uid: "" }, recent: new Map() });
+            expect((await enumerateCollection(s, { ...base, repo, windowSize: 10, overlapMs: 0 })).commands).toEqual([]);
+            expect((await enumerateCollection(s, { ...base, repo, windowSize: 10, overlapLimit: 0, overlapMs: 5 * 60_000 })).commands).toEqual([]);
+        });
+    });
+
+    describe("reconcile", () => {
+        it("Reports held items that no longer exist in the folder as Deletes, a slice per caught-up round, wrapping around.", async () => {
+            const repo = fakeRepo([
+                { uid: "a", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(1) },
+                { uid: "c", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(1) },
+                { uid: "moved", folderUid: "archive", mailboxUid: "mbx", dateModified: t(1) },
+            ]);
+            const s = state({
+                serverIds: new Set(["a", "b-purged", "c", "d-purged", "moved"]),
+                cursor: { date: t(5), uid: "" },
+                moveCursor: { date: t(5), uid: "" },
+                recent: new Map(),
+            });
+            const options = { ...base, repo, windowSize: 10, overlapMs: 0, reconcileLimit: 2 };
+
+            const first = await enumerateCollection(s, options);
+            expect(first.commands).toEqual([{ kind: "Delete", uid: "b-purged" }]);
+            expect(s.reconcileCursor).toBe("b-purged");
+
+            const second = await enumerateCollection(s, options);
+            expect(second.commands).toEqual([{ kind: "Delete", uid: "d-purged" }]);
+
+            const third = await enumerateCollection(s, options);
+            expect(third.commands).toEqual([{ kind: "Delete", uid: "moved" }]);
+            expect(s.reconcileCursor).toBe("");
+            expect([...s.serverIds].sort()).toEqual(["a", "c"]);
+
+            // An empty slice (the cursor is past every held id) just starts over.
+            s.reconcileCursor = "zzz";
+            expect((await enumerateCollection(s, options)).commands).toEqual([]);
+            expect(s.reconcileCursor).toBe("");
+        });
+
+        it("Stops at the window, leaving the rest for a later round, and doesn't run while more changes are pending.", async () => {
+            const repo = fakeRepo([{ uid: "new", folderUid: "inbox", mailboxUid: "mbx", dateModified: t(9) }]);
+            const s = state({ serverIds: new Set(["x-purged", "y-purged"]), cursor: { date: t(5), uid: "" }, moveCursor: { date: t(5), uid: "" }, recent: new Map() });
+
+            const busy = await enumerateCollection(s, { ...base, repo, windowSize: 1, overlapMs: 0, reconcileLimit: 10 });
+            expect(busy.commands.map((c: any) => c.kind)).toEqual(["Add"]);
+
+            const partial = await enumerateCollection(s, { ...base, repo, windowSize: 1, overlapMs: 0, reconcileLimit: 10 });
+            expect(partial.commands).toEqual([{ kind: "Delete", uid: "x-purged" }]);
+            expect(partial.moreAvailable).toBe(true);
+            expect(s.reconcileCursor).toBe("x-purged");
+        });
+    });
+
     describe("working state", () => {
         const row: any = {
             syncKey: formatSyncKey({ generation: 3, watermark: t(9) }),
@@ -261,10 +406,27 @@ describe("EasCollectionSync Tests", () => {
             const s = workingStateFromRow({ ...row, syncKey: "garbage", echoes: undefined, filterType: undefined });
             expect(s.generation).toBe(0);
             expect(s.echoes.size).toBe(0);
-            expect(s.filterType).toBe("0");
-            const r = workingStateFromRound({ ...row, filterType: undefined }, { ...row.previous, syncKey: "garbage" });
+            expect(s.filterType).toBeUndefined();
+            expect(s.recent).toBeUndefined();
+            expect(s.reconcileCursor).toBe("");
+            const r = workingStateFromRound({ ...row, filterType: null }, { ...row.previous, syncKey: "garbage" });
             expect(r.generation).toBe(0);
-            expect(r.filterType).toBe("0");
+            expect(r.filterType).toBeUndefined();
+            expect(r.reconcileCursor).toBe("");
+        });
+
+        it("Takes the held set from the caller when given, and restores recent/reconcileCursor for a retried round.", () => {
+            const withRecent = { ...row, recent: { a: t(9).toISOString() }, reconcileCursor: "m", previous: { ...row.previous, recent: { b: "x" }, reconcileCursor: "c" } };
+            const s = workingStateFromRow(withRecent, new Set(["chunked-1", "new"]));
+            expect([...s.serverIds]).toEqual(["chunked-1", "new"]);
+            expect(s.recent).toEqual(new Map([["a", t(9).toISOString()]]));
+            expect(s.reconcileCursor).toBe("m");
+            const r = workingStateFromRound(withRecent, withRecent.previous, new Set(["chunked-1", "new"]));
+            expect([...r.serverIds].sort()).toEqual(["chunked-1", "gone"]);
+            expect(r.recent).toEqual(new Map([["b", "x"]]));
+            expect(r.reconcileCursor).toBe("c");
+            expect(cloneWorkingState(r).recent).not.toBe(r.recent);
+            expect(roundRecord("k", r, r, new Map()).recent).toEqual({ b: "x" });
         });
 
         it("Clones deeply and records a round's delta.", () => {
@@ -286,6 +448,7 @@ describe("EasCollectionSync Tests", () => {
                 addedIds: ["z"],
                 removedIds: ["a"],
                 echoes: { a: t(9).toISOString() },
+                reconcileCursor: "",
                 clientIds: [{ clientId: "c", serverId: "z" }],
             });
         });

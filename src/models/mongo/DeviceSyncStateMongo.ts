@@ -87,6 +87,11 @@ export class DeviceSyncStateMongo extends BaseMongoEntity implements DeviceSyncS
     @Nullable
     public remoteWipeAcknowledgedAt?: Date;
 
+    @Column()
+    @Description("`true` once the device acknowledged a remote wipe, until an administrator unblocks it.")
+    @Nullable
+    public blocked?: boolean;
+
     constructor(other?: Partial<DeviceSyncStateMongo>) {
         super(other);
 
@@ -105,6 +110,7 @@ export class DeviceSyncStateMongo extends BaseMongoEntity implements DeviceSyncS
                 "remoteWipeAccountOnly" in other ? other.remoteWipeAccountOnly : this.remoteWipeAccountOnly;
             this.remoteWipeAcknowledgedAt =
                 "remoteWipeAcknowledgedAt" in other ? other.remoteWipeAcknowledgedAt : this.remoteWipeAcknowledgedAt;
+            this.blocked = "blocked" in other ? other.blocked : this.blocked;
         }
     }
 }

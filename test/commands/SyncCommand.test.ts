@@ -16,6 +16,8 @@ import { SyncCommandMongo } from "../../src/commands/mongo/SyncCommandMongo.js";
 import { element, findChild, findChildren, childText, textElement, type WbxmlElement } from "../../src/codec/WbxmlElement.js";
 import { WbxmlCodePage } from "../../src/codec/WbxmlCodePages.js";
 import { formatSyncKey } from "../../src/EasSyncKeyUtils.js";
+import { EasCollectionLease } from "../../src/EasCollectionLease.js";
+import { INLINE_HELD_LIMIT } from "../../src/EasCollectionStore.js";
 import type { EasCommandContext } from "../../src/EasCommandHandler.js";
 import type { EasCollectionSyncAdapter } from "../../src/adapters/EasCollectionSyncAdapter.js";
 
@@ -88,6 +90,7 @@ interface Harness {
     command: SyncCommandMongo;
     stateRepo: any;
     folderRepo: any;
+    chunkRepo: any;
     logger: any;
 }
 
@@ -110,17 +113,28 @@ async function buildCommand(
         findOne: vi.fn().mockResolvedValue(options.folder === null ? undefined : (options.folder ?? { uid: FOLDER_UID, mailboxUid: "mbx-1", type: FolderType.USER })),
         find: vi.fn().mockResolvedValue([{ uid: "deleted-items", mailboxUid: "mbx-1", type: FolderType.DELETED_ITEMS }]),
     };
+    const chunkRepo = {
+        find: vi.fn().mockResolvedValue([]),
+        create: vi.fn().mockResolvedValue(undefined),
+        update: vi.fn().mockResolvedValue(undefined),
+        delete: vi.fn().mockResolvedValue(undefined),
+        truncate: vi.fn().mockResolvedValue(undefined),
+    };
     const logger = { warn: vi.fn() };
     (command as any).repos = new Map([[collectionClass, repo]]);
     (command as any).adapters = new Map([[collectionClass, adapter]]);
     (command as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue({ uid: "mbx-1", primarySmtpAddress: "owner@example.com", displayName: "Owner" }) };
     (command as any).folderRepo = folderRepo;
     (command as any).collectionStateRepo = stateRepo;
+    (command as any).collectionChunkRepo = chunkRepo;
+    // The reconcile would look every held item up in these fakes (which find nothing) - covered on its own below and
+    // in test/EasCollectionSync.test.ts.
+    (command as any).reconcileLimit = 0;
     (command as any).windowSize = 100;
     (command as any).logger = logger;
     // Every permission granted by default.
     (command as any).aclUtils = options.aclUtils ?? { hasPermission: vi.fn().mockResolvedValue(true) };
-    return { command, stateRepo, folderRepo, logger };
+    return { command, stateRepo, folderRepo, chunkRepo, logger };
 }
 
 function buildContext(request: WbxmlElement): { ctx: EasCommandContext; deviceSyncStateUpdate: ReturnType<typeof vi.fn> } {
@@ -160,6 +174,11 @@ describe("SyncCommand Tests (guard clause only)", () => {
 });
 
 describe("SyncCommand Tests (isolated)", () => {
+    afterEach(() => {
+        EasCollectionLease.resetSharedState();
+        vi.restoreAllMocks();
+    });
+
     describe("collection resolution", () => {
         it("Answers a top-level Status 3 when the request has no collections, and Status 4 when it has too many.", async () => {
             const { command } = await buildCommand("Fake", fakeAdapter(), fakeRepo());
@@ -249,16 +268,140 @@ describe("SyncCommand Tests (isolated)", () => {
             expect(saved.cursorDate).toEqual(new Date(0));
         });
 
-        it("SyncKey 0 creates the collection row when none exists, and a failed save is logged rather than failing the request.", async () => {
+        it("SyncKey 0 creates the collection row when none exists, recording no FilterType without Options; a failed save is Status 5 without a key.", async () => {
             const { command, stateRepo, logger } = await buildCommand("Fake", fakeAdapter(), fakeRepo(), { state: null });
-            stateRepo.create.mockRejectedValue(new Error("duplicate key"));
 
+            const created = await command.handle(buildContext(syncRequest("Fake", [], [], "0")).ctx);
+            expect(childText(collection(created!), "Status")).toBe("1");
+            expect(savedState(stateRepo).filterType).toBeNull();
+
+            stateRepo.create.mockRejectedValue(new Error("duplicate key"));
             const response = await command.handle(buildContext(syncRequest("Fake", [], [], "0")).ctx);
 
-            expect(childText(collection(response!), "Status")).toBe("1");
-            expect(stateRepo.create).toHaveBeenCalledTimes(1);
-            expect(savedState(stateRepo).filterType).toBe("0");
+            expect(childText(collection(response!), "Status")).toBe("5");
+            expect(findChild(collection(response!), "SyncKey")).toBeUndefined();
             expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("duplicate key"));
+        });
+
+        it("SyncKey 0 of a chunked collection removes its chunk rows and goes back to an inline held set.", async () => {
+            const { command, stateRepo, chunkRepo } = await buildCommand("Fake", fakeAdapter(), fakeRepo(), { state: storedState({ chunked: true }) });
+
+            await command.handle(buildContext(syncRequest("Fake", [], [], "0")).ctx);
+
+            expect(chunkRepo.truncate).toHaveBeenCalledWith({ mailboxUid: "mbx-1", deviceId: "dev-1", folderUid: FOLDER_UID }, { ignoreACL: true });
+            expect(savedState(stateRepo)).toEqual(expect.objectContaining({ chunked: false, serverIds: [], recent: {}, reconcileCursor: "" }));
+        });
+
+        it("Adopts the first FilterType of a collection started without one while the device holds nothing, and otherwise restarts it.", async () => {
+            const options = [element(WbxmlCodePage.AirSync, "Options", [textElement(WbxmlCodePage.AirSync, "FilterType", "3")])];
+            const firstKey = formatSyncKey({ generation: 1, watermark: new Date(0) });
+            const { command, stateRepo } = await buildCommand("Fake", fakeAdapter(), fakeRepo(), {
+                state: storedState({ syncKey: firstKey, filterType: null }),
+            });
+
+            const adopted = await command.handle(buildContext(syncRequest("Fake", [], options, firstKey)).ctx);
+            expect(childText(collection(adopted!), "Status")).toBe("1");
+            expect(savedState(stateRepo).filterType).toBe("3");
+
+            const { command: holding } = await buildCommand("Fake", fakeAdapter(), fakeRepo(), {
+                state: storedState({ filterType: undefined, serverIds: ["held"] }),
+            });
+            expect(childText(collection((await holding.handle(buildContext(syncRequest("Fake", [], options)).ctx))!), "Status")).toBe("3");
+        });
+
+        it("Answers Status 3 without a SyncKey when the round's state can't be saved.", async () => {
+            const { command, stateRepo, logger } = await buildCommand("Fake", fakeAdapter(), fakeRepo());
+            stateRepo.update.mockRejectedValue(new ApiError(ApiErrors.INVALID_OBJECT_VERSION, 409, "Version conflict"));
+
+            const response = await command.handle(buildContext(syncRequest("Fake", [])).ctx);
+
+            expect(childText(collection(response!), "Status")).toBe("3");
+            expect(findChild(collection(response!), "SyncKey")).toBeUndefined();
+            expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("Version conflict"));
+        });
+
+        it("Answers Status 5 when a chunked held set can't be loaded.", async () => {
+            const { command, chunkRepo, stateRepo } = await buildCommand("Fake", fakeAdapter(), fakeRepo(), { state: storedState({ chunked: true }) });
+            chunkRepo.find.mockRejectedValue(new Error("db down"));
+
+            const response = await command.handle(buildContext(syncRequest("Fake", [])).ctx);
+
+            expect(childText(collection(response!), "Status")).toBe("5");
+            expect(stateRepo.update).not.toHaveBeenCalled();
+        });
+
+        it("Reads a chunked held set from its chunk rows and writes only the chunks a round changed.", async () => {
+            const chunkRows = [
+                { uid: "chunk-0", version: 1, mailboxUid: "mbx-1", deviceId: "dev-1", folderUid: FOLDER_UID, chunkIndex: 0, ids: ["held-1", "held-2"] },
+            ];
+            const repo = fakeRepo({
+                find: vi.fn().mockImplementation(async (query: any) =>
+                    !query.deleted && query.folderUid === FOLDER_UID && !String(query.dateModified).startsWith("range")
+                        ? [{ uid: "held-2", folderUid: FOLDER_UID, deleted: false, dateModified: new Date("2026-02-01T00:00:00.000Z") }]
+                        : [],
+                ),
+            });
+            const { command, stateRepo, chunkRepo } = await buildCommand("Fake", fakeAdapter(), repo, { state: storedState({ chunked: true }) });
+            chunkRepo.find.mockResolvedValue(chunkRows);
+
+            const response = await command.handle(buildContext(syncRequest("Fake", [])).ctx);
+
+            // held-2 is in the chunk, so it's a Change rather than an Add; nothing was added or removed, so no chunk write.
+            expect(childText(findChild(findChild(collection(response!), "Commands")!, "Change")!, "ServerId")).toBe("held-2");
+            expect(chunkRepo.update).not.toHaveBeenCalled();
+            expect(chunkRepo.create).not.toHaveBeenCalled();
+            expect(savedState(stateRepo)).toEqual(expect.objectContaining({ chunked: true, serverIds: [] }));
+        });
+
+        it("Moves a held set that outgrows the inline limit into chunk rows.", async () => {
+            const held = Array.from({ length: INLINE_HELD_LIMIT }, (_, i) => `held-${i}`);
+            const repo = fakeRepo({
+                find: vi.fn().mockImplementation(async (query: any) =>
+                    !query.deleted && query.folderUid === FOLDER_UID && !String(query.dateModified).startsWith("range")
+                        ? [{ uid: "one-more", folderUid: FOLDER_UID, dateModified: new Date("2026-02-01T00:00:00.000Z") }]
+                        : [],
+                ),
+            });
+            const { command, stateRepo, chunkRepo } = await buildCommand("Fake", fakeAdapter(), repo, { state: storedState({ serverIds: held }) });
+
+            await command.handle(buildContext(syncRequest("Fake", [])).ctx);
+
+            // INLINE_HELD_LIMIT + 1 ids fill one whole chunk and start a second.
+            expect(chunkRepo.create).toHaveBeenCalledTimes(2);
+            expect(chunkRepo.create.mock.calls[0][0]).toEqual(expect.objectContaining({ chunkIndex: 0, folderUid: FOLDER_UID }));
+            expect(chunkRepo.create.mock.calls[0][0].ids.length + chunkRepo.create.mock.calls[1][0].ids.length).toBe(INLINE_HELD_LIMIT + 1);
+            expect(savedState(stateRepo)).toEqual(expect.objectContaining({ chunked: true, serverIds: [] }));
+        });
+
+        it("Waits for another request's lease on the same collection, and answers Status 16 when it can't get one in time.", async () => {
+            const { command } = await buildCommand("Fake", fakeAdapter(), fakeRepo());
+            vi.spyOn(EasCollectionLease, "acquire").mockResolvedValue(undefined);
+
+            const response = await command.handle(buildContext(syncRequest("Fake", [])).ctx);
+
+            expect(childText(collection(response!), "Status")).toBe("16");
+            expect(childText(collection(response!), "SyncKey")).toBe(STORED_KEY);
+        });
+
+        it("Serializes two concurrent Syncs of the same collection, the second reading the state the first saved.", async () => {
+            let current: any = storedState();
+            const { command, stateRepo } = await buildCommand("Fake", fakeAdapter(), fakeRepo());
+            stateRepo.find.mockImplementation(async () => [current]);
+            stateRepo.update.mockImplementation(async (values: any) => {
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                current = { ...current, ...values, version: current.version + 1 };
+            });
+
+            const [first, second] = await Promise.all([
+                command.handle(buildContext(syncRequest("Fake", [])).ctx),
+                command.handle(buildContext(syncRequest("Fake", [])).ctx),
+            ]);
+
+            expect(childText(collection(first!), "Status")).toBe("1");
+            // The second request's key is now the previous one: it's replayed as a retry, not computed from stale state.
+            expect(childText(collection(second!), "Status")).toBe("1");
+            expect(stateRepo.update.mock.calls[1][0].version).toBe(5);
+            expect(stateRepo.update.mock.calls[1][0].previous.syncKey).toBe(STORED_KEY);
         });
 
         it("Rejects an unknown SyncKey (or any key when the collection was never started) with Status 3.", async () => {
@@ -385,6 +528,9 @@ describe("SyncCommand Tests (isolated)", () => {
             const limits: number[] = [];
             const repo = fakeRepo({
                 find: vi.fn().mockImplementation(async (query: any) => {
+                    if (String(query.dateModified).startsWith("range")) {
+                        return []; // the overlap re-read
+                    }
                     limits.push(query.limit);
                     return query.deleted ? [] : rows.slice(0, query.limit);
                 }),
@@ -716,6 +862,43 @@ describe("SyncCommand Tests (isolated)", () => {
             });
             await trash.handle(buildContext(request()).ctx);
             expect(trashRepo.delete).toHaveBeenCalledWith("msg-1", { ignoreACL: true });
+        });
+
+        it("Stamps what the adapter's beforeDelete asks for (judged against the folder's own mailbox) before deleting, and passes that mailbox to a Change.", async () => {
+            const existing = { uid: "event-1", version: 2, folderUid: FOLDER_UID };
+            const repo = fakeRepo({
+                findOne: vi.fn().mockResolvedValue(existing),
+                update: vi.fn().mockResolvedValue({ uid: "event-1", version: 3 }),
+                delete: vi.fn().mockResolvedValue(undefined),
+            });
+            const beforeDelete = vi.fn().mockReturnValue({ cancelNoticeSentAt: new Date("2026-02-01T00:00:00.000Z") });
+            const fromApplicationData = vi.fn().mockReturnValue({});
+            const { command } = await buildCommand("Fake", fakeAdapter({ beforeDelete, fromApplicationData }), repo, {
+                folder: { uid: FOLDER_UID, mailboxUid: "shared-mbx", type: FolderType.CALENDAR },
+            });
+            const ownerMailbox = { uid: "shared-mbx", primarySmtpAddress: "owner@example.com" };
+            (command as any).mailboxRepo = { findOne: vi.fn().mockImplementation(async (uid: string) => (uid === "shared-mbx" ? ownerMailbox : { uid })) };
+
+            await command.handle(
+                buildContext(
+                    syncRequest("Fake", [
+                        element(WbxmlCodePage.AirSync, "Change", [textElement(WbxmlCodePage.AirSync, "ServerId", "event-1"), element(WbxmlCodePage.AirSync, "ApplicationData", [])]),
+                        element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", "event-1")]),
+                    ]),
+                ).ctx,
+            );
+
+            expect(fromApplicationData).toHaveBeenCalledWith(expect.anything(), existing, ownerMailbox);
+            expect(beforeDelete).toHaveBeenCalledWith(existing, ownerMailbox);
+            expect(repo.update).toHaveBeenLastCalledWith({ uid: "event-1", version: 2, cancelNoticeSentAt: new Date("2026-02-01T00:00:00.000Z") }, existing, { ignoreACL: true });
+            expect(repo.delete).toHaveBeenCalledWith("event-1", { ignoreACL: true });
+
+            // Nothing to stamp: straight to the delete.
+            const plainRepo = fakeRepo({ findOne: vi.fn().mockResolvedValue(existing), delete: vi.fn().mockResolvedValue(undefined) });
+            const { command: plain } = await buildCommand("Fake", fakeAdapter({ beforeDelete: () => undefined }), plainRepo);
+            await plain.handle(buildContext(syncRequest("Fake", [element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", "event-1")])])).ctx);
+            expect(plainRepo.update).not.toHaveBeenCalled();
+            expect(plainRepo.delete).toHaveBeenCalled();
         });
 
         it("Reports Status 8 when ServerId doesn't resolve and Status 6 when the delete itself throws.", async () => {

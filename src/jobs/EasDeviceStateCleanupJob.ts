@@ -5,6 +5,7 @@
 import { ObjectDecorators } from "@rapidrest/core";
 import { BackgroundService, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { DeviceSyncState } from "../models/DeviceSyncState.js";
+import { clearHeldSet } from "../EasCollectionStore.js";
 const { Config, Init, Logger } = ObjectDecorators;
 
 /**
@@ -20,12 +21,14 @@ const { Config, Init, Logger } = ObjectDecorators;
 export abstract class EasDeviceStateCleanupJob<D extends DeviceSyncState> extends BackgroundService {
     protected abstract deviceSyncStateClass: any;
     protected abstract collectionStateClass: any;
+    protected abstract collectionChunkClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
     private deviceSyncStateRepo?: RepoUtils<D>;
     private collectionStateRepo?: RepoUtils<any>;
+    private collectionChunkRepo?: RepoUtils<any>;
 
     @Config("mail:jobs:eas_device_cleanup:schedule", "0 0 4 * * *")
     private scheduleExpr: string = "0 0 4 * * *";
@@ -53,6 +56,10 @@ export abstract class EasDeviceStateCleanupJob<D extends DeviceSyncState> extend
             name: this.collectionStateClass.name,
             args: [this.collectionStateClass],
         });
+        this.collectionChunkRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.collectionChunkClass.name,
+            args: [this.collectionChunkClass],
+        });
     }
 
     public async start(): Promise<void> {
@@ -64,7 +71,8 @@ export abstract class EasDeviceStateCleanupJob<D extends DeviceSyncState> extend
     }
 
     /**
-     * The `remoteWipeRequested` query value matching rows with no pending wipe (`false`, `null` or unset). MongoDB's
+     * The query value matching rows whose boolean flag isn't set (`false`, `null` or unset) - used for
+     * `remoteWipeRequested` and `blocked`. MongoDB's
      * `$ne: true` already matches a missing/`null` field; `EasDeviceStateCleanupJobSQL` overrides this, since SQL's
      * `!=` never matches `NULL`.
      */
@@ -92,15 +100,17 @@ export abstract class EasDeviceStateCleanupJob<D extends DeviceSyncState> extend
         // the configured batch size.
         //
         // A row with a pending remote wipe is never purged: deleting it would lose the wipe directive, so a lost or
-        // stolen device that reconnects later would simply re-pair and sync without ever being wiped.
+        // stolen device that reconnects later would simply re-pair and sync without ever being wiped. Nor is a device
+        // blocked after acknowledging a wipe: forgetting it would let it pair again as a brand-new device.
         const remoteWipeRequested: any = this.noPendingWipeQueryValue();
+        const blocked: any = this.noPendingWipeQueryValue();
         const [stale, neverSynced]: [D[], D[]] = await Promise.all([
             this.deviceSyncStateRepo.find(
-                { lastSyncAt: `lt(${cutoff.toISOString()})`, remoteWipeRequested, limit: this.batchSize } as any,
+                { lastSyncAt: `lt(${cutoff.toISOString()})`, remoteWipeRequested, blocked, limit: this.batchSize } as any,
                 { ignoreACL: true, limit: this.batchSize },
             ),
             this.deviceSyncStateRepo.find(
-                { lastSyncAt: null, remoteWipeRequested, limit: this.batchSize } as any,
+                { lastSyncAt: null, remoteWipeRequested, blocked, limit: this.batchSize } as any,
                 { ignoreACL: true, limit: this.batchSize },
             ),
         ]);
@@ -125,6 +135,9 @@ export abstract class EasDeviceStateCleanupJob<D extends DeviceSyncState> extend
                 { ignoreACL: true, limit: this.batchSize },
             );
             for (const state of states) {
+                if (state.chunked) {
+                    await clearHeldSet(state, { repo: this.collectionChunkRepo!, chunkClass: this.collectionChunkClass });
+                }
                 await this.collectionStateRepo!.delete(state.uid, { ignoreACL: true, purge: true });
             }
             if (states.length < this.batchSize) {

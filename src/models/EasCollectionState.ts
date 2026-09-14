@@ -23,6 +23,10 @@ export interface EasCollectionRound {
     removedIds: string[];
     /** `echoes` as they stood before the round. */
     echoes: Record<string, string>;
+    /** `recent` as it stood before the round (absent on rows written before it existed). */
+    recent?: Record<string, string>;
+    /** `reconcileCursor` as it stood before the round. */
+    reconcileCursor?: string;
     /** Each client `ClientId` with the `ServerId` created for it during the round, so a replayed `Add` is answered with
      * the same item instead of creating a duplicate. A list rather than a map: `ClientId` is client-chosen text, never
      * safe as a document/object key. */
@@ -60,9 +64,23 @@ export interface EasCollectionState extends BaseEntity {
     moveCursorDate: Date;
     moveCursorUid: string;
 
-    /** The `ServerId`s the device currently holds for this collection. Decides `Add` vs `Change` for a changed item
-     * and whether a removed item needs a `Delete` at all. */
+    /** The `ServerId`s the device currently holds for this collection, while the set is small. Decides `Add` vs
+     * `Change` for a changed item and whether a removed item needs a `Delete` at all. Empty once `chunked`. */
     serverIds: string[];
+
+    /** `true` once the held set has outgrown `serverIds` and lives in `EasCollectionChunk` rows instead. Stays set
+     * until the collection is restarted with `SyncKey 0`. */
+    chunked?: boolean;
+
+    /** Item uid -> `dateModified` (ISO) of the rows the folder stream processed within the overlap window before
+     * the cursor. The folder stream re-reads that window every round (a row committed out of order by another
+     * replica can carry a timestamp the cursor already passed), and a row still matching its entry here was
+     * already reported. */
+    recent?: Record<string, string>;
+
+    /** The last held `ServerId` checked against the store by the periodic reconcile (`""` = start over), which
+     * finds items that vanished without a trace in either change stream (hard purges). */
+    reconcileCursor?: string;
 
     /** Item uid -> the `dateModified` (ISO) the device's own write left on it. A changed row whose `dateModified`
      * still equals this value is the device's own `Add`/`Change` and is not echoed back. Entries are pruned once

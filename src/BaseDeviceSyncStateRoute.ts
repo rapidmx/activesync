@@ -80,4 +80,25 @@ export abstract class BaseDeviceSyncStateRoute<D extends DeviceSyncState> {
         });
         return deviceSyncState;
     }
+
+    /**
+     * Lets a device that acknowledged a remote wipe (`blocked`, see `ProvisionCommand`) connect again: it must still
+     * complete a fresh Provision handshake. Admin-only, like `remoteWipe`.
+     */
+    @Auth(["jwt"])
+    @Post("/:uid/unblock")
+    public async unblock(@Param("uid") uid: string, @AuthUser user?: JWTUser): Promise<D> {
+        if (!user || !UserUtils.hasRoles(user, this.trustedRoles)) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
+        }
+
+        const repo: RepoUtils<D> = await this.getDeviceSyncStateRepo();
+        const deviceSyncState: D | undefined = await repo.findOne(uid, { ignoreACL: true });
+        if (!deviceSyncState) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+
+        await persistDeviceSyncState(deviceSyncState, repo, { blocked: false });
+        return deviceSyncState;
+    }
 }

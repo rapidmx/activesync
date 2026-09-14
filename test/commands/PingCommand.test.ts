@@ -595,6 +595,104 @@ describe("PingCommand Tests", () => {
         expect(childText((await responsePromise)!, "Status")).toBe("1");
     });
 
+    describe("changes made before the Ping subscribed", () => {
+        const CURSOR = new Date("2026-03-01T00:00:00.000Z");
+        const after = new Date("2026-03-01T00:00:01.000Z");
+
+        /** Gives `command` a fake collection state store and an item repo, as PingCommandMongo/SQL would. */
+        function withPendingCheck(command: PingCommand, states: Record<string, any>, rowsByFolder: Record<string, any[]>): { itemRepo: any } {
+            const itemRepo = {
+                find: vi.fn().mockImplementation(async (query: any) => (query.deleted ? [] : (rowsByFolder[query.folderUid] ?? []).slice(0, query.limit))),
+            };
+            (command as any).collectionStateRepo = {
+                find: vi.fn().mockImplementation(async (query: any) => {
+                    if (query.folderUid === "broken") throw new Error("db down");
+                    return states[query.folderUid] ? [states[query.folderUid]] : [];
+                }),
+            };
+            (command as any).repos = new Map([["Email", itemRepo]]);
+            return { itemRepo };
+        }
+        const state = (overrides: Record<string, any> = {}) => ({ collectionClass: "Email", cursorDate: CURSOR, cursorUid: "", echoes: {}, ...overrides });
+
+        it("Answers Status 2 at once for a folder with a row after its recorded cursor, without Redis.", async () => {
+            const command = await createCommand({});
+            withPendingCheck(
+                command,
+                { "folder-1": state(), "folder-2": state(), "unsynced-class": state({ collectionClass: "Notes" }) },
+                { "folder-1": [], "folder-2": [{ uid: "m1", folderUid: "folder-2", dateModified: after }] },
+            );
+            const start = Date.now();
+
+            const response = await command.handle(makeContext(pingRequest(60, ["folder-1", "folder-2", "never-synced", "unsynced-class", "broken"])));
+
+            expect(childText(response!, "Status")).toBe("2");
+            expect(findChild(response!, "Folders")!.children.map((f) => f.text)).toEqual(["folder-2"]);
+            expect(Date.now() - start).toBeLessThan(1000);
+        });
+
+        it("Ignores the device's own writes, but counts a full page as a change.", async () => {
+            const command = await createCommand({});
+            const echoes = { m1: after.toISOString() };
+            withPendingCheck(command, { "folder-1": state({ echoes }), "folder-2": state({ echoes }) }, {
+                "folder-1": [{ uid: "m1", folderUid: "folder-1", dateModified: after }],
+                "folder-2": Array.from({ length: 6 }, (_, i) => ({ uid: "m1", folderUid: "folder-2", dateModified: after, i })),
+            });
+            const res = makeRes();
+
+            const pending = command.handle(makeContext(pingRequest(60, ["folder-1", "folder-2"]), { res }));
+            const response = await pending;
+
+            expect(findChild(response!, "Folders")!.children.map((f) => f.text)).toEqual(["folder-2"]);
+        });
+
+        it("Keeps waiting when nothing is pending, until the request closes.", async () => {
+            const command = await createCommand({});
+            withPendingCheck(command, { "folder-1": state({ echoes: { m1: after.toISOString() } }) }, { "folder-1": [{ uid: "m1", folderUid: "folder-1", dateModified: after }] });
+            const res = makeRes();
+
+            const pending = command.handle(makeContext(pingRequest(60, ["folder-1"]), { res }));
+            await tick(50);
+            res.finish();
+
+            expect(childText((await pending)!, "Status")).toBe("1");
+        });
+
+        it("Checks once subscribed to Redis, releasing the subscription, and also when the Redis connect fails.", async () => {
+            const command = await createCommand(REDIS_CONFIG);
+            withPendingCheck(command, { "folder-1": state() }, { "folder-1": [{ uid: "m1", folderUid: "folder-1", dateModified: after }] });
+
+            const response = await command.handle(makeContext(pingRequest(5, ["folder-1"])));
+            expect(childText(response!, "Status")).toBe("2");
+            await tick();
+            expect(fakeRedisServer.listenerCount("folder-1")).toBe(0);
+
+            fake.nextConnectShouldFail = true;
+            PingCommand.resetSharedState();
+            const failedConnect = await command.handle(makeContext(pingRequest(5, ["folder-1"])));
+            expect(childText(failedConnect!, "Status")).toBe("2");
+        });
+
+        it("Changes nothing when a publish already answered the Ping before the check completes.", async () => {
+            const command = await createCommand(REDIS_CONFIG);
+            const gate = deferred();
+            const { itemRepo } = withPendingCheck(command, { "folder-1": state() }, {});
+            itemRepo.find.mockImplementation(async (query: any) => {
+                await gate.promise;
+                return query.deleted ? [] : [{ uid: "m1", folderUid: "folder-1", dateModified: after }];
+            });
+
+            const pending = command.handle(makeContext(pingRequest(5, ["folder-1", "folder-2"])));
+            await tick();
+            fakeRedisServer.publish("folder-2", "{}");
+            const response = await pending;
+            gate.resolve();
+            await tick();
+
+            expect(findChild(response!, "Folders")!.children.map((f) => f.text)).toEqual(["folder-2"]);
+        });
+    });
+
     it("Clamps a HeartbeatInterval outside the configured min/max range.", async () => {
         const command = await createCommand({
             "datastores:events": { url: "redis://fake" },

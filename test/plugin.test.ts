@@ -35,6 +35,7 @@ describe("plugin entry points", () => {
             [`DeviceSyncStateRoute${suffix}`]: "route /api/mail/devices",
             [`DeviceSyncState${suffix}`]: `model ${datastore}`,
             [`EasCollectionState${suffix}`]: `model ${datastore}`,
+            [`EasCollectionChunk${suffix}`]: `model ${datastore}`,
             [`EasDeviceStateCleanupJob${suffix}`]: "job",
         });
     });

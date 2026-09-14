@@ -178,7 +178,9 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
      * the device didn't send (`AttendeeStatus`/`AttendeeType`/`Name`, and `isOrganizer`), and a rebuilt recurrence
      * keeps the series' existing exceptions (cancelled occurrences have no wire representation here). A change to the
      * time, location, attendees or recurrence bumps `sequence`, as `BaseCalendarEventRoute.update` does, so updated
-     * invitations go out.
+     * invitations go out - but only on the organizer's copy: when `mailbox` (the item's owner on a `Change`) isn't
+     * the organizer, `sequence` is left alone and `inviteSequenceSent` is kept equal to it, so an attendee editing
+     * their own copy never makes `MeetingSchedulingJob` send invitations as the organizer.
      */
     public fromApplicationData(el: WbxmlElement, existing?: CalendarEvent, mailbox?: Mailbox): Partial<CalendarEvent> {
         const partial: Partial<CalendarEvent> = {};
@@ -235,11 +237,27 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
             };
         }
 
-        if (existing && isSchedulingRelevantChange(existing, partial)) {
+        if (existing && mailbox && !isOrganizedBy(existing, mailbox)) {
+            // An attendee's copy: the attendee can't reschedule the organizer's meeting for everyone, so the sequence
+            // stays put, and the copy is marked as already invited at it so MeetingSchedulingJob never mails a REQUEST
+            // on the organizer's behalf because of this edit.
+            if (existing.inviteSequenceSent !== existing.sequence) {
+                partial.inviteSequenceSent = existing.sequence ?? 0;
+            }
+        } else if (existing && isSchedulingRelevantChange(existing, partial)) {
             partial.sequence = (existing.sequence ?? 0) + 1;
         }
 
         return partial;
+    }
+
+    /** Stamps `cancelNoticeSentAt` on an attendee's copy of a meeting before it is deleted, so the deletion is never
+     * taken as the organizer cancelling the meeting (see `EasCollectionSyncAdapter.beforeDelete`). */
+    public beforeDelete(existing: CalendarEvent, mailbox: Mailbox): Partial<CalendarEvent> | undefined {
+        if (isOrganizedBy(existing, mailbox) || existing.cancelNoticeSentAt != null) {
+            return undefined;
+        }
+        return { cancelNoticeSentAt: new Date() };
     }
 
     /** `icalUid`/`sequence` have no wire representation on `Add` (see `fromApplicationData`'s own doc comment)
@@ -315,6 +333,16 @@ export function localDayAndMonth(date: Date, timezone: string): { day: number; m
     } catch {
         return { day: date.getUTCDate(), month: date.getUTCMonth() + 1 };
     }
+}
+
+/** `true` when `event`'s organizer is one of `mailbox`'s own addresses - the organizer's copy of a meeting, as opposed
+ * to an attendee's copy of someone else's. An event without an organizer address counts as the mailbox's own. */
+export function isOrganizedBy(event: CalendarEvent, mailbox: Mailbox): boolean {
+    const organizer: string | undefined = event.organizer?.address?.toLowerCase();
+    if (!organizer) {
+        return true;
+    }
+    return [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].some((address) => address.toLowerCase() === organizer);
 }
 
 /** Normalizes a value for comparison - `null` (SQL) and `undefined` (Mongo) mean the same "unset". */

@@ -4,11 +4,14 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { createClient, type RedisClientType } from "redis";
 import { ObjectDecorators } from "@rapidrest/core";
-import { ACLAction, ACLUtils } from "@rapidrest/service-core";
+import { ACLAction, ACLUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { RecoverableRepoUtils } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
-const { Config, Inject } = ObjectDecorators;
+import { scanAfter } from "../EasSyncKeyUtils.js";
+import type { EasCollectionState } from "../models/EasCollectionState.js";
+const { Config, Init, Inject } = ObjectDecorators;
 
 /** MS-ASCMD `Ping` `Status` codes this pragmatic subset distinguishes - not the full enumeration the real
  * spec defines (e.g. it also has a code for "folder hierarchy changed"), matching this library's "pragmatic
@@ -18,8 +21,17 @@ const STATUS_CHANGES_FOUND = "2";
 const STATUS_MISSING_PARAMETERS = "3";
 const STATUS_TOO_MANY_FOLDERS = "6";
 
-/** How many `ACLUtils.hasPermission()` checks run concurrently while filtering the requested folders. */
+/** How many `ACLUtils.hasPermission()` checks (and pending-change lookups) run concurrently. */
 const ACL_CHECK_CHUNK_SIZE = 25;
+
+/** Rows read per folder when looking for changes a device hasn't synced yet - enough to see past a few of the
+ * device's own writes (`echoes`); a full page is reported as a change regardless. */
+const PENDING_CHANGE_SCAN_LIMIT = 5;
+
+/** Binds one MS-ASCMD `Class` value to the entity class whose rows a `Ping` checks for pending changes. */
+export interface PingCollectionBinding {
+    entityClass: any;
+}
 
 type PingListener = (message: string, channel: string) => void;
 
@@ -41,6 +53,13 @@ type PingListener = (message: string, channel: string) => void;
  * checks themselves run in bounded concurrent chunks.
  * - Without a `datastores:events` config the `Ping` still waits the full (clamped) heartbeat before answering
  * Status 1, so a device can't hot-loop against it.
+ *
+ * **Changes made before the `Ping` started**: a publish only reaches a subscriber that exists at that moment, so a
+ * change landing between the device's last `Sync` and this `Ping`'s subscribe would otherwise go unnoticed until
+ * the next change. Once subscribed (or right away, without Redis), each folder's stream is checked for a row after
+ * the cursor its `EasCollectionState` recorded, and any folder with one is answered with Status 2 immediately. This
+ * needs `collectionStateClass`/`collectionBindings` (set by `PingCommandMongo`/`PingCommandSQL`); a folder the
+ * device never synced has no cursor and isn't checked.
  *
  * Requested folder uids are filtered down to only those the caller currently has `READ` on before subscribing -
  * without it a device could long-poll on any folder uid it happens to know (including one whose share was since
@@ -73,6 +92,33 @@ export class PingCommand implements EasCommandHandler {
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
+
+    /** Supplied by the Mongo/SQL subclasses; without them the pending-change check is skipped. */
+    protected collectionStateClass?: any;
+    protected collectionBindings: Record<string, PingCollectionBinding> = {};
+
+    // Automatically injected by ObjectFactory on instantiation
+    private _objectFactory?: ObjectFactory;
+
+    private collectionStateRepo?: RepoUtils<any>;
+    private repos = new Map<string, RepoUtils<any>>();
+
+    @Init
+    public async init(): Promise<void> {
+        if (!this.collectionStateClass) {
+            return;
+        }
+        this.collectionStateRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.collectionStateClass.name,
+            args: [this.collectionStateClass],
+        });
+        for (const [collectionClass, binding] of Object.entries(this.collectionBindings)) {
+            this.repos.set(
+                collectionClass,
+                await this._objectFactory!.newInstance(RecoverableRepoUtils, { name: binding.entityClass.name, args: [binding.entityClass] }),
+            );
+        }
+    }
 
     /** Forgets all process-wide shared state (subscriber clients and active pings). Intended for tests. */
     public static resetSharedState(): void {
@@ -146,6 +192,34 @@ export class PingCommand implements EasCommandHandler {
         return result;
     }
 
+    /** The subset of `folderUids` whose change stream has a row the device hasn't synced yet (after its collection's
+     * recorded cursor, other than the device's own writes). A failed lookup counts as "no pending change". */
+    private async pendingChanges(ctx: EasCommandContext, folderUids: string[]): Promise<string[]> {
+        if (!this.collectionStateRepo) {
+            return [];
+        }
+        const changed: string[] = [];
+        for (let i = 0; i < folderUids.length; i += ACL_CHECK_CHUNK_SIZE) {
+            const chunk = folderUids.slice(i, i + ACL_CHECK_CHUNK_SIZE);
+            const results = await Promise.all(chunk.map((folderUid) => this.hasPendingChange(ctx, folderUid).catch(() => false)));
+            changed.push(...chunk.filter((_uid, j) => results[j]));
+        }
+        return changed;
+    }
+
+    private async hasPendingChange(ctx: EasCommandContext, folderUid: string): Promise<boolean> {
+        const state: EasCollectionState | undefined = (
+            await this.collectionStateRepo!.find({ mailboxUid: ctx.mailboxUid, deviceId: ctx.deviceId, folderUid } as any, { ignoreACL: true, limit: 1 })
+        )[0];
+        const repo = state ? this.repos.get(state.collectionClass) : undefined;
+        if (!state || !repo) {
+            return false;
+        }
+        const { rows, more } = await scanAfter<any>(repo, { folderUid }, { date: new Date(state.cursorDate), uid: state.cursorUid }, PENDING_CHANGE_SCAN_LIMIT);
+        const echoes: Record<string, string> = state.echoes ?? {};
+        return more || rows.some((row) => echoes[row.uid] !== new Date(row.dateModified).toISOString());
+    }
+
     /** Returns the process-wide subscriber client for `url`, connecting it on first use. A failed connect is
      * evicted from the cache (and the client destroyed) so a later call retries. */
     private static getSubscriber(url: string): Promise<RedisClientType> {
@@ -197,6 +271,13 @@ export class PingCommand implements EasCommandHandler {
                 resolve(changed);
             };
             const cancel = (): void => finish([]);
+            const checkPending = (): void => {
+                void this.pendingChanges(ctx, folderUids).then((changed) => {
+                    if (changed.length > 0) {
+                        finish(changed);
+                    }
+                });
+            };
 
             PingCommand.activePings.get(key)?.();
             PingCommand.activePings.set(key, cancel);
@@ -204,6 +285,7 @@ export class PingCommand implements EasCommandHandler {
             ctx.res?.onFinish(cancel);
 
             if (redisUrl === undefined) {
+                checkPending();
                 return;
             }
 
@@ -224,10 +306,13 @@ export class PingCommand implements EasCommandHandler {
                         await release();
                     } else {
                         unsubscribe = release;
+                        // Subscribed: every later change is published to the listener, so this covers the ones before.
+                        checkPending();
                     }
                 })
                 .catch(() => {
                     // Connect failed - fail open, the timer/cancel still answers Status 1.
+                    checkPending();
                 });
         });
     }

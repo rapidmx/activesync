@@ -45,4 +45,9 @@ export interface DeviceSyncState extends BaseEntity {
 
     /** When the device most recently acknowledged a remote wipe request. */
     remoteWipeAcknowledgedAt?: Date;
+
+    /** `true` once the device has acknowledged a remote wipe: every further request from it (including a fresh
+     * `Provision`) is refused until an administrator clears the flag (`BaseDeviceSyncStateRoute.unblock`), so a
+     * device can't acknowledge the wipe and then simply provision again. */
+    blocked?: boolean;
 }

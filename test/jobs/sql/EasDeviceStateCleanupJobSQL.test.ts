@@ -15,6 +15,7 @@ import config from "../../config.sql.js";
 import { EasDeviceStateCleanupJobSQL } from "../../../src/jobs/sql/EasDeviceStateCleanupJobSQL.js";
 import { DeviceSyncStateSQL } from "../../../src/models/sql/DeviceSyncStateSQL.js";
 import { EasCollectionStateSQL } from "../../../src/models/sql/EasCollectionStateSQL.js";
+import { EasCollectionChunkSQL } from "../../../src/models/sql/EasCollectionChunkSQL.js";
 
 const DEVICE_TTL_DAYS = 90; // matches mail:jobs:eas_device_cleanup:device_ttl_days in test/config.ts
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -25,6 +26,7 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
     let connectionManager: ConnectionManager;
     let job: EasDeviceStateCleanupJobSQL;
     let collectionStateRepo: Repository<EasCollectionStateSQL>;
+    let collectionChunkRepo: Repository<EasCollectionChunkSQL>;
     let deviceSyncStateRepo: Repository<DeviceSyncStateSQL>;
 
     const createDevice = async (data?: Partial<DeviceSyncStateSQL>): Promise<DeviceSyncStateSQL> => {
@@ -52,6 +54,7 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
         models.set("AccessControlListSQL", AccessControlListSQL);
         models.set("DeviceSyncStateSQL", DeviceSyncStateSQL);
         models.set("EasCollectionStateSQL", EasCollectionStateSQL);
+        models.set("EasCollectionChunkSQL", EasCollectionChunkSQL);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("sql");
@@ -60,6 +63,7 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
         }
         deviceSyncStateRepo = conn.getRepository(DeviceSyncStateSQL);
         collectionStateRepo = conn.getRepository(EasCollectionStateSQL);
+        collectionChunkRepo = conn.getRepository(EasCollectionChunkSQL);
 
         // Constructed once via real ObjectFactory DI: `@Init` builds its one real `RepoUtils` against the live
         // connection above.
@@ -73,6 +77,7 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
     beforeEach(async () => {
         await deviceSyncStateRepo.clear();
         await collectionStateRepo.clear();
+        await collectionChunkRepo.clear();
         // Restore the job's batch size to the configured default between tests, in case a test overrode it.
         (job as any).batchSize = config.get("mail:jobs:eas_device_cleanup:batch_size") ?? 500;
     });
@@ -129,8 +134,14 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
         const acknowledged = await createDevice({ lastSyncAt: staleDate, remoteWipeRequested: false });
         const unset = await createDevice({ lastSyncAt: staleDate, remoteWipeRequested: undefined });
         const unsetNeverSynced = await createDevice({ lastSyncAt: undefined, remoteWipeRequested: undefined });
+        const blocked = await createDevice({ lastSyncAt: staleDate, remoteWipeRequested: false, blocked: true });
+        const unblocked = await createDevice({ lastSyncAt: undefined, blocked: false });
 
         await job.run();
+
+        // A device blocked after acknowledging a wipe is kept too, or it could pair again as a new device.
+        expect(await deviceSyncStateRepo.findOne({ where: { uid: blocked.uid } })).not.toBeNull();
+        expect(await deviceSyncStateRepo.findOne({ where: { uid: unblocked.uid } })).toBeNull();
 
         expect(await deviceSyncStateRepo.findOne({ where: { uid: pendingStale.uid } })).not.toBeNull();
         expect(await deviceSyncStateRepo.findOne({ where: { uid: pendingNeverSynced.uid } })).not.toBeNull();
@@ -201,9 +212,16 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
             await collection(stale, folderUid);
         }
         await collection(recent, "f1");
+        await collectionStateRepo.save(
+            new EasCollectionStateSQL({ mailboxUid: stale.mailboxUid, deviceId: stale.deviceId, folderUid: "f4", collectionClass: "Email", syncKey: "1:x", chunked: true }) as any,
+        );
+        await collectionChunkRepo.save(new EasCollectionChunkSQL({ mailboxUid: stale.mailboxUid, deviceId: stale.deviceId, folderUid: "f4", chunkIndex: 0, ids: ["a"] }) as any);
+        await collectionChunkRepo.save(new EasCollectionChunkSQL({ mailboxUid: recent.mailboxUid, deviceId: recent.deviceId, folderUid: "f4", chunkIndex: 0, ids: ["a"] }) as any);
 
         await job.run();
 
+        expect(await collectionChunkRepo.count({ where: { deviceId: stale.deviceId } })).toBe(0);
+        expect(await collectionChunkRepo.count({ where: { deviceId: recent.deviceId } })).toBe(1);
         expect(await collectionStateRepo.count({ where: { deviceId: stale.deviceId } })).toBe(0);
         expect(await collectionStateRepo.count({ where: { deviceId: recent.deviceId } })).toBe(1);
     });

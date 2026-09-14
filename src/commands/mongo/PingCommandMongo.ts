@@ -2,19 +2,16 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { MessageMongo, ContactMongo, CalendarEventMongo, TaskMongo, FolderMongo } from "@rapidmx/restapi/mongo";
+import { MessageMongo, ContactMongo, CalendarEventMongo, TaskMongo } from "@rapidmx/restapi/mongo";
 import { EasCollectionStateMongo } from "../../models/mongo/EasCollectionStateMongo.js";
-import { EasCollectionChunkMongo } from "../../models/mongo/EasCollectionChunkMongo.js";
-import { GetItemEstimateCommand, type EstimateCollectionBinding } from "../GetItemEstimateCommand.js";
+import { PingCommand, type PingCollectionBinding } from "../PingCommand.js";
 
 /**
  * @author Jean-Philippe Steinmetz
  */
-export class GetItemEstimateCommandMongo extends GetItemEstimateCommand {
-    protected folderClass: any = FolderMongo;
+export class PingCommandMongo extends PingCommand {
     protected collectionStateClass: any = EasCollectionStateMongo;
-    protected collectionChunkClass: any = EasCollectionChunkMongo;
-    protected collectionBindings: Record<string, EstimateCollectionBinding> = {
+    protected collectionBindings: Record<string, PingCollectionBinding> = {
         Email: { entityClass: MessageMongo },
         Contacts: { entityClass: ContactMongo },
         Calendar: { entityClass: CalendarEventMongo },

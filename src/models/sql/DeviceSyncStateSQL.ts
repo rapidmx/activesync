@@ -82,6 +82,11 @@ export class DeviceSyncStateSQL extends BaseEntity implements DeviceSyncState {
     @Nullable
     public remoteWipeAcknowledgedAt?: Date;
 
+    @Column({ nullable: true })
+    @Description("`true` once the device acknowledged a remote wipe, until an administrator unblocks it.")
+    @Nullable
+    public blocked?: boolean;
+
     constructor(other?: Partial<DeviceSyncStateSQL>) {
         super(other);
 
@@ -100,6 +105,7 @@ export class DeviceSyncStateSQL extends BaseEntity implements DeviceSyncState {
                 "remoteWipeAccountOnly" in other ? other.remoteWipeAccountOnly : this.remoteWipeAccountOnly;
             this.remoteWipeAcknowledgedAt =
                 "remoteWipeAcknowledgedAt" in other ? other.remoteWipeAcknowledgedAt : this.remoteWipeAcknowledgedAt;
+            this.blocked = "blocked" in other ? other.blocked : this.blocked;
         }
     }
 }

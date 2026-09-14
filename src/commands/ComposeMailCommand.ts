@@ -48,17 +48,38 @@ function collectAddresses(entry: EmailAddress, out: string[]): void {
     }
 }
 
+/** The top-level header block of `raw` (up to the first empty line), as `latin1` text, and where it ends. */
+function headerBlock(raw: Buffer): { text: string; header: string; end: number } {
+    const text = raw.toString("latin1");
+    const crlf = text.indexOf("\r\n\r\n");
+    const lf = text.indexOf("\n\n");
+    const end = crlf !== -1 && (lf === -1 || crlf < lf) ? crlf + 2 : lf !== -1 ? lf + 1 : text.length;
+    return { text, header: text.slice(0, end), end };
+}
+
+/**
+ * Counts the top-level header fields named `name` (case-insensitive) in `raw`. Folded continuation lines are part
+ * of the field before them, so only field starts count; optional whitespace before the colon (RFC 5322's obsolete
+ * syntax, which parsers still accept) is allowed. `name` is a plain header name (letters, digits and `-`).
+ */
+export function countHeader(raw: Buffer, name: string): number {
+    const prefix: string = name.toLowerCase();
+    return headerBlock(raw)
+        .header.split(/\r?\n/)
+        .filter((line) => {
+            const lower = line.toLowerCase();
+            return lower.startsWith(prefix) && /^[ \t]*:/.test(lower.slice(prefix.length));
+        }).length;
+}
+
 /**
  * Returns a copy of `raw` with every top-level header named `name` (case-insensitive, including its folded
  * continuation lines) removed. Only the header block is touched; the body is copied verbatim. Works on the
  * `latin1` view of the bytes so no byte sequence is altered.
  */
 export function stripHeader(raw: Buffer, name: string): Buffer {
-    const text = raw.toString("latin1");
-    const crlf = text.indexOf("\r\n\r\n");
-    const lf = text.indexOf("\n\n");
-    const end = crlf !== -1 && (lf === -1 || crlf < lf) ? crlf + 2 : lf !== -1 ? lf + 1 : text.length;
-    const lines = text.slice(0, end).split(/(?<=\n)/);
+    const { text, header, end } = headerBlock(raw);
+    const lines = header.split(/(?<=\n)/);
     const kept: string[] = [];
     let dropping = false;
     const prefix = `${name.toLowerCase()}:`;
@@ -86,7 +107,8 @@ export function stripHeader(raw: Buffer, name: string): Buffer {
  *
  * **Sender and envelope checks** (the MIME is entirely device-controlled): every `From` address - and a `Sender`
  * header, if present - must be the caller's own mailbox's primary or alias address (HTTP 403 otherwise), so a
- * device can't send as anyone else; the envelope sender is that validated `From`. The envelope is capped at
+ * device can't send as anyone else. A message with more than one `From` or `Sender` header field is refused the same
+ * way: the parser checks only one of them, while a recipient's mail client may display another; the envelope sender is that validated `From`. The envelope is capped at
  * `MAX_COMPOSE_RECIPIENTS` recipients (HTTP 400). `Bcc` recipients are delivered via the envelope, but the `Bcc`
  * header itself is stripped from the relayed copy so other recipients never see it (the Sent Items copy keeps it).
  *
@@ -191,6 +213,12 @@ export abstract class ComposeMailCommand implements EasCommandHandler {
                 throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
             }
             original = found;
+        }
+
+        // Checked on the raw bytes before parsing: mailparser keeps just one of several `From`/`Sender` fields, so the
+        // address check below would validate a field other than the one a recipient may be shown.
+        if (countHeader(raw, "from") > 1 || countHeader(raw, "sender") > 1) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "The composed message has more than one From or Sender header.");
         }
 
         const parsed: ParsedMail = await simpleParser(raw);

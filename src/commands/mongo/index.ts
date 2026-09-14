@@ -11,3 +11,4 @@ export * from "./ItemOperationsCommandMongo.js";
 export * from "./SearchCommandMongo.js";
 export * from "./MeetingResponseCommandMongo.js";
 export * from "./SettingsCommandMongo.js";
+export * from "./PingCommandMongo.js";
