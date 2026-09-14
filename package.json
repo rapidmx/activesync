@@ -30,7 +30,7 @@
         "mailparser": "^3.9.23"
     },
     "devDependencies": {
-        "@rapidmx/restapi": "^0.8.0",
+        "@rapidmx/restapi": "patch:@rapidmx/restapi@npm%3A0.8.0#~/.yarn/patches/@rapidmx-restapi-npm-0.8.0-d588a97668.patch",
         "@rapidrest/core": "^5.2.2",
         "@rapidrest/service-core": "^2.0.0",
         "@swc/core": "^1.16.2",
@@ -90,5 +90,149 @@
     "typings": "dist/types/index.d.ts",
     "files": [
         "dist"
-    ]
+    ],
+    "rapidmx": {
+        "plugin": {
+            "apiVersion": 1,
+            "displayName": "Exchange ActiveSync",
+            "description": "Lets phones and mail apps sync mail, contacts, calendars and tasks over Exchange ActiveSync (served at /Microsoft-Server-ActiveSync).",
+            "settings": [
+                {
+                    "key": "mail:eas:sync_window_size",
+                    "label": "Sync batch size",
+                    "type": "number",
+                    "default": 100,
+                    "min": 1,
+                    "max": 512,
+                    "help": "Most items sent to a device in one Sync response."
+                },
+                {
+                    "key": "mail:eas:foldersync_window_size",
+                    "label": "Folder sync batch size",
+                    "type": "number",
+                    "default": 512,
+                    "min": 1,
+                    "max": 5000,
+                    "help": "Most folder changes sent in one FolderSync response."
+                },
+                {
+                    "key": "mail:eas:item_estimate_max_count",
+                    "label": "Item estimate limit",
+                    "type": "number",
+                    "default": 512,
+                    "min": 1,
+                    "max": 100000,
+                    "help": "Highest count GetItemEstimate reports for a folder."
+                },
+                {
+                    "key": "mail:eas:itemoperations_max_fetch",
+                    "label": "Fetches per request",
+                    "type": "number",
+                    "default": 25,
+                    "min": 1,
+                    "max": 500,
+                    "help": "Most items a device may fetch in one ItemOperations request."
+                },
+                {
+                    "key": "mail:eas:itemoperations_batch_size",
+                    "label": "Fetch batch size",
+                    "type": "number",
+                    "default": 500,
+                    "min": 1,
+                    "max": 5000,
+                    "help": "Rows read per database query while fetching."
+                },
+                {
+                    "key": "mail:eas:ping_min_heartbeat_seconds",
+                    "label": "Minimum push heartbeat (seconds)",
+                    "type": "number",
+                    "default": 60,
+                    "min": 1,
+                    "max": 3600,
+                    "help": "Shortest Ping interval a device may request."
+                },
+                {
+                    "key": "mail:eas:ping_max_heartbeat_seconds",
+                    "label": "Maximum push heartbeat (seconds)",
+                    "type": "number",
+                    "default": 1740,
+                    "min": 60,
+                    "max": 3600,
+                    "help": "Longest Ping interval a device may request."
+                },
+                {
+                    "key": "mail:eas:search_default_range",
+                    "label": "Default search results",
+                    "type": "number",
+                    "default": 9,
+                    "min": 0,
+                    "max": 999,
+                    "help": "Last result index returned when a search doesn't ask for a range."
+                },
+                {
+                    "key": "mail:eas:search_max_range",
+                    "label": "Maximum search results",
+                    "type": "number",
+                    "default": 99,
+                    "min": 0,
+                    "max": 999,
+                    "help": "Highest result index a search may request."
+                },
+                {
+                    "key": "mail:eas:resolve_recipients_max_matches",
+                    "label": "Recipient lookup matches",
+                    "type": "number",
+                    "default": 10,
+                    "min": 1,
+                    "max": 100,
+                    "help": "Most matches returned per name when resolving recipients."
+                },
+                {
+                    "key": "mail:eas:provision:password_enabled",
+                    "label": "Require a device passcode",
+                    "type": "boolean",
+                    "default": true,
+                    "help": "Devices must set a passcode before syncing."
+                },
+                {
+                    "key": "mail:eas:provision:min_password_length",
+                    "label": "Minimum passcode length",
+                    "type": "number",
+                    "default": 4,
+                    "min": 1,
+                    "max": 16
+                },
+                {
+                    "key": "mail:eas:provision:max_failed_attempts",
+                    "label": "Failed unlocks before wipe",
+                    "type": "number",
+                    "default": 8,
+                    "min": 1,
+                    "max": 16
+                },
+                {
+                    "key": "mail:eas:provision:require_device_encryption",
+                    "label": "Require device encryption",
+                    "type": "boolean",
+                    "default": true
+                },
+                {
+                    "key": "mail:eas:provision:allow_simple_password",
+                    "label": "Allow simple passcodes",
+                    "type": "boolean",
+                    "default": false,
+                    "help": "For example 1111 or 1234."
+                },
+                {
+                    "key": "mail:jobs:eas_device_cleanup:device_ttl_days",
+                    "label": "Forget idle devices after (days)",
+                    "type": "number",
+                    "default": 90,
+                    "min": 1,
+                    "max": 3650,
+                    "help": "Device pairings that haven't synced for this long are removed."
+                }
+            ]
+        }
+    }
 }

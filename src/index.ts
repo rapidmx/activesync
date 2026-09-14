@@ -34,6 +34,8 @@ export * from "./codec/WbxmlEncoder.js";
 export * from "./codec/WbxmlDecoder.js";
 export * from "./BaseEasRoute.js";
 export * from "./BaseDeviceSyncStateRoute.js";
+export * from "./models/DeviceSyncState.js";
+export * from "./jobs/EasDeviceStateCleanupJob.js";
 export * from "./EasCommandHandler.js";
 export * from "./EasSyncKeyUtils.js";
 export * from "./CompactDateTime.js";

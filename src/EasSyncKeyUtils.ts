@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { RecoverableBaseEntity, RepoUtils } from "@rapidrest/service-core";
-import type { DeviceSyncState } from "@rapidmx/restapi";
+import type { DeviceSyncState } from "./models/DeviceSyncState.js";
 
 /**
  * A parsed EAS `SyncKey`. The wire value is opaque to the client per spec, so this library encodes it as

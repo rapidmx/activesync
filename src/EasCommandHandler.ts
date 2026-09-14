@@ -5,7 +5,7 @@
 import type { JWTUser } from "@rapidrest/core";
 import type { HttpRequest, RepoUtils } from "@rapidrest/service-core";
 import type { WbxmlElement } from "./codec/WbxmlElement.js";
-import type { DeviceSyncState } from "@rapidmx/restapi";
+import type { DeviceSyncState } from "./models/DeviceSyncState.js";
 
 /**
  * Everything an `EasCommandHandler` needs to process one dispatched EAS command — assembled once by

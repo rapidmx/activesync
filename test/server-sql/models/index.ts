@@ -6,10 +6,11 @@ export {
     AttachmentSQL,
     CalendarEventSQL,
     ContactSQL,
-    DeviceSyncStateSQL,
     FolderSQL,
     LabelSQL,
     MailboxSQL,
     MessageSQL,
     TaskSQL,
 } from "@rapidmx/restapi/sql";
+// This plugin's own model.
+export { DeviceSyncStateSQL } from "../../../src/models/sql/DeviceSyncStateSQL.js";

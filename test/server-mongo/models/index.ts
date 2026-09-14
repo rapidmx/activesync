@@ -8,10 +8,11 @@ export {
     AttachmentMongo,
     CalendarEventMongo,
     ContactMongo,
-    DeviceSyncStateMongo,
     FolderMongo,
     LabelMongo,
     MailboxMongo,
     MessageMongo,
     TaskMongo,
 } from "@rapidmx/restapi/mongo";
+// This plugin's own model.
+export { DeviceSyncStateMongo } from "../../../src/models/mongo/DeviceSyncStateMongo.js";

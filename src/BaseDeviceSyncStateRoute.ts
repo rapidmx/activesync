@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators, ObjectFactory, UserUtils, type JWTUser } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, HttpRequest, RepoUtils, RouteDecorators } from "@rapidrest/service-core";
-import type { DeviceSyncState } from "@rapidmx/restapi";
+import type { DeviceSyncState } from "./models/DeviceSyncState.js";
 import { persistDeviceSyncState } from "./EasSyncKeyUtils.js";
 const { Config } = ObjectDecorators;
 const { Auth, Param, Post, Request, User: AuthUser } = RouteDecorators;

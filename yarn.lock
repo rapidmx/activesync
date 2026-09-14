@@ -728,7 +728,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@rapidmx/activesync@workspace:."
   dependencies:
-    "@rapidmx/restapi": "npm:^0.8.0"
+    "@rapidmx/restapi": "patch:@rapidmx/restapi@npm%3A0.8.0#~/.yarn/patches/@rapidmx-restapi-npm-0.8.0-d588a97668.patch"
     "@rapidrest/core": "npm:^5.2.2"
     "@rapidrest/service-core": "npm:^2.0.0"
     "@swc/core": "npm:^1.16.2"
@@ -769,7 +769,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@rapidmx/restapi@npm:^0.8.0":
+"@rapidmx/restapi@npm:0.8.0":
   version: 0.8.0
   resolution: "@rapidmx/restapi@npm:0.8.0"
   dependencies:
@@ -803,6 +803,43 @@ __metadata:
     pdf-parse:
       optional: true
   checksum: 10c0/17252bdfa839bff990241f40a7a824dafd05d2fbec02215b5b9307cfc3fcc68c9b09a1928b70b41ed51d3f0c4ea1fc4823ff95c8535bbbbeb366d17efd0eaa5d
+  languageName: node
+  linkType: hard
+
+"@rapidmx/restapi@patch:@rapidmx/restapi@npm%3A0.8.0#~/.yarn/patches/@rapidmx-restapi-npm-0.8.0-d588a97668.patch":
+  version: 0.8.0
+  resolution: "@rapidmx/restapi@patch:@rapidmx/restapi@npm%3A0.8.0#~/.yarn/patches/@rapidmx-restapi-npm-0.8.0-d588a97668.patch::version=0.8.0&hash=5b0d91"
+  dependencies:
+    "@peculiar/x509": "npm:^2.1.0"
+    acme-client: "npm:^5.4.0"
+    html-to-text: "npm:^10.0.1"
+    mailparser: "npm:^3.9.23"
+    nodemailer: "npm:^10.0.1"
+    pst-extractor: "npm:^1.12.0"
+    sanitize-html: "npm:^2.17.7"
+  peerDependencies:
+    "@aws-sdk/client-s3": 3.x
+    "@aws-sdk/client-ses": 3.x
+    "@aws-sdk/client-sesv2": 3.x
+    "@opensearch-project/opensearch": ">=3.0.0"
+    "@rapidrest/core": 5.x
+    "@rapidrest/service-core": 2.x
+    mammoth: ">=1.8.0"
+    pdf-parse: ">=1.1.1"
+  peerDependenciesMeta:
+    "@aws-sdk/client-s3":
+      optional: true
+    "@aws-sdk/client-ses":
+      optional: true
+    "@aws-sdk/client-sesv2":
+      optional: true
+    "@opensearch-project/opensearch":
+      optional: true
+    mammoth:
+      optional: true
+    pdf-parse:
+      optional: true
+  checksum: 10c0/d06320b9dbc1598f0e7c1ea16851b42aaf346b2d94fc86a5c5803f680282fd8318a9c144ce86fe00ebb7e6a3987dcb6eeaaa35d1a92271345f766d06d44c7d8f
   languageName: node
   linkType: hard
 

@@ -18,13 +18,13 @@ import {
     AttachmentMongo,
     CalendarEventMongo,
     ContactMongo,
-    DeviceSyncStateMongo,
     FolderMongo,
     LabelMongo,
     MailboxMongo,
     MessageMongo,
     TaskMongo,
 } from "@rapidmx/restapi/mongo";
+import { DeviceSyncStateMongo } from "../../../src/models/mongo/DeviceSyncStateMongo.js";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { registerTestDoubles, RecordingMailTransport, InMemoryBlobStore, NoopSearchProvider } from "../../testDoubles.js";
 import { WbxmlEncoder } from "../../../src/codec/WbxmlEncoder.js";

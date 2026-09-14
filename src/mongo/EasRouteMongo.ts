@@ -2,7 +2,9 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { DeviceSyncStateMongo, MailboxMongo } from "@rapidmx/restapi/mongo";
+import { MailboxMongo } from "@rapidmx/restapi/mongo";
+import { RouteDecorators } from "@rapidrest/service-core";
+import { DeviceSyncStateMongo } from "../models/mongo/DeviceSyncStateMongo.js";
 import { BaseEasRoute } from "../BaseEasRoute.js";
 import { ProvisionCommand } from "../commands/ProvisionCommand.js";
 import { PingCommand } from "../commands/PingCommand.js";
@@ -18,14 +20,15 @@ import { SettingsCommandMongo } from "../commands/mongo/SettingsCommandMongo.js"
 import { GetItemEstimateCommandMongo } from "../commands/mongo/GetItemEstimateCommandMongo.js";
 import { MoveItemsCommandMongo } from "../commands/mongo/MoveItemsCommandMongo.js";
 import { ResolveRecipientsCommandMongo } from "../commands/mongo/ResolveRecipientsCommandMongo.js";
+const { Route } = RouteDecorators;
 
 /**
- * Mongo-backed concrete `BaseEasRoute`. A deployment mounts this at the well-known EAS path via its own
- * trivial `@Route("/Microsoft-Server-ActiveSync")` subclass, following the same pattern
- * `push/MailPushRoute.ts`'s doc comment describes for `BasePushRoute`.
+ * Mongo-backed concrete `BaseEasRoute`, mounted at the protocol's well-known path. Exported from this plugin's
+ * `./mongo` entry point, so the server host mounts it without a wrapper class of its own.
  *
  * @author Jean-Philippe Steinmetz
  */
+@Route("/Microsoft-Server-ActiveSync")
 export class EasRouteMongo extends BaseEasRoute<DeviceSyncStateMongo, MailboxMongo> {
     protected deviceSyncStateClass: any = DeviceSyncStateMongo;
     protected mailboxClass: any = MailboxMongo;

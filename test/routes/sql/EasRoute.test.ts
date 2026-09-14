@@ -23,13 +23,13 @@ import {
     AttachmentSQL,
     CalendarEventSQL,
     ContactSQL,
-    DeviceSyncStateSQL,
     FolderSQL,
     LabelSQL,
     MailboxSQL,
     MessageSQL,
     TaskSQL,
 } from "@rapidmx/restapi/sql";
+import { DeviceSyncStateSQL } from "../../../src/models/sql/DeviceSyncStateSQL.js";
 import { registerTestDoubles, RecordingMailTransport, InMemoryBlobStore, NoopSearchProvider } from "../../testDoubles.js";
 import { WbxmlEncoder } from "../../../src/codec/WbxmlEncoder.js";
 import { WbxmlDecoder } from "../../../src/codec/WbxmlDecoder.js";
