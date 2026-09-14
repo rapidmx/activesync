@@ -355,4 +355,43 @@ describe("EmailSyncAdapter Tests", () => {
             expect(defaults.messageId).toMatch(/^<.+@eas>$/);
         });
     });
+
+    describe("toApplicationDataBatch", () => {
+        const categoriesOf = (el: WbxmlElement): string[] | undefined =>
+            el.children.find((child) => child.tag === "Categories")?.children.map((child) => child.text!);
+
+        it("Resolves every page's labels with one in(...) find per mailbox, not one per labelled message.", async () => {
+            const { adapter, labelFind } = buildAdapter();
+            labelFind.mockImplementation(async (query: any) => {
+                const all = [
+                    { uid: "l1", mailboxUid: "mbx-1", name: "Important" },
+                    { uid: "l2", mailboxUid: "mbx-1", name: "Follow Up" },
+                    { uid: "l1", mailboxUid: "mbx-2", name: "Other Mailbox" },
+                ];
+                const uids: string[] = /^in\((.*)\)$/.exec(query.uid)![1].split(",");
+                return all.filter((label) => label.mailboxUid === query.mailboxUid && uids.includes(label.uid));
+            });
+            const messages: Message[] = [
+                { ...baseMessage, uid: "m1", labelUids: ["l2", "l1", "stale"] },
+                { ...baseMessage, uid: "m2", labelUids: ["l1", "l1"] },
+                { ...baseMessage, uid: "m3" },
+                { ...baseMessage, uid: "m4", mailboxUid: "mbx-2", labelUids: ["l1"] },
+            ];
+
+            const rendered = await adapter.toApplicationDataBatch(messages);
+
+            expect(labelFind).toHaveBeenCalledTimes(2);
+            const mbx1Query = labelFind.mock.calls.find(([query]) => query.mailboxUid === "mbx-1")![0];
+            expect(mbx1Query.uid.split(",").length).toBe(3);
+            expect(rendered.map(categoriesOf)).toEqual([["Follow Up", "Important"], ["Important"], undefined, ["Other Mailbox"]]);
+        });
+
+        it("Never queries the Label repo when no message has labels, and toApplicationData() matches the batch form.", async () => {
+            const { adapter, labelFind } = buildAdapter();
+            const [batched] = await adapter.toApplicationDataBatch([baseMessage]);
+            expect(await adapter.toApplicationData(baseMessage)).toEqual(batched);
+            expect(await adapter.toApplicationDataBatch([])).toEqual([]);
+            expect(labelFind).not.toHaveBeenCalled();
+        });
+    });
 });

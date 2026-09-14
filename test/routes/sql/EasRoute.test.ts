@@ -3825,6 +3825,21 @@ describe("Route:EasRouteSQL Tests", () => {
             expect(findChild(resp, "Recipient")).toBeUndefined();
         });
 
+        it("Handles a query whose escaped regex would exceed the pattern length limit instead of failing the request.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+            await createContact(mailbox.uid, folder.uid, {
+                displayName: "Jane Doe",
+                emails: [{ address: "new@example.com", type: ContactAddressKind.OTHER }],
+            });
+
+            const response = await postWbxml("ResolveRecipients", "dev1", resolveRequest([".".repeat(90), "Jane"]));
+
+            const responses = findChildren(response, "Response");
+            expect(responses.map((r) => childText(r, "Status"))).toEqual(["4", "1"]);
+        });
+
         it("Resolves multiple To values in one request independently.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");

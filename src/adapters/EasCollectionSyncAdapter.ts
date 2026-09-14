@@ -30,6 +30,11 @@ export interface EasCollectionSyncAdapter<T extends RecoverableBaseEntity> {
      * through unchanged (the same optional-async shape `fromApplicationData` already established below). */
     toApplicationData(item: T): WbxmlElement | Promise<WbxmlElement>;
 
+    /** Optional bulk form of `toApplicationData`, returning one element per item in the same order. Implemented
+     * where rendering needs a lookup that is far cheaper done once for a whole page (`EmailSyncAdapter`'s
+     * `Label` resolution); callers fall back to per-item `toApplicationData` when absent. */
+    toApplicationDataBatch?(items: T[]): Promise<WbxmlElement[]>;
+
     /**
      * Parses one client-originated `Add`/`Change` command's `<ApplicationData>` element (`el`) into a partial
      * entity update. Only fields actually present in `el` are included in the result - an omitted field means

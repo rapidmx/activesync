@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ApiError, ObjectDecorators, StringUtils } from "@rapidrest/core";
+import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
@@ -10,7 +10,19 @@ import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.
 import type { EmailSyncAdapter } from "../adapters/EmailSyncAdapter.js";
 import type { Contact, Message } from "@rapidmx/restapi";
 import type { SearchProvider } from "@rapidmx/restapi/search";
+import { boundedEscapedPattern } from "../RegexPatternUtils.js";
 const { Config, Init, Inject } = ObjectDecorators;
+
+/** Max message uids per `in(...)` lookup - well under `RepoUtils.find()`'s 1000-row page cap. */
+const SEARCH_LOOKUP_CHUNK = 500;
+
+function chunk<T>(items: T[], size: number): T[][] {
+    const chunks: T[][] = [];
+    for (let i = 0; i < items.length; i += size) {
+        chunks.push(items.slice(i, i + size));
+    }
+    return chunks;
+}
 
 /** Parses a `Range` value (`"m-n"`, a zero-based inclusive index pair) into `{ start, end }`, falling back to
  * `defaultEnd` for a missing/malformed value - never trusting the client to request more than `maxEnd` rows. */
@@ -111,7 +123,9 @@ export abstract class SearchCommand implements EasCommandHandler {
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
-        if (!this.contactRepo || !this.messageRepo || !this.searchProvider || !this.emailAdapter) {
+        // `searchProvider` is only needed by the Mailbox store - checked in `handleMailbox()` so a deployment
+        // without one can still answer GAL searches.
+        if (!this.contactRepo || !this.messageRepo || !this.emailAdapter) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         const storeEl = ctx.request ? findChild(ctx.request, "Store") : undefined;
@@ -154,7 +168,8 @@ export abstract class SearchCommand implements EasCommandHandler {
         // compiled case-insensitively on both backends (`$regex`/driver-native `REGEXP`), so escaping the term
         // with `StringUtils.escapeRegExp` gives a genuine literal-substring match with no residual wildcard
         // ambiguity - no `*...*` wrapping needed, `regex()` already matches anywhere in the field by default.
-        const pattern = StringUtils.escapeRegExp(query);
+        // Bounded so the escaped operand never trips service-core's regex length guard (-> INVALID_REQUEST).
+        const pattern = boundedEscapedPattern(query);
         const findOptions: any = { ignoreACL: true, limit: this.maxRangeEnd + 1 };
         const perField = await Promise.all(
             ["displayName", "givenName", "surname", "company"].map((field) =>
@@ -177,6 +192,9 @@ export abstract class SearchCommand implements EasCommandHandler {
     }
 
     private async handleMailbox(ctx: EasCommandContext, storeEl: WbxmlElement, start: number, end: number): Promise<WbxmlElement> {
+        if (!this.searchProvider) {
+            throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
+        }
         const queryEl = findChild(storeEl, "Query");
         if (!queryEl) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Search requires a Store with Name 'Mailbox' and a Query.");
@@ -196,7 +214,7 @@ export abstract class SearchCommand implements EasCommandHandler {
             );
         }
 
-        const resultPage = await this.searchProvider!.search({
+        const resultPage = await this.searchProvider.search({
             mailboxUid: ctx.mailboxUid,
             text: freeText,
             entityTypes: ["message"],
@@ -204,19 +222,39 @@ export abstract class SearchCommand implements EasCommandHandler {
             limit: this.maxRangeEnd + 1,
         });
 
-        const matches: Message[] = [];
-        for (const result of resultPage.results) {
-            const message: Message | undefined = await this.messageRepo!.findOne(result.entityUid, { ignoreACL: true });
-            if (!message) {
-                continue;
+        // One `in(...)` query for every hit (chunked to stay within `RepoUtils`' page size) instead of one
+        // `findOne` per hit, then one ACL check per distinct folder instead of per hit. A hit whose message no
+        // longer exists (stale index entry) simply isn't in `byUid`.
+        const hitUids: string[] = Array.from(new Set(resultPage.results.map((result) => result.entityUid)));
+        const byUid = new Map<string, Message>();
+        await Promise.all(
+            chunk(hitUids, SEARCH_LOOKUP_CHUNK).map(async (uids) => {
+                const found: Message[] = await this.messageRepo!.find({ uid: `in(${uids.join(",")})`, limit: uids.length } as any, {
+                    ignoreACL: true,
+                    limit: uids.length,
+                });
+                for (const message of found) {
+                    byUid.set((message as any).uid, message);
+                }
+            }),
+        );
+        const folderReadable = new Map<string, Promise<boolean>>();
+        const canRead = (folderUid: string): Promise<boolean> => {
+            let allowed = folderReadable.get(folderUid);
+            if (!allowed) {
+                allowed = this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.READ);
+                folderReadable.set(folderUid, allowed);
             }
-            if (!(await this.aclUtils!.hasPermission(ctx.user, message.folderUid, ACLAction.READ))) {
-                continue;
-            }
-            matches.push(message);
-        }
+            return allowed;
+        };
+        const candidates: Message[] = resultPage.results
+            .map((result) => byUid.get(result.entityUid))
+            .filter((message): message is Message => message !== undefined);
+        const readable: boolean[] = await Promise.all(candidates.map((message) => canRead(message.folderUid)));
+        const matches: Message[] = candidates.filter((_message, i) => readable[i]);
         const { page, rangeStart, rangeEnd } = paginate(matches, start, end);
-        const results = await Promise.all(page.map((message) => this.messageToResult(message)));
+        const applicationData: WbxmlElement[] = await this.emailAdapter!.toApplicationDataBatch(page);
+        const results = page.map((message, i) => this.messageToResult(message, applicationData[i]));
 
         return element(WbxmlCodePage.Search, "Store", [
             textElement(WbxmlCodePage.Search, "Status", "1"),
@@ -243,8 +281,7 @@ export abstract class SearchCommand implements EasCommandHandler {
      * Importance/Read/Flag/Body/ConversationId) for a Mailbox-store search hit's `Properties` - the same
      * per-field shape `Sync` already renders for this message, rather than a second, parallel mapping that
      * could drift out of sync with it. */
-    private async messageToResult(message: Message): Promise<WbxmlElement> {
-        const applicationData = await this.emailAdapter!.toApplicationData(message);
+    private messageToResult(message: Message, applicationData: WbxmlElement): WbxmlElement {
         return element(WbxmlCodePage.Search, "Result", [
             textElement(WbxmlCodePage.AirSync, "Class", "Email"),
             textElement(WbxmlCodePage.AirSync, "CollectionId", message.folderUid),

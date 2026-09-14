@@ -297,9 +297,12 @@ export abstract class SyncCommand implements EasCommandHandler {
             };
         }
 
+        const upserts: RecoverableBaseEntity[] = [...changes.adds, ...changes.changes];
+        const applicationData: WbxmlElement[] = adapter.toApplicationDataBatch
+            ? await adapter.toApplicationDataBatch(upserts)
+            : await Promise.all(upserts.map(async (item) => await adapter.toApplicationData(item)));
         const commandElements: WbxmlElement[] = [
-            ...(await Promise.all(changes.adds.map((item) => this.itemToCommandElement("Add", adapter, item)))),
-            ...(await Promise.all(changes.changes.map((item) => this.itemToCommandElement("Change", adapter, item)))),
+            ...upserts.map((item, i) => this.itemToCommandElement(i < changes.adds.length ? "Add" : "Change", item, applicationData[i])),
             ...changes.deletes.map((item) =>
                 element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", item.uid)]),
             ),
@@ -317,11 +320,8 @@ export abstract class SyncCommand implements EasCommandHandler {
         };
     }
 
-    private async itemToCommandElement(kind: "Add" | "Change", adapter: EasCollectionSyncAdapter<any>, item: RecoverableBaseEntity): Promise<WbxmlElement> {
-        return element(WbxmlCodePage.AirSync, kind, [
-            textElement(WbxmlCodePage.AirSync, "ServerId", item.uid),
-            await adapter.toApplicationData(item),
-        ]);
+    private itemToCommandElement(kind: "Add" | "Change", item: RecoverableBaseEntity, applicationData: WbxmlElement): WbxmlElement {
+        return element(WbxmlCodePage.AirSync, kind, [textElement(WbxmlCodePage.AirSync, "ServerId", item.uid), applicationData]);
     }
 
     /** One client-originated command's outcome: `response` is a `Responses/{Add,Change,Delete}` entry to

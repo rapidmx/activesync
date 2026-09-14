@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/RapidMX/activesync/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/RapidMX/activesync/actions/workflows/build.yml)
 [![Coverage Status](https://coveralls.io/repos/github/RapidMX/activesync/badge.svg?branch=main)](https://coveralls.io/github/RapidMX/activesync?branch=main)
-[![npm version](https://img.shields.io/npm/v/@rapidmx/activesync)](https://www.npmjs.com/package/@rapidmx/activesync)
+[![npm version](https://img.shields.io/npm/v/@rapidmx/activesync-plugin)](https://www.npmjs.com/package/@rapidmx/activesync-plugin)
 
 Exchange ActiveSync (EAS) protocol support for a [`@rapidmx/restapi`](https://github.com/RapidMX/restapi)-based
 mail server — covers every command a real mobile client (iOS Mail, Outlook mobile, Android/Samsung Mail) needs
@@ -23,7 +23,7 @@ EAS-specific login flow — which means a real native device (rather than a test
 token) needs an OAuth 2.0 Authorization Server role in front of it to obtain one; that piece is tracked as a
 follow-up in `@rapidrest/auth`, not this package.
 
-A [`@rapidmx/autodiscover`](https://github.com/RapidMX/autodiscover) mount lets real clients find this
+A [`@rapidmx/autodiscover-plugin`](https://github.com/RapidMX/autodiscover) mount lets real clients find this
 package's endpoint from just an email address.
 
 Responds to a client's `OPTIONS` capability probe with real `MS-ASProtocolVersions`/`MS-ASProtocolCommands`
@@ -36,11 +36,11 @@ means `OPTIONS` falls back to the bare `204` and a client falls back to trying i
 
 ## Usage
 
-Mount `EasRouteMongo`/`EasRouteSQL` (from `@rapidmx/activesync/mongo` or `/sql`) at the protocol's well-known
+Mount `EasRouteMongo`/`EasRouteSQL` (from `@rapidmx/activesync-plugin/mongo` or `/sql`) at the protocol's well-known
 path with a one-line subclass:
 
 ```ts
-import { EasRouteMongo } from "@rapidmx/activesync/mongo";
+import { EasRouteMongo } from "@rapidmx/activesync-plugin/mongo";
 import { RouteDecorators } from "@rapidrest/service-core";
 const { Route } = RouteDecorators;
 

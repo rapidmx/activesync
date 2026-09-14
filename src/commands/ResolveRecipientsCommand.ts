@@ -2,13 +2,14 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ObjectDecorators, StringUtils } from "@rapidrest/core";
+import { ObjectDecorators } from "@rapidrest/core";
 import { ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import type { Contact } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { element, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
-const { Config, Init } = ObjectDecorators;
+import { boundedEscapedPattern } from "../RegexPatternUtils.js";
+const { Config, Init, Logger } = ObjectDecorators;
 
 /** A simple, deliberately permissive email-address shape check - just enough to distinguish "the client sent
  * an address it already knows how to reach" from "the client sent a partial name/string that needs GAL
@@ -57,6 +58,9 @@ export abstract class ResolveRecipientsCommand implements EasCommandHandler {
 
     private contactRepo?: RepoUtils<any>;
 
+    @Logger
+    private logger: any;
+
     @Init
     public async init(): Promise<void> {
         this.contactRepo = await this._objectFactory!.newInstance(RepoUtils, {
@@ -70,7 +74,13 @@ export abstract class ResolveRecipientsCommand implements EasCommandHandler {
         const responses: WbxmlElement[] = [];
         for (const toEl of toEls) {
             const value = toEl.text ?? "";
-            responses.push(await this.resolveOne(ctx, value));
+            try {
+                responses.push(await this.resolveOne(ctx, value));
+            } catch (err) {
+                // One unresolvable `To` must not fail every other recipient in the same request.
+                this.logger?.warn(`ResolveRecipients lookup failed for one recipient: ${String(err)}`);
+                responses.push(this.responseElement(value, STATUS_NOT_FOUND, []));
+            }
         }
         return element(WbxmlCodePage.ResolveRecipients, "ResolveRecipients", [
             textElement(WbxmlCodePage.ResolveRecipients, "Status", "1"),
@@ -83,7 +93,8 @@ export abstract class ResolveRecipientsCommand implements EasCommandHandler {
             return this.responseElement(value, STATUS_SUCCESS, [this.recipientElement(value, undefined)]);
         }
 
-        const pattern = StringUtils.escapeRegExp(value);
+        // Bounded so the escaped operand never trips service-core's regex length guard (-> INVALID_REQUEST).
+        const pattern = boundedEscapedPattern(value);
         const findOptions: any = { ignoreACL: true, limit: this.maxMatches };
         const perField = await Promise.all(
             ["displayName", "givenName", "surname"].map((field) =>

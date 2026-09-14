@@ -27,6 +27,13 @@ const IMPORTANCE_BY_CODE: Record<string, MessageImportance> = {
 /** MS-ASAIRSYNCBASE `Body.Type`: 1 = plain text, 2 = HTML, 3 = RTF, 4 = MIME. */
 const BODY_TYPE_PLAIN_TEXT = "1";
 
+/** Max label uids per `in(...)` lookup - well under `RepoUtils.find()`'s 1000-row page cap. */
+const LABEL_LOOKUP_CHUNK = 500;
+
+function labelKey(mailboxUid: string, labelUid: string): string {
+    return `${mailboxUid}/${labelUid}`;
+}
+
 /**
  * Maps `Message` to/from the EAS `Sync` `Email` collection class (MS-ASEMAIL). Only a plain-text preview of the
  * body is included here (`Message.bodyPreview`, always already loaded on the entity, `Truncated: 1`) rather
@@ -53,10 +60,9 @@ const BODY_TYPE_PLAIN_TEXT = "1";
  * already takes for a stale search-index entry. Deliberately not writable: unlike `Contact.categories` (a
  * plain free-form string array with no separate entity behind it), a `Label` is a real mailbox-scoped entity
  * referenced by uid - a write path would need to resolve category name strings back to `Label`s and create new
- * ones on the fly for names that don't exist yet, real added scope this pragmatic subset defers. One `find()`
- * per message that actually has labels (most won't, since labels are opt-in) - not batched across a whole Sync
- * page/search result set, a documented, modest N+1 tradeoff rather than widening this adapter's own interface
- * further to let a caller pre-resolve names for a whole batch.
+ * ones on the fly for names that don't exist yet, real added scope this pragmatic subset defers. Callers
+ * rendering a whole Sync page/search result set use `toApplicationDataBatch()`, which resolves every referenced
+ * label with one `in(...)` query per mailbox rather than one per labelled message.
  *
  * `labelClass` is supplied by the Mongo/SQL concrete subclasses.
  *
@@ -84,10 +90,29 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
     }
 
     public async toApplicationData(message: Message): Promise<WbxmlElement> {
+        return (await this.toApplicationDataBatch([message]))[0];
+    }
+
+    /** Renders a whole page of messages, resolving every referenced `Label` with one `find()` per distinct
+     * mailbox (in practice one per page) instead of one per labelled message. */
+    public async toApplicationDataBatch(messages: Message[]): Promise<WbxmlElement[]> {
+        const labelNames = await this.resolveLabelNames(messages);
+        return messages.map((message) => {
+            const categories: string[] = [];
+            for (const uid of new Set(message.labelUids ?? [])) {
+                const name = labelNames.get(labelKey(message.mailboxUid, uid));
+                if (name !== undefined) {
+                    categories.push(name);
+                }
+            }
+            return this.render(message, categories);
+        });
+    }
+
+    private render(message: Message, categories: string[]): WbxmlElement {
         const to = message.recipients.filter((r) => r.type === RecipientType.TO).map((r) => r.address);
         const cc = message.recipients.filter((r) => r.type === RecipientType.CC).map((r) => r.address);
         const bcc = message.recipients.filter((r) => r.type === RecipientType.BCC).map((r) => r.address);
-        const categories = await this.resolveLabelNames(message);
 
         return element(WbxmlCodePage.AirSync, "ApplicationData", [
             textElement(WbxmlCodePage.Email, "Subject", message.subject),
@@ -118,15 +143,42 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
         ]);
     }
 
-    private async resolveLabelNames(message: Message): Promise<string[]> {
-        if (!message.labelUids || message.labelUids.length === 0) {
-            return [];
+    /** Resolves every distinct `labelUids` entry across `messages` to its `Label.name`, keyed by `labelKey()`.
+     * Labels are mailbox-scoped, so uids are grouped per `mailboxUid` and each group is fetched with a single
+     * `in(...)` query (chunked to stay within `RepoUtils`' page size). A stale uid simply has no entry. */
+    private async resolveLabelNames(messages: Message[]): Promise<Map<string, string>> {
+        const uidsByMailbox = new Map<string, Set<string>>();
+        for (const message of messages) {
+            for (const uid of message.labelUids ?? []) {
+                let uids = uidsByMailbox.get(message.mailboxUid);
+                if (!uids) {
+                    uids = new Set<string>();
+                    uidsByMailbox.set(message.mailboxUid, uids);
+                }
+                uids.add(uid);
+            }
         }
-        const labels: Label[] = await this.labelRepo!.find(
-            { mailboxUid: message.mailboxUid, uid: `in(${message.labelUids.join(",")})` } as any,
-            { ignoreACL: true },
-        );
-        return labels.map((label) => label.name);
+
+        const names = new Map<string, string>();
+        const lookups: Promise<void>[] = [];
+        for (const [mailboxUid, uidSet] of uidsByMailbox) {
+            const uids = Array.from(uidSet);
+            for (let i = 0; i < uids.length; i += LABEL_LOOKUP_CHUNK) {
+                const chunk = uids.slice(i, i + LABEL_LOOKUP_CHUNK);
+                lookups.push(
+                    this.labelRepo!.find({ mailboxUid, uid: `in(${chunk.join(",")})`, limit: chunk.length } as any, {
+                        ignoreACL: true,
+                        limit: chunk.length,
+                    }).then((labels: Label[]) => {
+                        for (const label of labels) {
+                            names.set(labelKey(mailboxUid, (label as any).uid), label.name);
+                        }
+                    }),
+                );
+            }
+        }
+        await Promise.all(lookups);
+        return names;
     }
 
     /**

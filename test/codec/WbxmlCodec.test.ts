@@ -112,6 +112,21 @@ describe("WBXML codec Tests", () => {
             expect(decoded.text).toBe("José 日本語 😀");
         });
 
+        it("Strips U+0000 from inline text so it can't terminate the string early and inject tokens.", () => {
+            const nul = String.fromCharCode(0);
+            // Without stripping, the bytes after the first NUL (0x01 = END) would be parsed as markup.
+            const tree = element(WbxmlCodePage.AirSync, "Sync", [
+                textElement(WbxmlCodePage.Email, "Subject", `Hi${nul}${String.fromCharCode(1)}${nul}there`),
+                textElement(WbxmlCodePage.Email, "Read", "1"),
+            ]);
+
+            const decoded: WbxmlElement = new WbxmlDecoder().decode(new WbxmlEncoder().encode(tree));
+
+            expect(decoded.children.map((child) => child.tag)).toEqual(["Subject", "Read"]);
+            expect(decoded.children[0].text).toBe(`Hi${String.fromCharCode(1)}there`);
+            expect(childText(decoded, "Read")).toBe("1");
+        });
+
         it("Round-trips a tree switching between more than two code pages across sibling elements.", () => {
             const tree: WbxmlElement = element(WbxmlCodePage.AirSync, "Sync", [
                 textElement(WbxmlCodePage.AirSync, "SyncKey", "1"),

@@ -49,6 +49,35 @@ Keep entries terse — this is a reference, not a transcript.
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
 
+### 2026-09-14 — Review-finding fix pass (perf batching, WBXML NUL injection, regex length, GAL guard)
+
+Each finding was confirmed in code before fixing (the reviewer's line numbers were stale, the code shapes matched).
+Not committed; no version/peerDependency changes.
+
+- **Label/Search N+1 batched.** Added optional `EasCollectionSyncAdapter.toApplicationDataBatch(items)`;
+  `EmailSyncAdapter` implements it by grouping distinct `labelUids` per `mailboxUid` and fetching each group
+  with one `uid: in(...)` find (chunked at 500, `limit` in both query and options, since `RepoUtils.find()`
+  defaults to 100 rows). `toApplicationData()` delegates to it. `SyncCommand` renders adds+changes in one
+  batch call (falling back to per-item for adapters without it). `SearchCommand`'s Mailbox branch now loads
+  all hits with one `uid: in(...)` find instead of a sequential `findOne` per hit, and memoizes
+  `hasPermission` per `folderUid`; relevance order, duplicate hits and stale-entry skipping are unchanged.
+  Categories now come out in `labelUids` order (was DB order). Supersedes the "one `find()` per labelled
+  message" tradeoff noted in the 2026-09-13 (2) entry.
+- **WBXML `STR_I` NUL injection.** `WbxmlEncoder.writeStrI` strips U+0000 (UTF-8 emits 0x00 for no other code
+  point), so a user-controlled label name/subject can no longer terminate the inline string early and inject
+  tokens. The NUL is built via `String.fromCharCode(0)`: tool edits typing an escaped NUL wrote a literal 0x00
+  byte into the source twice this session. Check with `file` that a source file still reads as text.
+- **Regex length guard.** `service-core`'s `regex()` rejects operands over its private
+  `ModelUtils.MAX_PATTERN_LENGTH` (100), checked after escaping, so a metacharacter-heavy term under 100 raw
+  chars could 400 the whole command. New `src/RegexPatternUtils.ts` `boundedEscapedPattern()` truncates the raw
+  term per code point so the escaped form fits. Used by GAL Search and ResolveRecipients. ResolveRecipients
+  also now catches a per-recipient lookup failure and reports that recipient as Status `4`, not failing all.
+- **GAL without a SearchProvider.** `SearchCommand.handle()` no longer requires `searchProvider`; only the
+  Mailbox branch checks it (500 if missing).
+- README package names updated to `@rapidmx/activesync-plugin` / `@rapidmx/autodiscover-plugin`.
+- Tests: new `test/commands/ResolveRecipientsCommand.test.ts`, `test/RegexPatternUtils.test.ts`; extended
+  `SearchCommand.test.ts`, `EmailSyncAdapter.test.ts`, `WbxmlCodec.test.ts`, and both `EasRoute.test.ts`.
+
 ### 2026-09-13 (3) — Switched GAL search from `like()` glob-wrapping to `regex()`, matching the `mapi` plugin's own fix
 
 JP pointed out the sibling `mapi` plugin hit the exact same `service-core` 2.0 `like()`-glob regression this repo

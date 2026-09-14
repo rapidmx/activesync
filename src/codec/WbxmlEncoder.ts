@@ -12,6 +12,9 @@ const END = 0x01;
 const STR_I = 0x03;
 const OPAQUE = 0xc3;
 
+/** U+0000, the character whose UTF-8 encoding is the `STR_I` terminator byte. */
+const NUL = String.fromCharCode(0);
+
 /** Bit flags folded into a tag token byte alongside its 6-bit code (MS-ASWBXML §2.1.2.2 "Tag Format"). Only
  * `CONTENT_FLAG` is ever set by this encoder - ActiveSync's WBXML profile never uses attributes. */
 const CONTENT_FLAG = 0x40;
@@ -64,9 +67,12 @@ export class WbxmlEncoder {
         this.bytes.push(END);
     }
 
+    /** A NUL byte terminates a WBXML inline string, so any U+0000 in `text` (e.g. a label name or subject
+     * controlled by another user) would end the string early and let the remaining bytes be parsed as tokens.
+     * UTF-8 never produces a 0x00 byte for any other code point, so stripping U+0000 is sufficient. */
     private writeStrI(text: string): void {
         this.bytes.push(STR_I);
-        for (const byte of Buffer.from(text, "utf-8")) {
+        for (const byte of Buffer.from(text.split(NUL).join(""), "utf-8")) {
             this.bytes.push(byte);
         }
         this.bytes.push(0x00);
