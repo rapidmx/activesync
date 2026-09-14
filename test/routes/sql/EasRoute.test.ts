@@ -70,11 +70,11 @@ describe("Route:EasRouteSQL Tests", () => {
     const adminToken = JWTUtils.createTokenSync(config.get("auth"), admin);
 
     /** See the identical helper in test/routes/mongo/EasRoute.test.ts for why the ACL seed matters here. */
-    const createMailbox = async function (ownerUid: string): Promise<MailboxSQL> {
+    const createMailbox = async function (ownerUid: string, aliasAddresses: string[] = []): Promise<MailboxSQL> {
         const obj: MailboxSQL = new MailboxSQL({
             ownerUserUid: ownerUid,
             primarySmtpAddress: `${uuid.v4()}@example.com`,
-            aliasAddresses: [],
+            aliasAddresses,
             displayName: "Test Mailbox",
             timezone: "UTC",
             quotaBytes: 1_000_000_000,
@@ -217,11 +217,20 @@ describe("Route:EasRouteSQL Tests", () => {
         );
     };
 
+    /** The policy key the device acknowledged, sent as `X-MS-PolicyKey` exactly like a real provisioned client
+     * (`BaseEasRoute` refuses a missing or stale key with 449). Empty for a device that was never provisioned. */
+    const policyKeyOf = async function (deviceId: string): Promise<string> {
+        const mailbox = await mailboxRepo.findOne({ where: { ownerUserUid: owner.uid } });
+        const state = mailbox ? await deviceSyncStateRepo.findOne({ where: { mailboxUid: mailbox.uid, deviceId } }) : null;
+        return state?.policyKey ?? "";
+    };
+
     /** See the identical helper in test/routes/mongo/EasRoute.test.ts. */
     const postWbxml = async function (cmd: string, deviceId: string, requestBody?: WbxmlElement): Promise<WbxmlElement> {
         const req = request(server.getApplication())
             .post(`${baseUrl}?Cmd=${cmd}&DeviceId=${deviceId}`)
             .set("Authorization", "jwt " + ownerToken)
+            .set("X-MS-PolicyKey", await policyKeyOf(deviceId))
             .set("Content-Type", "application/vnd.ms-sync.wbxml");
         const result = requestBody ? await req.send(new WbxmlEncoder().encode(requestBody)) : await req;
         expect(result.status).toBeGreaterThanOrEqual(200);
@@ -240,8 +249,9 @@ describe("Route:EasRouteSQL Tests", () => {
      * that actually assert on such a field's exact byte content need this; every other test's response content
      * is plain text and unaffected, so `postWbxml` remains the default.
      */
-    const postWbxmlBinary = function (cmd: string, deviceId: string, requestBody?: WbxmlElement): Promise<WbxmlElement> {
-        return new Promise((resolve, reject) => {
+    const postWbxmlBinary = async function (cmd: string, deviceId: string, requestBody?: WbxmlElement): Promise<WbxmlElement> {
+        const policyKey = await policyKeyOf(deviceId);
+        return await new Promise((resolve, reject) => {
             const body = requestBody ? new WbxmlEncoder().encode(requestBody) : Buffer.alloc(0);
             const req = http.request(
                 {
@@ -251,6 +261,7 @@ describe("Route:EasRouteSQL Tests", () => {
                     method: "POST",
                     headers: {
                         Authorization: "jwt " + ownerToken,
+                        "X-MS-PolicyKey": policyKey,
                         "Content-Type": "application/vnd.ms-sync.wbxml",
                         "Content-Length": body.length,
                     },
@@ -383,7 +394,8 @@ describe("Route:EasRouteSQL Tests", () => {
         it("Returns 404 when the caller owns no mailbox.", async () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=FolderSync&DeviceId=dev1`)
-                .set("Authorization", "jwt " + ownerToken);
+                .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"));
             expect(result.status).toBe(404);
         });
 
@@ -417,7 +429,8 @@ describe("Route:EasRouteSQL Tests", () => {
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=FolderSync&DeviceId=dev1`)
-                .set("Authorization", "jwt " + ownerToken);
+                .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"));
 
             expect(result.status).toBe(449);
         });
@@ -427,7 +440,8 @@ describe("Route:EasRouteSQL Tests", () => {
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=Settings&DeviceId=dev1`)
-                .set("Authorization", "jwt " + ownerToken);
+                .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"));
 
             expect(result.status).toBeGreaterThanOrEqual(200);
             expect(result.status).toBeLessThan(300);
@@ -442,12 +456,14 @@ describe("Route:EasRouteSQL Tests", () => {
                     deviceType: "TestPhone",
                     folderSyncKeys: {},
                     provisioned: true,
+                    policyKey: "validate-cert-key",
                 }),
             );
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=ValidateCert&DeviceId=dev1`)
-                .set("Authorization", "jwt " + ownerToken);
+                .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"));
 
             expect(result.status).toBe(501);
         });
@@ -457,10 +473,12 @@ describe("Route:EasRouteSQL Tests", () => {
 
             await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=Settings&DeviceId=dev1`)
-                .set("Authorization", "jwt " + ownerToken);
+                .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"));
             await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=Settings&DeviceId=dev1`)
-                .set("Authorization", "jwt " + ownerToken);
+                .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"));
 
             const all = await deviceSyncStateRepo.find({ where: { mailboxUid: mailbox.uid, deviceId: "dev1" } });
             expect(all.length).toBe(1);
@@ -575,7 +593,8 @@ describe("Route:EasRouteSQL Tests", () => {
             // The device is forced back through Provision by the ordinary 449 gate before it can do anything else.
             const gated = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=FolderSync&DeviceId=dev1`)
-                .set("Authorization", "jwt " + ownerToken);
+                .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"));
             expect(gated.status).toBe(449);
 
             const wipeDirective = await postWbxml(
@@ -649,7 +668,7 @@ describe("Route:EasRouteSQL Tests", () => {
             expect(childText(response, "SyncKey")).toBeTruthy();
         });
 
-        it("Returns a fresh SyncKey with no items on the initial (SyncKey 0) request.", async () => {
+        it("Returns every existing folder as an Add together with a fresh SyncKey on the initial (SyncKey 0) request.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");
             await folderRepo.save(new FolderSQL({ mailboxUid: mailbox.uid, name: "Inbox", type: FolderType.INBOX, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 }));
@@ -664,10 +683,12 @@ describe("Route:EasRouteSQL Tests", () => {
 
             expect(childText(response, "Status")).toBe("1");
             expect(childText(response, "SyncKey")).not.toBe("0");
-            expect(findChild(response, "Changes")).toBeUndefined();
+            const changes = findChild(response, "Changes")!;
+            expect(childText(changes, "Count")).toBe("1");
+            expect(childText(findChild(changes, "Add")!, "DisplayName")).toBe("Inbox");
         });
 
-        it("Reports an existing folder as an Add on the first real sync round after the initial request.", async () => {
+        it("Reports an existing folder as an Add in the initial response, and not again on the next round.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");
             const folder = await folderRepo.save(
@@ -691,15 +712,17 @@ describe("Route:EasRouteSQL Tests", () => {
                 ]),
             );
 
-            expect(childText(response, "Status")).toBe("1");
-            expect(childText(response, "SyncKey")).not.toBe(initialKey);
-            const changes = findChild(response, "Changes")!;
+            const changes = findChild(initial, "Changes")!;
             expect(childText(changes, "Count")).toBe("1");
             const add = findChild(changes, "Add")!;
             expect(childText(add, "ServerId")).toBe(folder.uid);
             expect(childText(add, "DisplayName")).toBe("Inbox");
             expect(childText(add, "ParentId")).toBe("0");
             expect(childText(add, "Type")).toBe("2");
+
+            expect(childText(response, "Status")).toBe("1");
+            expect(childText(response, "SyncKey")).not.toBe(initialKey);
+            expect(findChild(response, "Changes")).toBeUndefined();
         });
 
         it("Reports a folder renamed via the REST API as an Update on the next sync round.", async () => {
@@ -894,7 +917,7 @@ describe("Route:EasRouteSQL Tests", () => {
             expect(childText(appData, "Subject")).toBe("Hello EAS");
             expect(childText(appData, "From")).toBe("Sender <sender@example.com>");
             expect(childText(appData, "Read")).toBe("1");
-            expect(childText(appData, "Flag")).toBe("1");
+            expect(childText(findChild(appData, "Flag")!, "FlagStatus")).toBe("2");
             expect(childText(appData, "Bcc")).toBe("hidden@example.com");
         });
 
@@ -1160,7 +1183,7 @@ describe("Route:EasRouteSQL Tests", () => {
                 expect(childText(collection, "Class")).toBe("Email");
             });
 
-            it("Returns Status 4 when Class is omitted for a folder never previously synced.", async () => {
+            it("Falls back to the folder's type when Class is omitted for a folder never previously synced.", async () => {
                 const mailbox = await createMailbox(owner.uid);
                 await provisionDevice("dev1");
                 const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
@@ -1168,7 +1191,8 @@ describe("Route:EasRouteSQL Tests", () => {
                 const response = await postWbxml("Sync", "dev1", syncRequest("0", undefined, folder.uid));
 
                 const collection = findChild(findChild(response, "Collections")!, "Collection")!;
-                expect(childText(collection, "Status")).toBe("4");
+                expect(childText(collection, "Status")).toBe("1");
+                expect(childText(collection, "Class")).toBe("Email");
             });
         });
 
@@ -1899,7 +1923,7 @@ describe("Route:EasRouteSQL Tests", () => {
                 expect(childText(del, "Status")).toBe("8");
             });
 
-            it("Accepts a client-originated Email Delete silently, soft-deleting the message.", async () => {
+            it("Accepts a client-originated Email Delete silently, moving the message to Deleted Items (DeletesAsMoves defaults to true).", async () => {
                 const mailbox = await createMailbox(owner.uid);
                 await provisionDevice("dev1");
                 const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
@@ -1916,7 +1940,8 @@ describe("Route:EasRouteSQL Tests", () => {
 
                 expect(findChild(collectionOf(response), "Responses")).toBeUndefined();
                 const deleted = await messageRepo.findOne({ where: { uid: message.uid } });
-                expect(deleted?.deleted).toBe(true);
+                expect(deleted?.deleted).toBe(false);
+                expect(deleted?.folderUid).not.toBe(folder.uid);
             });
         });
     });
@@ -1965,12 +1990,13 @@ describe("Route:EasRouteSQL Tests", () => {
         };
 
         it("SendMail relays the composed message and returns an empty response.", async () => {
-            await createMailbox(owner.uid);
+            await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SendMail&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(new WbxmlEncoder().encode(composeRequest("SendMail", rawMime())));
 
@@ -1982,13 +2008,14 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("SendMail with SaveInSentItems creates a Message in the mailbox's Sent Items folder.", async () => {
-            await createMailbox(owner.uid);
+            await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
 
             const mime = rawMime({ subject: "Saved Copy", cc: "cc@example.com", bcc: "bcc@example.com" });
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SendMail&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(new WbxmlEncoder().encode(composeRequest("SendMail", mime, { saveInSentItems: true })));
             expect(result.status).toBeGreaterThanOrEqual(200);
@@ -2008,12 +2035,13 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("SendMail without SaveInSentItems relays but does not save a copy.", async () => {
-            await createMailbox(owner.uid);
+            await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
 
             await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SendMail&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(new WbxmlEncoder().encode(composeRequest("SendMail", rawMime())));
 
@@ -2023,12 +2051,13 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("Rejects a compose request with no MIME body.", async () => {
-            await createMailbox(owner.uid);
+            await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SendMail&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2042,12 +2071,13 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("Returns 422 when the composed message fails spam scanning.", async () => {
-            await createMailbox(owner.uid);
+            await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SendMail&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(new WbxmlEncoder().encode(composeRequest("SendMail", rawMime({ body: "X-Test-Force-Spam: true" }))));
 
@@ -2056,12 +2086,13 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("Returns 502 when the mail transport rejects the message.", async () => {
-            await createMailbox(owner.uid);
+            await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SendMail&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(new WbxmlEncoder().encode(composeRequest("SendMail", rawMime({ to: "reject@example.com" }))));
 
@@ -2069,7 +2100,7 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("SmartReply threads the reply to the original and marks it Answered.", async () => {
-            const mailbox = await createMailbox(owner.uid);
+            const mailbox = await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
             const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
             const original = await createMessage(mailbox.uid, inbox.uid, {
@@ -2080,6 +2111,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SmartReply&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2102,7 +2134,7 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("SmartForward marks the original message Forwarded.", async () => {
-            const mailbox = await createMailbox(owner.uid);
+            const mailbox = await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
             const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
             const original = await createMessage(mailbox.uid, inbox.uid, { messageId: "<original2@example.com>" });
@@ -2110,6 +2142,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SmartForward&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2127,12 +2160,13 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("Returns 404 when Source.ItemId references a message that doesn't exist.", async () => {
-            await createMailbox(owner.uid);
+            await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SmartReply&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2146,7 +2180,7 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("Returns 403 when Source.ItemId references a message the caller has no permission on.", async () => {
-            await createMailbox(owner.uid);
+            await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
             const otherMailbox = await createMailbox(otherUser.uid);
             const otherInbox = await createFolderWithAcl(otherMailbox.uid, { name: "Inbox", type: FolderType.INBOX });
@@ -2155,6 +2189,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SmartReply&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2168,12 +2203,13 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("Returns 400 when Source is present but missing its required ItemId.", async () => {
-            await createMailbox(owner.uid);
+            await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SmartReply&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2190,13 +2226,14 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("Returns 400 when the composed Mime has no resolvable From/To address.", async () => {
-            await createMailbox(owner.uid);
+            await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
             const noAddressMime = Buffer.from(["Subject: No addresses", "MIME-Version: 1.0", "Content-Type: text/plain", "", "Body only."].join("\r\n"));
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SendMail&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(new WbxmlEncoder().encode(composeRequest("SendMail", noAddressMime)));
 
@@ -2204,7 +2241,7 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("SendMail with SaveInSentItems flattens a grouped (mailing-list-style) To header.", async () => {
-            await createMailbox(owner.uid);
+            await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
             const groupedMime = Buffer.from(
                 [
@@ -2222,6 +2259,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SendMail&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(new WbxmlEncoder().encode(composeRequest("SendMail", groupedMime, { saveInSentItems: true })));
 
@@ -2233,7 +2271,7 @@ describe("Route:EasRouteSQL Tests", () => {
         });
 
         it("SendMail with a Source (non-standard, but not rejected) relays without touching any original message.", async () => {
-            const mailbox = await createMailbox(owner.uid);
+            const mailbox = await createMailbox(owner.uid, ["owner@example.com"]);
             await provisionDevice("dev1");
             const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
             const original = await createMessage(mailbox.uid, inbox.uid);
@@ -2241,6 +2279,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=SendMail&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2348,6 +2387,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2373,6 +2413,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2395,6 +2436,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2416,6 +2458,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(new WbxmlEncoder().encode(element(WbxmlCodePage.ItemOperations, "ItemOperations", [])));
 
@@ -2428,7 +2471,8 @@ describe("Route:EasRouteSQL Tests", () => {
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
-                .set("Authorization", "jwt " + ownerToken);
+                .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"));
 
             expect(result.status).toBe(400);
         });
@@ -2440,6 +2484,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2471,6 +2516,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(new WbxmlEncoder().encode(element(WbxmlCodePage.ItemOperations, "ItemOperations", fetches)));
 
@@ -2488,6 +2534,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2639,6 +2686,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -2688,6 +2736,7 @@ describe("Route:EasRouteSQL Tests", () => {
                 const result = await request(server.getApplication())
                     .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
                     .set("Authorization", "jwt " + ownerToken)
+                    .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                     .set("Content-Type", "application/vnd.ms-sync.wbxml")
                     .send(
                         new WbxmlEncoder().encode(
@@ -2712,6 +2761,7 @@ describe("Route:EasRouteSQL Tests", () => {
                 const result = await request(server.getApplication())
                     .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
                     .set("Authorization", "jwt " + ownerToken)
+                    .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                     .set("Content-Type", "application/vnd.ms-sync.wbxml")
                     .send(
                         new WbxmlEncoder().encode(
@@ -2733,6 +2783,7 @@ describe("Route:EasRouteSQL Tests", () => {
                 const result = await request(server.getApplication())
                     .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
                     .set("Authorization", "jwt " + ownerToken)
+                    .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                     .set("Content-Type", "application/vnd.ms-sync.wbxml")
                     .send(
                         new WbxmlEncoder().encode(
@@ -2976,6 +3027,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=Search&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -3035,6 +3087,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=Search&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -3125,6 +3178,7 @@ describe("Route:EasRouteSQL Tests", () => {
                 const result = await request(server.getApplication())
                     .post(`${baseUrl}?Cmd=Search&DeviceId=dev1`)
                     .set("Authorization", "jwt " + ownerToken)
+                    .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                     .set("Content-Type", "application/vnd.ms-sync.wbxml")
                     .send(new WbxmlEncoder().encode(mailboxSearchRequest("term", { className: "Contacts" })));
 
@@ -3138,6 +3192,7 @@ describe("Route:EasRouteSQL Tests", () => {
                 const result = await request(server.getApplication())
                     .post(`${baseUrl}?Cmd=Search&DeviceId=dev1`)
                     .set("Authorization", "jwt " + ownerToken)
+                    .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                     .set("Content-Type", "application/vnd.ms-sync.wbxml")
                     .send(new WbxmlEncoder().encode(mailboxSearchRequest(undefined)));
 
@@ -3151,6 +3206,7 @@ describe("Route:EasRouteSQL Tests", () => {
                 const result = await request(server.getApplication())
                     .post(`${baseUrl}?Cmd=Search&DeviceId=dev1`)
                     .set("Authorization", "jwt " + ownerToken)
+                    .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                     .set("Content-Type", "application/vnd.ms-sync.wbxml")
                     .send(
                         new WbxmlEncoder().encode(
@@ -3285,13 +3341,14 @@ describe("Route:EasRouteSQL Tests", () => {
             expect(updated?.attendees[0].responseStatus).toBe(AttendeeResponseStatus.NEEDS_ACTION);
         });
 
-        it("Returns 404 when RequestId references a calendar event that doesn't exist.", async () => {
+        it("Reports Result Status 2 when RequestId references neither a calendar event nor a message.", async () => {
             await createMailbox(owner.uid);
             await provisionDevice("dev1");
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=MeetingResponse&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -3305,10 +3362,11 @@ describe("Route:EasRouteSQL Tests", () => {
                     ),
                 );
 
-            expect(result.status).toBe(404);
+            expect(result.status).toBe(200);
+            expect(childText(findChild(new WbxmlDecoder().decode(Buffer.from(result.body)), "Result")!, "Status")).toBe("2");
         });
 
-        it("Returns 404 when the caller is not an attendee of the referenced event.", async () => {
+        it("Reports Result Status 2 when the caller is not an attendee of the referenced event.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");
             const folder = await createFolderWithAcl(mailbox.uid, { name: "Calendar", type: FolderType.CALENDAR });
@@ -3326,6 +3384,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=MeetingResponse&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -3339,10 +3398,11 @@ describe("Route:EasRouteSQL Tests", () => {
                     ),
                 );
 
-            expect(result.status).toBe(404);
+            expect(result.status).toBe(200);
+            expect(childText(findChild(new WbxmlDecoder().decode(Buffer.from(result.body)), "Result")!, "Status")).toBe("2");
         });
 
-        it("Returns 400 when the Request is missing UserResponse.", async () => {
+        it("Reports Result Status 2 when the Request is missing UserResponse.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");
             const folder = await createFolderWithAcl(mailbox.uid, { name: "Calendar", type: FolderType.CALENDAR });
@@ -3351,6 +3411,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=MeetingResponse&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -3363,7 +3424,8 @@ describe("Route:EasRouteSQL Tests", () => {
                     ),
                 );
 
-            expect(result.status).toBe(400);
+            expect(result.status).toBe(200);
+            expect(childText(findChild(new WbxmlDecoder().decode(Buffer.from(result.body)), "Result")!, "Status")).toBe("2");
         });
 
         it("Returns 400 when the request has no Request element at all.", async () => {
@@ -3373,6 +3435,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=MeetingResponse&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(new WbxmlEncoder().encode(element(WbxmlCodePage.MeetingResponse, "MeetingResponse", [])));
 
@@ -3385,7 +3448,8 @@ describe("Route:EasRouteSQL Tests", () => {
 
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=MeetingResponse&DeviceId=dev1`)
-                .set("Authorization", "jwt " + ownerToken);
+                .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"));
 
             expect(result.status).toBe(400);
         });
@@ -3430,7 +3494,7 @@ describe("Route:EasRouteSQL Tests", () => {
             expect(updated?.attendees[1].responseStatus).toBe(AttendeeResponseStatus.TENTATIVE);
         });
 
-        it("Returns 403 when responding to a meeting the caller has no permission on.", async () => {
+        it("Reports Result Status 2 when responding to a meeting the caller has no permission on.", async () => {
             await createMailbox(owner.uid);
             await provisionDevice("dev1");
             const otherMailbox = await createMailbox(otherUser.uid);
@@ -3449,6 +3513,7 @@ describe("Route:EasRouteSQL Tests", () => {
             const result = await request(server.getApplication())
                 .post(`${baseUrl}?Cmd=MeetingResponse&DeviceId=dev1`)
                 .set("Authorization", "jwt " + ownerToken)
+                .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
                 .set("Content-Type", "application/vnd.ms-sync.wbxml")
                 .send(
                     new WbxmlEncoder().encode(
@@ -3462,7 +3527,8 @@ describe("Route:EasRouteSQL Tests", () => {
                     ),
                 );
 
-            expect(result.status).toBe(403);
+            expect(result.status).toBe(200);
+            expect(childText(findChild(new WbxmlDecoder().decode(Buffer.from(result.body)), "Result")!, "Status")).toBe("2");
         });
     });
 
@@ -4148,6 +4214,535 @@ describe("Route:EasRouteSQL Tests", () => {
                 expect(childText(get, "OofState")).toBe("1");
                 expect(findChild(get, "StartTime")).toBeUndefined();
                 expect(findChild(get, "EndTime")).toBeUndefined();
+            });
+        });
+    });
+    describe("Round-3 protocol fixes (end to end)", () => {
+        const collectionOf = function (response: WbxmlElement): WbxmlElement {
+            return findChild(findChild(response, "Collections")!, "Collection")!;
+        };
+
+        /** One-collection Sync request with optional Commands and extra per-collection elements (WindowSize, Options...). */
+        const sync = function (syncKey: string, collectionClass: string | undefined, folderUid: string, extra: WbxmlElement[] = [], commands?: WbxmlElement[]): WbxmlElement {
+            return element(WbxmlCodePage.AirSync, "Sync", [
+                element(WbxmlCodePage.AirSync, "Collections", [
+                    element(WbxmlCodePage.AirSync, "Collection", [
+                        ...(collectionClass ? [textElement(WbxmlCodePage.AirSync, "Class", collectionClass)] : []),
+                        textElement(WbxmlCodePage.AirSync, "SyncKey", syncKey),
+                        textElement(WbxmlCodePage.AirSync, "CollectionId", folderUid),
+                        ...extra,
+                        ...(commands ? [element(WbxmlCodePage.AirSync, "Commands", commands)] : []),
+                    ]),
+                ]),
+            ]);
+        };
+
+        const syncRound = async function (syncKey: string, collectionClass: string | undefined, folderUid: string, extra: WbxmlElement[] = [], commands?: WbxmlElement[]) {
+            const collection = collectionOf(await postWbxml("Sync", "dev1", sync(syncKey, collectionClass, folderUid, extra, commands)));
+            const commandsEl = findChild(collection, "Commands");
+            return {
+                collection,
+                key: childText(collection, "SyncKey")!,
+                status: childText(collection, "Status"),
+                more: !!findChild(collection, "MoreAvailable"),
+                commands: (commandsEl?.children ?? []).map((c) => `${c.tag}:${childText(c, "ServerId")}`),
+            };
+        };
+
+        const startCollection = async function (collectionClass: string, folderUid: string, extra: WbxmlElement[] = []): Promise<string> {
+            return (await syncRound("0", collectionClass, folderUid, extra)).key;
+        };
+
+        const windowSize = (n: number) => textElement(WbxmlCodePage.AirSync, "WindowSize", String(n));
+
+        /** The live EAS route instance the test server mounted, for the few tests that shrink a limit on one handler. */
+        const easHandler = function (command: string): any {
+            const route = [...(objectFactory as any).instances.values()].find((instance: any) => instance?.handlers?.get?.(command));
+            return route.handlers.get(command);
+        };
+
+        describe("provisioning", () => {
+            it("Refuses commands without the acknowledged X-MS-PolicyKey, and a remote wipe invalidates the old key at once.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const key = await policyKeyOf("dev1");
+                const folderSync = (policyKey?: string) => {
+                    const req = request(server.getApplication())
+                        .post(`${baseUrl}?Cmd=FolderSync&DeviceId=dev1`)
+                        .set("Authorization", "jwt " + ownerToken);
+                    return policyKey === undefined ? req : req.set("X-MS-PolicyKey", policyKey);
+                };
+
+                expect((await folderSync()).status).toBe(449);
+                expect((await folderSync("not-the-key")).status).toBe(449);
+                expect((await folderSync(key)).status).toBe(200);
+
+                const state = await deviceSyncStateRepo.findOne({ where: { mailboxUid: mailbox.uid, deviceId: "dev1" } });
+                const wipe = await request(server.getApplication())
+                    .post(`/sql/device-sync-state/${state!.uid}/remote-wipe`)
+                    .set("Authorization", "jwt " + adminToken)
+                    .send({});
+                expect(wipe.status).toBe(200);
+                expect((await deviceSyncStateRepo.findOne({ where: { uid: state!.uid } }))?.policyKey ?? undefined).toBeUndefined();
+                expect((await folderSync(key)).status).toBe(449);
+
+                // Acknowledging the old key while the wipe is pending gets the wipe directive, not a provisioned device.
+                const ack = await postWbxml(
+                    "Provision",
+                    "dev1",
+                    element(WbxmlCodePage.Provision, "Provision", [
+                        element(WbxmlCodePage.Provision, "Policies", [
+                            element(WbxmlCodePage.Provision, "Policy", [
+                                textElement(WbxmlCodePage.Provision, "PolicyKey", key),
+                                textElement(WbxmlCodePage.Provision, "Status", "1"),
+                            ]),
+                        ]),
+                    ]),
+                );
+                expect(childText(findChild(ack, "RemoteWipe")!, "Status")).toBe("1");
+                expect((await deviceSyncStateRepo.findOne({ where: { uid: state!.uid } }))?.provisioned).toBe(false);
+            });
+
+            it("Answers HTTP 400 for a malformed WBXML body.", async () => {
+                await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+
+                const result = await request(server.getApplication())
+                    .post(`${baseUrl}?Cmd=Sync&DeviceId=dev1`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
+                    .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                    .send(Buffer.from([0x03, 0x01, 0x6a, 0x00, 0x45, 0x5c]));
+
+                expect(result.status).toBe(400);
+            });
+        });
+
+        it("FolderSync reports a folder created and then renamed between rounds as an Add, never an Update.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const initial = await postWbxml("FolderSync", "dev1", element(WbxmlCodePage.FolderHierarchy, "FolderSync", [textElement(WbxmlCodePage.FolderHierarchy, "SyncKey", "0")]));
+            const folder = await createFolderWithAcl(mailbox.uid, { name: "Projects", type: FolderType.USER });
+            await folderRepo.update({ uid: folder.uid }, { name: "Projects 2026", dateModified: new Date(Date.now() + 5000) });
+
+            const response = await postWbxml(
+                "FolderSync",
+                "dev1",
+                element(WbxmlCodePage.FolderHierarchy, "FolderSync", [textElement(WbxmlCodePage.FolderHierarchy, "SyncKey", childText(initial, "SyncKey")!)]),
+            );
+
+            const changes = findChild(response, "Changes")!;
+            expect(findChild(changes, "Update")).toBeUndefined();
+            expect(childText(findChild(changes, "Add")!, "DisplayName")).toBe("Projects 2026");
+        });
+
+        describe("Sync", () => {
+            it("Never skips pending server changes when the device's own write is newer, and never echoes that write back.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+                const mine = await createContact(mailbox.uid, folder.uid, { displayName: "Mine" });
+                const first = await syncRound(await startCollection("Contacts", folder.uid), "Contacts", folder.uid);
+                expect(first.commands).toEqual([`Add:${mine.uid}`]);
+
+                const b = await createContact(mailbox.uid, folder.uid, { displayName: "Server B" });
+                const c = await createContact(mailbox.uid, folder.uid, { displayName: "Server C" });
+
+                const withWrite = await syncRound(first.key, "Contacts", folder.uid, [windowSize(1)], [
+                    element(WbxmlCodePage.AirSync, "Change", [
+                        textElement(WbxmlCodePage.AirSync, "ServerId", mine.uid),
+                        element(WbxmlCodePage.AirSync, "ApplicationData", [textElement(WbxmlCodePage.Contacts, "FirstName", "Edited")]),
+                    ]),
+                ]);
+                expect(withWrite.commands.length).toBe(1);
+                expect(withWrite.more).toBe(true);
+
+                // B and C may share a timestamp, so their relative order is only fixed by uid.
+                const next = await syncRound(withWrite.key, "Contacts", folder.uid, [windowSize(1)]);
+                expect([...withWrite.commands, ...next.commands].sort()).toEqual([`Add:${b.uid}`, `Add:${c.uid}`].sort());
+
+                const last = await syncRound(next.key, "Contacts", folder.uid);
+                expect(last.commands).toEqual([]);
+                expect(last.more).toBe(false);
+            });
+
+            it("Reports a message moved to another folder as a Delete in the source collection and an Add in the destination.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const archive = await createFolderWithAcl(mailbox.uid, { name: "Archive", type: FolderType.ARCHIVE });
+                const message = await createMessage(mailbox.uid, inbox.uid);
+                const inboxRound = await syncRound(await startCollection("Email", inbox.uid), "Email", inbox.uid);
+                expect(inboxRound.commands).toEqual([`Add:${message.uid}`]);
+                const archiveRound = await syncRound(await startCollection("Email", archive.uid), "Email", archive.uid);
+                expect(archiveRound.commands).toEqual([]);
+
+                const moved = await postWbxml(
+                    "MoveItems",
+                    "dev1",
+                    element(WbxmlCodePage.Move, "MoveItems", [
+                        element(WbxmlCodePage.Move, "Move", [
+                            textElement(WbxmlCodePage.Move, "SrcMsgId", message.uid),
+                            textElement(WbxmlCodePage.Move, "SrcFldId", inbox.uid),
+                            textElement(WbxmlCodePage.Move, "DstFldId", archive.uid),
+                        ]),
+                    ]),
+                );
+                expect(childText(findChild(moved, "Response")!, "Status")).toBe("1");
+
+                expect((await syncRound(inboxRound.key, "Email", inbox.uid)).commands).toEqual([`Delete:${message.uid}`]);
+                expect((await syncRound(archiveRound.key, "Email", archive.uid)).commands).toEqual([`Add:${message.uid}`]);
+            });
+
+            it("Reports an item created long before and modified just before the device's first round as an Add, not a Change.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+                const contact = await createContact(mailbox.uid, folder.uid);
+                await contactRepo.update({ uid: contact.uid }, { dateCreated: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000) });
+
+                const round = await syncRound(await startCollection("Contacts", folder.uid), "Contacts", folder.uid);
+
+                expect(round.commands).toEqual([`Add:${contact.uid}`]);
+            });
+
+            it("Accepts a retried SyncKey, re-sending the same server changes without duplicating a re-sent client Add.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Contacts", type: FolderType.CONTACTS });
+                const existing = await createContact(mailbox.uid, folder.uid);
+                const key = await startCollection("Contacts", folder.uid);
+                const add = [
+                    element(WbxmlCodePage.AirSync, "Add", [
+                        textElement(WbxmlCodePage.AirSync, "ClientId", "phone-1"),
+                        element(WbxmlCodePage.AirSync, "ApplicationData", [textElement(WbxmlCodePage.Contacts, "FirstName", "Created On Phone")]),
+                    ]),
+                ];
+
+                const lost = await syncRound(key, "Contacts", folder.uid, [], add);
+                const retried = await syncRound(key, "Contacts", folder.uid, [], add);
+
+                expect(retried.status).toBe("1");
+                expect(retried.commands).toEqual(lost.commands);
+                expect(lost.commands).toEqual([`Add:${existing.uid}`]);
+                const serverIdOf = (round: any) => childText(findChild(findChild(round.collection, "Responses")!, "Add")!, "ServerId");
+                expect(serverIdOf(retried)).toBe(serverIdOf(lost));
+                expect(await contactRepo.count({ where: { folderUid: folder.uid } })).toBe(2);
+
+                // The lost response's key is no longer valid once the retry has been answered.
+                expect((await syncRound(lost.key, "Contacts", folder.uid)).status).toBe(retried.key === lost.key ? "1" : "3");
+                expect((await syncRound(retried.key, "Contacts", folder.uid)).commands).toEqual([]);
+            });
+
+            it("Honours an Email FilterType window, and restarts the collection (Status 3) when the FilterType changes.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                await createMessage(mailbox.uid, folder.uid, { receivedDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) });
+                const recent = await createMessage(mailbox.uid, folder.uid, { receivedDate: new Date() });
+                const options = (filterType: string) => [element(WbxmlCodePage.AirSync, "Options", [textElement(WbxmlCodePage.AirSync, "FilterType", filterType)])];
+
+                const round = await syncRound(await startCollection("Email", folder.uid, options("3")), "Email", folder.uid);
+                expect(round.commands).toEqual([`Add:${recent.uid}`]);
+
+                expect((await syncRound(round.key, "Email", folder.uid, options("3"))).status).toBe("1");
+                expect((await syncRound(round.key, "Email", folder.uid, options("5"))).status).toBe("3");
+            });
+
+            it("Hard-deletes a message with DeletesAsMoves 0, and refuses an Email Add outside Drafts.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const message = await createMessage(mailbox.uid, folder.uid);
+                const key = await startCollection("Email", folder.uid);
+
+                const round = await syncRound(key, "Email", folder.uid, [textElement(WbxmlCodePage.AirSync, "DeletesAsMoves", "0")], [
+                    element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", message.uid)]),
+                    element(WbxmlCodePage.AirSync, "Add", [
+                        textElement(WbxmlCodePage.AirSync, "ClientId", "c1"),
+                        element(WbxmlCodePage.AirSync, "ApplicationData", [textElement(WbxmlCodePage.Email, "Subject", "Not a draft")]),
+                    ]),
+                ]);
+
+                expect((await messageRepo.findOne({ where: { uid: message.uid } }))?.deleted).toBe(true);
+                expect(childText(findChild(findChild(round.collection, "Responses")!, "Add")!, "Status")).toBe("6");
+            });
+
+            it("Stores a fetchable body for a Draft added without a Body.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const drafts = await createFolderWithAcl(mailbox.uid, { name: "Drafts", type: FolderType.DRAFTS });
+
+                const round = await syncRound(await startCollection("Email", drafts.uid), "Email", drafts.uid, [], [
+                    element(WbxmlCodePage.AirSync, "Add", [
+                        textElement(WbxmlCodePage.AirSync, "ClientId", "c1"),
+                        element(WbxmlCodePage.AirSync, "ApplicationData", [textElement(WbxmlCodePage.Email, "Subject", "Empty draft")]),
+                    ]),
+                ]);
+                const serverId = childText(findChild(findChild(round.collection, "Responses")!, "Add")!, "ServerId")!;
+
+                const fetched = await postWbxml(
+                    "ItemOperations",
+                    "dev1",
+                    element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                        element(WbxmlCodePage.ItemOperations, "Fetch", [
+                            textElement(WbxmlCodePage.ItemOperations, "Store", "Mailbox"),
+                            textElement(WbxmlCodePage.AirSync, "ServerId", serverId),
+                        ]),
+                    ]),
+                );
+                expect(childText(findChild(findChild(fetched, "Response")!, "Fetch")!, "Status")).toBe("1");
+            });
+
+            it("Makes the caller the organizer of a Calendar Add naming someone else.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Calendar", type: FolderType.CALENDAR });
+
+                const round = await syncRound(await startCollection("Calendar", folder.uid), "Calendar", folder.uid, [], [
+                    element(WbxmlCodePage.AirSync, "Add", [
+                        textElement(WbxmlCodePage.AirSync, "ClientId", "c1"),
+                        element(WbxmlCodePage.AirSync, "ApplicationData", [
+                            textElement(WbxmlCodePage.Calendar, "Subject", "Spoofed invite"),
+                            textElement(WbxmlCodePage.Calendar, "StartTime", "20260301T100000Z"),
+                            textElement(WbxmlCodePage.Calendar, "EndTime", "20260301T110000Z"),
+                            textElement(WbxmlCodePage.Calendar, "OrganizerEmail", "ceo@example.com"),
+                        ]),
+                    ]),
+                ]);
+                const serverId = childText(findChild(findChild(round.collection, "Responses")!, "Add")!, "ServerId")!;
+
+                const created = await calendarEventRepo.findOne({ where: { uid: serverId } });
+                expect(created?.organizer.address).toBe(mailbox.primarySmtpAddress);
+            });
+
+            it("GetItemEstimate falls back to the folder's type without Class, and counts an item moved out as a pending Delete.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const archive = await createFolderWithAcl(mailbox.uid, { name: "Archive", type: FolderType.ARCHIVE });
+                const message = await createMessage(mailbox.uid, inbox.uid);
+                const round = await syncRound(await startCollection("Email", inbox.uid), "Email", inbox.uid);
+                await messageRepo.update({ uid: message.uid }, { folderUid: archive.uid, dateModified: new Date(Date.now() + 5000) });
+
+                const estimate = await postWbxml(
+                    "GetItemEstimate",
+                    "dev1",
+                    element(WbxmlCodePage.ItemEstimate, "GetItemEstimate", [
+                        element(WbxmlCodePage.AirSync, "Collections", [
+                            element(WbxmlCodePage.AirSync, "Collection", [
+                                textElement(WbxmlCodePage.AirSync, "SyncKey", round.key),
+                                textElement(WbxmlCodePage.AirSync, "CollectionId", inbox.uid),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                const response = findChild(estimate, "Response")!;
+                expect(childText(response, "Status")).toBe("1");
+                const collection = findChild(response, "Collection")!;
+                expect(childText(collection, "Class")).toBe("Email");
+                expect(childText(collection, "Estimate")).toBe("1");
+            });
+        });
+
+        describe("SendMail", () => {
+            const mime = (headers: string[]) => Buffer.from([...headers, "Subject: Round 3", "MIME-Version: 1.0", "Content-Type: text/plain", "", "Body", ""].join("\r\n"));
+            const send = async (raw: Buffer, cmd = "SendMail", extra: WbxmlElement[] = []) =>
+                await request(server.getApplication())
+                    .post(`${baseUrl}?Cmd=${cmd}&DeviceId=dev1`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
+                    .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                    .send(new WbxmlEncoder().encode(element(WbxmlCodePage.ComposeMail, cmd, [...extra, opaqueElement(WbxmlCodePage.ComposeMail, "MIME", raw)])));
+            const transport = () => objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+
+            it("Refuses a From or Sender that isn't one of the mailbox's own addresses, and more than 500 recipients.", async () => {
+                const mailbox = await createMailbox(owner.uid, ["alias@example.com"]);
+                await provisionDevice("dev1");
+
+                expect((await send(mime(["From: ceo@example.com", "To: victim@example.com"]))).status).toBe(403);
+                expect((await send(mime([`From: ${mailbox.primarySmtpAddress}`, "Sender: ceo@example.com", "To: victim@example.com"]))).status).toBe(403);
+                const many = Array.from({ length: 501 }, (_, i) => `r${i}@example.com`).join(", ");
+                expect((await send(mime(["From: alias@example.com", `To: ${many}`]))).status).toBe(400);
+                expect(transport().sent.length).toBe(0);
+
+                expect((await send(mime(["From: ALIAS@example.com", "To: friend@example.com"]))).status).toBe(200);
+                expect(transport().sent[0].envelopeFrom).toBe("ALIAS@example.com");
+            });
+
+            it("Delivers to Bcc recipients without relaying the Bcc header, keeping it on the Sent Items copy.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+
+                const result = await send(
+                    mime([`From: ${mailbox.primarySmtpAddress}`, "To: to@example.com", "Bcc: hidden@example.com,", " second-hidden@example.com"]),
+                    "SendMail",
+                    [element(WbxmlCodePage.ComposeMail, "SaveInSentItems", [])],
+                );
+
+                expect(result.status).toBe(200);
+                const sent = transport().sent[0];
+                expect(sent.envelopeTo.sort()).toEqual(["hidden@example.com", "second-hidden@example.com", "to@example.com"]);
+                const relayed = sent.raw.toString("utf-8");
+                expect(relayed).not.toMatch(/^bcc:/im);
+                expect(relayed).not.toContain("second-hidden@example.com");
+                const saved = await messageRepo.findOne({ where: { subject: "Round 3" } });
+                expect((await blobStore().get(saved!.bodyBlobKey)).toString("utf-8")).toContain("Bcc: hidden@example.com");
+            });
+
+            it("Still answers a SmartReply whose original can't be flagged afterwards.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const original = await createMessage(mailbox.uid, inbox.uid);
+                const handler = easHandler("SmartReply");
+                const update = vi.spyOn(handler.messageRepo, "update").mockRejectedValueOnce(new Error("version conflict"));
+
+                try {
+                    const result = await send(mime([`From: ${mailbox.primarySmtpAddress}`, "To: to@example.com"]), "SmartReply", [
+                        element(WbxmlCodePage.ComposeMail, "Source", [textElement(WbxmlCodePage.ComposeMail, "ItemId", original.uid)]),
+                    ]);
+                    expect(result.status).toBe(200);
+                    expect(update).toHaveBeenCalledTimes(1);
+                    expect(transport().sent.length).toBe(1);
+                } finally {
+                    update.mockRestore();
+                }
+            });
+        });
+
+        describe("ItemOperations and MoveItems", () => {
+            const fetchRequest = (fetches: WbxmlElement[]) => element(WbxmlCodePage.ItemOperations, "ItemOperations", fetches);
+            const fetchById = (serverId: string) =>
+                element(WbxmlCodePage.ItemOperations, "Fetch", [
+                    textElement(WbxmlCodePage.ItemOperations, "Store", "Mailbox"),
+                    textElement(WbxmlCodePage.AirSync, "ServerId", serverId),
+                ]);
+            const fetchAttachment = (fileReference: string) =>
+                element(WbxmlCodePage.ItemOperations, "Fetch", [
+                    textElement(WbxmlCodePage.ItemOperations, "Store", "Mailbox"),
+                    textElement(WbxmlCodePage.AirSyncBase, "FileReference", fileReference),
+                ]);
+
+            it("Answers Status 11 for Fetches beyond the response size cap while serving the ones that fit.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const message = await createMessage(mailbox.uid, inbox.uid);
+                await blobStore().put(message.bodyBlobKey, Buffer.from("Subject: x\r\n\r\n" + "a".repeat(40)), { contentType: "message/rfc822" });
+                const small = await createAttachment(message.uid, inbox.uid, mailbox.uid, Buffer.from("tiny"));
+                const large = await createAttachment(message.uid, inbox.uid, mailbox.uid, Buffer.from("b".repeat(90)));
+                const lying = await createAttachment(message.uid, inbox.uid, mailbox.uid, Buffer.from("c".repeat(90)), { sizeBytes: 1 });
+                const handler = easHandler("ItemOperations");
+                const original = handler.maxResponseBytes;
+                handler.maxResponseBytes = 60;
+
+                try {
+                    const response = await postWbxml("ItemOperations", "dev1", fetchRequest([fetchById(message.uid), fetchAttachment(small.uid), fetchAttachment(large.uid), fetchAttachment(lying.uid), fetchById(message.uid)]));
+                    const statuses = findChildren(findChild(response, "Response")!, "Fetch").map((f) => childText(f, "Status"));
+                    expect(statuses).toEqual(["1", "1", "11", "11", "11"]);
+                } finally {
+                    handler.maxResponseBytes = original;
+                }
+            });
+
+            it("Checks attachment access against the message's current folder, not the attachment's stale folderUid.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const otherMailbox = await createMailbox(otherUser.uid);
+                const otherInbox = await createFolderWithAcl(otherMailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                // Filed under the caller's folder, but its message now lives in a folder the caller can't read.
+                const hiddenMessage = await createMessage(otherMailbox.uid, otherInbox.uid);
+                const stale = await createAttachment(hiddenMessage.uid, inbox.uid, mailbox.uid, Buffer.from("secret"));
+                // The reverse: a stale folderUid the caller can't read, but the message is readable.
+                const visibleMessage = await createMessage(mailbox.uid, inbox.uid);
+                const readable = await createAttachment(visibleMessage.uid, otherInbox.uid, otherMailbox.uid, Buffer.from("mine"));
+                const orphan = await createAttachment(uuid.v4(), inbox.uid, mailbox.uid, Buffer.from("orphan"));
+
+                const post = async (fileReference: string) =>
+                    await request(server.getApplication())
+                        .post(`${baseUrl}?Cmd=ItemOperations&DeviceId=dev1`)
+                        .set("Authorization", "jwt " + ownerToken)
+                        .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
+                        .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                        .send(new WbxmlEncoder().encode(fetchRequest([fetchAttachment(fileReference)])));
+
+                expect((await post(stale.uid)).status).toBe(403);
+                expect((await post(readable.uid)).status).toBe(200);
+                expect((await post(orphan.uid)).status).toBe(404);
+            });
+
+            it("MoveItems refuses a destination in another mailbox and more than 500 Moves.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const otherMailbox = await createMailbox(otherUser.uid);
+                const otherInbox = await createFolderWithAcl(otherMailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const message = await createMessage(mailbox.uid, inbox.uid);
+                const move = (dst: string) =>
+                    element(WbxmlCodePage.Move, "Move", [
+                        textElement(WbxmlCodePage.Move, "SrcMsgId", message.uid),
+                        textElement(WbxmlCodePage.Move, "SrcFldId", inbox.uid),
+                        textElement(WbxmlCodePage.Move, "DstFldId", dst),
+                    ]);
+
+                const tooMany = await request(server.getApplication())
+                    .post(`${baseUrl}?Cmd=MoveItems&DeviceId=dev1`)
+                    .set("Authorization", "jwt " + ownerToken)
+                    .set("X-MS-PolicyKey", await policyKeyOf("dev1"))
+                    .set("Content-Type", "application/vnd.ms-sync.wbxml")
+                    .send(new WbxmlEncoder().encode(element(WbxmlCodePage.Move, "MoveItems", Array.from({ length: 501 }, () => move(inbox.uid)))));
+                expect(tooMany.status).toBe(400);
+
+                const response = await postWbxml("MoveItems", "dev1", element(WbxmlCodePage.Move, "MoveItems", [move(otherInbox.uid)]));
+                expect(childText(findChild(response, "Response")!, "Status")).toBe("3");
+                expect((await messageRepo.findOne({ where: { uid: message.uid } }))?.folderUid).toBe(inbox.uid);
+            });
+        });
+
+        describe("MeetingResponse", () => {
+            it("Responds via the Inbox meeting request message, answers several Requests, and mails a REPLY when SendResponse is set.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const inbox = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const calendar = await createFolderWithAcl(mailbox.uid, { name: "Calendar", type: FolderType.CALENDAR });
+                const icalUid = `${uuid.v4()}@example.com`;
+                const attendee = { address: mailbox.primarySmtpAddress, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false };
+                const event = await createCalendarEvent(mailbox.uid, calendar.uid, { icalUid, attendees: [attendee], organizer: { address: "boss@example.com", type: RecipientType.TO } });
+                const ics = ["BEGIN:VCALENDAR", "METHOD:REQUEST", "BEGIN:VEVENT", `UID:${icalUid}`, "SEQUENCE:0", "END:VEVENT", "END:VCALENDAR"].join("\r\n");
+                const invite = await createMessage(mailbox.uid, inbox.uid);
+                await blobStore().put(
+                    invite.bodyBlobKey,
+                    Buffer.from(["Subject: Invite", "MIME-Version: 1.0", 'Content-Type: multipart/mixed; boundary="b"', "", "--b", "Content-Type: text/plain", "", "Join", "--b", "Content-Type: text/calendar; method=REQUEST", "", ics, "--b--", ""].join("\r\n")),
+                    { contentType: "message/rfc822" },
+                );
+                const transport = objectFactory.getInstance<RecordingMailTransport>("MailTransport")!;
+
+                const response = await postWbxml(
+                    "MeetingResponse",
+                    "dev1",
+                    element(WbxmlCodePage.MeetingResponse, "MeetingResponse", [
+                        element(WbxmlCodePage.MeetingResponse, "Request", [
+                            textElement(WbxmlCodePage.MeetingResponse, "UserResponse", "1"),
+                            textElement(WbxmlCodePage.MeetingResponse, "RequestId", invite.uid),
+                            element(WbxmlCodePage.MeetingResponse, "SendResponse", []),
+                        ]),
+                        element(WbxmlCodePage.MeetingResponse, "Request", [
+                            textElement(WbxmlCodePage.MeetingResponse, "UserResponse", "1"),
+                            textElement(WbxmlCodePage.MeetingResponse, "RequestId", uuid.v4()),
+                        ]),
+                    ]),
+                );
+
+                const results = findChildren(response, "Result");
+                expect(results.map((r) => childText(r, "Status"))).toEqual(["1", "2"]);
+                expect(childText(results[0], "CalendarId")).toBe(event.uid);
+                expect((await calendarEventRepo.findOne({ where: { uid: event.uid } }))?.attendees[0].responseStatus).toBe(AttendeeResponseStatus.ACCEPTED);
+                expect(transport.sent.length).toBe(1);
+                expect(transport.sent[0].envelopeTo).toEqual(["boss@example.com"]);
+                expect(transport.sent[0].raw.toString("utf-8")).toContain("METHOD:REPLY");
             });
         });
     });

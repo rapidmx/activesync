@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { MessageSQL, ContactSQL, CalendarEventSQL, TaskSQL, MailboxSQL } from "@rapidmx/restapi/sql";
+import { MessageSQL, ContactSQL, CalendarEventSQL, TaskSQL, MailboxSQL, FolderSQL } from "@rapidmx/restapi/sql";
+import { EasCollectionStateSQL } from "../../models/sql/EasCollectionStateSQL.js";
 import { EmailSyncAdapterSQL } from "../../adapters/sql/EmailSyncAdapterSQL.js";
 import { ContactsSyncAdapter } from "../../adapters/ContactsSyncAdapter.js";
 import { CalendarSyncAdapter } from "../../adapters/CalendarSyncAdapter.js";
@@ -14,6 +15,8 @@ import { SyncCommand, type SyncCollectionBinding } from "../SyncCommand.js";
  */
 export class SyncCommandSQL extends SyncCommand {
     protected mailboxClass: any = MailboxSQL;
+    protected folderClass: any = FolderSQL;
+    protected collectionStateClass: any = EasCollectionStateSQL;
     protected collectionBindings: Record<string, SyncCollectionBinding<any>> = {
         Email: { entityClass: MessageSQL, adapterClass: EmailSyncAdapterSQL },
         Contacts: { entityClass: ContactSQL, adapterClass: ContactsSyncAdapter },

@@ -14,3 +14,4 @@ export {
 } from "@rapidmx/restapi/sql";
 // This plugin's own model.
 export { DeviceSyncStateSQL } from "../../../src/models/sql/DeviceSyncStateSQL.js";
+export { EasCollectionStateSQL } from "../../../src/models/sql/EasCollectionStateSQL.js";

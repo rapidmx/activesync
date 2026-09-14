@@ -22,6 +22,7 @@ import config from "../config.js";
 import { ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { BaseEasRoute } from "../../src/BaseEasRoute.js";
+import { WbxmlDecoder } from "../../src/codec/WbxmlDecoder.js";
 
 class TestEasRoute extends BaseEasRoute<any> {
     protected deviceSyncStateClass: any = { name: "TestDeviceSyncState" };
@@ -29,7 +30,7 @@ class TestEasRoute extends BaseEasRoute<any> {
 }
 
 function makeReq(): any {
-    return { query: { Cmd: "FolderSync", DeviceId: "dev1" }, rawBody: undefined };
+    return { query: { Cmd: "FolderSync", DeviceId: "dev1" }, headers: {}, rawBody: undefined };
 }
 
 function makeRes(): any {
@@ -69,7 +70,7 @@ describe("BaseEasRoute Tests (guard clauses only)", () => {
 
     it("dispatch() sends a bare 200 with no body when the matched handler returns undefined.", async () => {
         const route = objectFactory.newInstance<TestEasRoute>(TestEasRoute, { initialize: false });
-        const deviceSyncState = { uid: "dss-1", version: 1, provisioned: true, mailboxUid: "mbx-1", deviceId: "dev1" };
+        const deviceSyncState = { uid: "dss-1", version: 1, provisioned: true, policyKey: "pk-1", mailboxUid: "mbx-1", deviceId: "dev1" };
         (route as any).deviceSyncStateRepo = {
             find: vi.fn().mockResolvedValue([deviceSyncState]),
             update: vi.fn().mockResolvedValue(undefined),
@@ -78,12 +79,82 @@ describe("BaseEasRoute Tests (guard clauses only)", () => {
         (route as any).handlers.set("NoOp", { command: "NoOp", handle: vi.fn().mockResolvedValue(undefined) });
 
         const res = makeRes();
-        await route.dispatch({ query: { Cmd: "NoOp", DeviceId: "dev1" }, rawBody: undefined } as any, res, {
+        await route.dispatch({ query: { Cmd: "NoOp", DeviceId: "dev1" }, headers: { "x-ms-policykey": "pk-1" }, rawBody: undefined } as any, res, {
             uid: "user-1",
         } as any);
 
         expect(res.status).toHaveBeenCalledWith(200);
         expect(res.send).toHaveBeenCalledWith();
+    });
+
+    /** A route whose repos resolve one provisioned device (policy key `pk-1`) and one registered `NoOp` handler. */
+    function provisionedRoute(update: any = vi.fn().mockResolvedValue(undefined)): { route: TestEasRoute; handle: any; logger: any } {
+        const route = objectFactory.newInstance<TestEasRoute>(TestEasRoute, { initialize: false }) as TestEasRoute;
+        const deviceSyncState = { uid: "dss-1", version: 1, provisioned: true, policyKey: "pk-1", mailboxUid: "mbx-1", deviceId: "dev1" };
+        const handle = vi.fn().mockResolvedValue(undefined);
+        const logger = { warn: vi.fn() };
+        (route as any).deviceSyncStateRepo = { find: vi.fn().mockResolvedValue([deviceSyncState]), update, findOne: vi.fn() };
+        (route as any).mailboxRepo = { find: vi.fn().mockResolvedValue([{ uid: "mbx-1" }]) };
+        (route as any).handlers.set("NoOp", { command: "NoOp", handle });
+        (route as any).logger = logger;
+        return { route, handle, logger };
+    }
+
+    it("dispatch() answers 413 for a body beyond mail:eas:max_request_bytes, by declared or actual size, before any lookup.", async () => {
+        const { route, handle } = provisionedRoute();
+        (route as any).maxRequestBytes = 10;
+
+        const declared = makeRes();
+        await route.dispatch({ query: { Cmd: "NoOp", DeviceId: "dev1" }, headers: { "content-length": "11" } } as any, declared, { uid: "user-1" } as any);
+        expect(declared.status).toHaveBeenCalledWith(413);
+
+        const actual = makeRes();
+        await route.dispatch({ query: { Cmd: "NoOp", DeviceId: "dev1" }, headers: {}, rawBody: Buffer.alloc(11) } as any, actual, { uid: "user-1" } as any);
+        expect(actual.status).toHaveBeenCalledWith(413);
+        expect(handle).not.toHaveBeenCalled();
+        expect((route as any).mailboxRepo.find).not.toHaveBeenCalled();
+    });
+
+    it("dispatch() answers 449 when a provisioned device presents a missing or stale policy key, accepting the PolicyKey query value too.", async () => {
+        const { route, handle } = provisionedRoute();
+
+        const missing = makeRes();
+        await route.dispatch({ query: { Cmd: "NoOp", DeviceId: "dev1" }, headers: {} } as any, missing, { uid: "user-1" } as any);
+        expect(missing.status).toHaveBeenCalledWith(449);
+
+        const stale = makeRes();
+        await route.dispatch({ query: { Cmd: "NoOp", DeviceId: "dev1" }, headers: { "x-ms-policykey": "old" } } as any, stale, { uid: "user-1" } as any);
+        expect(stale.status).toHaveBeenCalledWith(449);
+        expect(handle).not.toHaveBeenCalled();
+
+        const viaQuery = makeRes();
+        await route.dispatch({ query: { Cmd: "NoOp", DeviceId: "dev1", PolicyKey: "pk-1" }, headers: {} } as any, viaQuery, { uid: "user-1" } as any);
+        expect(viaQuery.status).toHaveBeenCalledWith(200);
+        expect(handle.mock.calls[0][0].policyKey).toBe("pk-1");
+    });
+
+    it("dispatch() maps a malformed WBXML body to HTTP 400, but lets any other decoding failure propagate.", async () => {
+        const { route, handle } = provisionedRoute();
+        const req = () => ({ query: { Cmd: "NoOp", DeviceId: "dev1" }, headers: { "x-ms-policykey": "pk-1" }, rawBody: Buffer.from([0x03, 0x01, 0x6a, 0x00, 0x45]) });
+
+        await expect(route.dispatch(req() as any, makeRes(), { uid: "user-1" } as any)).rejects.toThrow(/malformed wbxml/i);
+
+        vi.spyOn(WbxmlDecoder.prototype, "decode").mockImplementation(() => {
+            throw new Error("unexpected");
+        });
+        await expect(route.dispatch(req() as any, makeRes(), { uid: "user-1" } as any)).rejects.toThrow("unexpected");
+        expect(handle).not.toHaveBeenCalled();
+    });
+
+    it("dispatch() still answers when recording lastSyncAt fails after the command ran.", async () => {
+        const { route, handle, logger } = provisionedRoute(vi.fn().mockRejectedValue(new Error("db down")));
+
+        const res = makeRes();
+        await route.dispatch({ query: { Cmd: "NoOp", DeviceId: "dev1" }, headers: { "x-ms-policykey": "pk-1" } } as any, res, { uid: "user-1" } as any);
+
+        expect(handle).toHaveBeenCalledTimes(1);
+        expect(res.status).toHaveBeenCalledWith(200);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("db down"));
     });
 
     it("options() answers with MS-ASProtocolVersions/MS-ASProtocolCommands derived from the registered handlers.", async () => {

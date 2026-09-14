@@ -125,4 +125,46 @@ describe("ProvisionCommand Tests", () => {
         expect(ctx.deviceSyncState.provisioned).toBe(false);
         expect((ctx.deviceSyncState as any).remoteWipeAcknowledgedAt).toBeInstanceOf(Date);
     });
+
+    it("Answers an acknowledgement of a policy key issued before a wipe was requested with the RemoteWipe directive, never provisioning.", async () => {
+        const command = new ProvisionCommand();
+        const update = vi.fn().mockResolvedValue(undefined);
+        const ctx = makeContext({
+            deviceSyncState: { uid: "dss-1", version: 1, policyKey: "abc123", provisioned: false, remoteWipeRequested: true } as any,
+            deviceSyncStateRepo: { update } as any,
+            request: element(WbxmlCodePage.Provision, "Provision", [
+                element(WbxmlCodePage.Provision, "Policies", [
+                    element(WbxmlCodePage.Provision, "Policy", [
+                        textElement(WbxmlCodePage.Provision, "PolicyKey", "abc123"),
+                        textElement(WbxmlCodePage.Provision, "Status", "1"),
+                    ]),
+                ]),
+            ]),
+        });
+
+        const response = await command.handle(ctx);
+
+        expect(childText(findChild(response!, "RemoteWipe")!, "Status")).toBe("1");
+        expect(findChild(response!, "Policies")).toBeUndefined();
+        expect(ctx.deviceSyncState.provisioned).toBe(false);
+        expect(update).not.toHaveBeenCalled();
+    });
+
+    it("Ignores a RemoteWipe acknowledgement when no wipe is pending (Status 2, nothing written).", async () => {
+        const command = new ProvisionCommand();
+        const update = vi.fn().mockResolvedValue(undefined);
+        const ctx = makeContext({
+            deviceSyncState: { uid: "dss-1", version: 1, policyKey: "abc123", provisioned: true } as any,
+            deviceSyncStateRepo: { update } as any,
+            request: element(WbxmlCodePage.Provision, "Provision", [
+                element(WbxmlCodePage.Provision, "RemoteWipe", [textElement(WbxmlCodePage.Provision, "Status", "1")]),
+            ]),
+        });
+
+        const response = await command.handle(ctx);
+
+        expect(childText(response!, "Status")).toBe("2");
+        expect(update).not.toHaveBeenCalled();
+        expect((ctx.deviceSyncState as any).remoteWipeAcknowledgedAt).toBeUndefined();
+    });
 });

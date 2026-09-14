@@ -6,7 +6,14 @@ import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
-import { computeChanges, formatSyncKey, persistDeviceSyncState, resolveSyncKey } from "../EasSyncKeyUtils.js";
+import {
+    type ChangeCursor,
+    computeChanges,
+    epochCursor,
+    formatSyncKey,
+    persistDeviceSyncState,
+    resolveSyncKey,
+} from "../EasSyncKeyUtils.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 import { Folder, FolderType } from "@rapidmx/restapi";
 const { Config, Init } = ObjectDecorators;
@@ -48,6 +55,9 @@ const FOLDER_HIERARCHY_CURSOR_KEY = "$foldersync";
  * `MoreAvailable` mechanism is exercised the same way it will be for `SyncCommand`'s much larger item
  * collections. */
 const DEFAULT_WINDOW_SIZE = 512;
+
+/** Safety bound on how many `windowSize` pages a `SyncKey "0"` request reads while returning the full hierarchy. */
+const MAX_INITIAL_PAGES = 100;
 
 /**
  * Handles EAS `FolderSync`: enumerates `Add`/`Update`/`Delete`s for the caller's mailbox's `Folder` hierarchy
@@ -96,26 +106,48 @@ export abstract class FolderSyncCommand<F extends Folder> implements EasCommandH
             ]);
         }
 
+        let generation: number;
+        let adds: F[];
+        let updates: F[] = [];
+        let deletes: F[] = [];
+        let cursor: ChangeCursor;
         if (resolution.kind === "initial") {
-            // Per spec: the first response to SyncKey "0" never returns items itself, only establishes a
-            // cursor - but that cursor's watermark must be the epoch, not "now": the client's *next* request
-            // (with this key) is its true first full sync and must report every existing folder as an Add,
-            // including ones that existed and were last modified long before this handshake ever started.
-            // Watermarking at "now" here would silently skip all of those (an epoch-old folder never appears
-            // as "modified after now"), which is exactly backwards for a brand-new device's first sync.
-            const newKey = formatSyncKey({ generation: 1, watermark: new Date(0) });
-            await this.persistSyncKey(ctx, newKey);
-            return element(WbxmlCodePage.FolderHierarchy, "FolderSync", [
-                textElement(WbxmlCodePage.FolderHierarchy, "Status", "1"),
-                textElement(WbxmlCodePage.FolderHierarchy, "SyncKey", newKey),
-            ]);
+            // [MS-ASCMD] FolderSync: a SyncKey "0" request returns the entire folder hierarchy as Adds together
+            // with the new key - there is no separate "empty handshake" round (unlike Sync), and FolderSync has no
+            // MoreAvailable, so every page is read here rather than leaving the rest for a later round (where a
+            // folder created before that round's cursor would wrongly be reported as an Update).
+            generation = 0;
+            adds = [];
+            cursor = epochCursor();
+            for (let page = 0; page < MAX_INITIAL_PAGES; page++) {
+                const changes = await computeChanges(this.folderRepo, "mailboxUid", ctx.mailboxUid, cursor, this.windowSize);
+                adds.push(...changes.adds, ...changes.changes);
+                cursor = changes.cursor;
+                if (!changes.moreAvailable) {
+                    break;
+                }
+            }
+        } else {
+            generation = resolution.key.generation;
+            const changes = await computeChanges(
+                this.folderRepo,
+                "mailboxUid",
+                ctx.mailboxUid,
+                { date: resolution.key.watermark, uid: resolution.key.uid ?? "" },
+                this.windowSize,
+            );
+            adds = changes.adds;
+            updates = changes.changes;
+            deletes = changes.deletes;
+            cursor = changes.cursor;
         }
 
-        const changes = await computeChanges(this.folderRepo, "mailboxUid", ctx.mailboxUid, resolution.key.watermark, this.windowSize);
-        const newKey = formatSyncKey({ generation: resolution.key.generation + 1, watermark: changes.newWatermark });
-        await this.persistSyncKey(ctx, newKey);
+        const newKey = formatSyncKey({ generation: generation + 1, watermark: cursor.date, uid: cursor.uid });
+        await persistDeviceSyncState(ctx.deviceSyncState, ctx.deviceSyncStateRepo, (current) => ({
+            folderSyncKeys: { ...current.folderSyncKeys, [FOLDER_HIERARCHY_CURSOR_KEY]: newKey },
+        }));
 
-        const totalChanges: number = changes.adds.length + changes.changes.length + changes.deletes.length;
+        const totalChanges: number = adds.length + updates.length + deletes.length;
         if (totalChanges === 0) {
             return element(WbxmlCodePage.FolderHierarchy, "FolderSync", [
                 textElement(WbxmlCodePage.FolderHierarchy, "Status", "1"),
@@ -124,9 +156,9 @@ export abstract class FolderSyncCommand<F extends Folder> implements EasCommandH
         }
 
         const changeElements: WbxmlElement[] = [
-            ...changes.adds.map((folder) => this.folderToChangeElement("Add", folder)),
-            ...changes.changes.map((folder) => this.folderToChangeElement("Update", folder)),
-            ...changes.deletes.map((folder) =>
+            ...adds.map((folder) => this.folderToChangeElement("Add", folder)),
+            ...updates.map((folder) => this.folderToChangeElement("Update", folder)),
+            ...deletes.map((folder) =>
                 element(WbxmlCodePage.FolderHierarchy, "Delete", [
                     textElement(WbxmlCodePage.FolderHierarchy, "ServerId", folder.uid),
                 ]),
@@ -153,10 +185,5 @@ export abstract class FolderSyncCommand<F extends Folder> implements EasCommandH
                other; `folder.type` can never carry a value outside the enum. */
             textElement(WbxmlCodePage.FolderHierarchy, "Type", FOLDER_TYPE_CODES[folder.type] ?? FOLDER_TYPE_CODES[FolderType.USER]),
         ]);
-    }
-
-    private async persistSyncKey(ctx: EasCommandContext, newKey: string): Promise<void> {
-        const folderSyncKeys = { ...ctx.deviceSyncState.folderSyncKeys, [FOLDER_HIERARCHY_CURSOR_KEY]: newKey };
-        await persistDeviceSyncState(ctx.deviceSyncState, ctx.deviceSyncStateRepo, { folderSyncKeys });
     }
 }

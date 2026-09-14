@@ -4,23 +4,23 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
-import { RecoverableRepoUtils } from "@rapidmx/restapi";
+import { type Folder, RecoverableRepoUtils } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
-import { computeChanges, resolveSyncKey } from "../EasSyncKeyUtils.js";
+import { classForFolderType, enumerateCollection, filterPredicate, workingStateFromRow } from "../EasCollectionSync.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
+import type { EasCollectionState } from "../models/EasCollectionState.js";
 const { Config, Init, Inject } = ObjectDecorators;
 
-/** Caps how many changes `computeChanges()` will actually enumerate (and therefore count) per collection for
- * an already-synced folder - a real estimate, not a precise unbounded count, matching the command's own name;
- * a folder with more pending changes than this reports exactly this many, not the true total. Deliberately
- * separate from `SyncCommand`'s own `mail:eas:sync_window_size` - the two commands have no reason to share one
- * config knob just because they happen to reuse the same underlying enumeration helper. */
+/** Caps how many changes are enumerated (and therefore counted) per collection - a real estimate, not a precise
+ * unbounded count; a folder with more pending changes than this reports exactly this many. */
 const DEFAULT_MAX_COUNT = 512;
 
-/** Binds one MS-ASCMD `Class` value to the concrete entity class this command counts against - a lighter
- * version of `SyncCommand`'s own `SyncCollectionBinding` (no adapter needed at all, since `GetItemEstimate`
- * never serializes an item, only counts them). Supplied by the Mongo/SQL concrete subclasses. */
+/** Rows read from the out-of-folder stream while estimating (mirrors `SyncCommand`). */
+const MOVE_SCAN_LIMIT = 1000;
+
+/** Binds one MS-ASCMD `Class` value to the concrete entity class this command counts against. Supplied by the
+ * Mongo/SQL concrete subclasses. */
 export interface EstimateCollectionBinding {
     entityClass: any;
 }
@@ -31,20 +31,16 @@ export interface EstimateCollectionBinding {
  * consumes a `SyncKey` itself.
  *
  * The modern (14.0+) request/response reuses `WbxmlCodePage.AirSync`'s own `Collections`/`Collection`/`Class`/
- * `CollectionId`/`SyncKey` via `SWITCH_PAGE` rather than this page's own legacy (`Folders`/`Folder`/`FolderId`)
- * shape - see `WbxmlCodePages.ts`'s own doc comment on `WbxmlCodePage.ItemEstimate` for why, and
- * `ItemOperationsCommand.fetchMessage`'s identical cross-page-reuse precedent.
+ * `CollectionId`/`SyncKey` via `SWITCH_PAGE` rather than this page's own legacy (`Folders`/`Folder`/`FolderId`) shape.
  *
- * A `SyncKey` of `"0"` (or one this device has never synced this folder with before) reports the folder's
- * total live item count - what a first `Sync` would report as `Add`s. Otherwise reuses `EasSyncKeyUtils.
- * computeChanges()` (the same enumeration `SyncCommand` itself uses), capped at `DEFAULT_MAX_COUNT` - see its
- * own doc comment for why this is a real, documented approximation on a very active folder rather than a
- * precise unbounded count.
+ * The collection's `EasCollectionState` (the same per-device row `SyncCommand` keeps) decides the estimate: a
+ * `SyncKey` of `"0"` reports the folder's total live item count (what the first `Sync` would `Add`); the
+ * collection's current `SyncKey` runs `SyncCommand`'s own enumeration as a dry run (nothing persisted), capped at
+ * `mail:eas:item_estimate_max_count`; any other key is Status 2. A request without `Class` falls back to the class
+ * remembered for the collection, then to the folder's type.
  *
- * **ACL-checked like `Sync`**: `estimateCollection()` requires `ACLAction.READ` on the client-supplied
- * `CollectionId` before counting anything - without it, a crafted `CollectionId` belonging to another
- * mailbox's folder would return a real pending-change count for it. A denied folder is reported identically to
- * an unrecognized collection (`Status 2`), never distinguishable from "you don't have this collection at all".
+ * **ACL-checked like `Sync`**: `READ` on the client-supplied `CollectionId` is required before counting anything;
+ * a denied folder is reported identically to an unrecognized collection (`Status 2`).
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -52,6 +48,8 @@ export abstract class GetItemEstimateCommand implements EasCommandHandler {
     public readonly command = "GetItemEstimate";
 
     protected abstract collectionBindings: Record<string, EstimateCollectionBinding>;
+    protected abstract folderClass: any;
+    protected abstract collectionStateClass: any;
 
     @Config("mail:eas:item_estimate_max_count", DEFAULT_MAX_COUNT)
     private maxCount: number = DEFAULT_MAX_COUNT;
@@ -63,9 +61,19 @@ export abstract class GetItemEstimateCommand implements EasCommandHandler {
     private aclUtils?: ACLUtils;
 
     private repos = new Map<string, RepoUtils<any>>();
+    private folderRepo?: RepoUtils<any>;
+    private collectionStateRepo?: RepoUtils<any>;
 
     @Init
     public async init(): Promise<void> {
+        this.folderRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.folderClass.name,
+            args: [this.folderClass],
+        });
+        this.collectionStateRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.collectionStateClass.name,
+            args: [this.collectionStateClass],
+        });
         for (const [collectionClass, binding] of Object.entries(this.collectionBindings)) {
             this.repos.set(
                 collectionClass,
@@ -78,17 +86,13 @@ export abstract class GetItemEstimateCommand implements EasCommandHandler {
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
-        if (!this.aclUtils) {
+        if (!this.aclUtils || !this.folderRepo || !this.collectionStateRepo) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         const collections = ctx.request ? findChild(ctx.request, "Collections") : undefined;
         const collectionEls = collections ? findChildren(collections, "Collection") : [];
         if (collectionEls.length === 0) {
-            return element(WbxmlCodePage.ItemEstimate, "GetItemEstimate", [
-                element(WbxmlCodePage.ItemEstimate, "Response", [
-                    textElement(WbxmlCodePage.ItemEstimate, "Status", "2"),
-                ]),
-            ]);
+            return element(WbxmlCodePage.ItemEstimate, "GetItemEstimate", [this.statusResponse("2")]);
         }
 
         const responses: WbxmlElement[] = [];
@@ -99,53 +103,55 @@ export abstract class GetItemEstimateCommand implements EasCommandHandler {
         return element(WbxmlCodePage.ItemEstimate, "GetItemEstimate", responses);
     }
 
+    private statusResponse(status: string, extra: WbxmlElement[] = []): WbxmlElement {
+        return element(WbxmlCodePage.ItemEstimate, "Response", [textElement(WbxmlCodePage.ItemEstimate, "Status", status), ...extra]);
+    }
+
     private async estimateCollection(ctx: EasCommandContext, collectionEl: WbxmlElement): Promise<WbxmlElement> {
-        const collectionClass: string | undefined = childText(collectionEl, "Class");
+        const requestedClass: string | undefined = childText(collectionEl, "Class");
         const folderUid: string | undefined = childText(collectionEl, "CollectionId");
         const clientSyncKey: string | undefined = childText(collectionEl, "SyncKey");
 
-        const repo = collectionClass ? this.repos.get(collectionClass) : undefined;
-        if (!collectionClass || !folderUid || !repo) {
-            // Status 2 ("Invalid collection") per [MS-ASCMD] - the request named a collection this device
-            // hasn't (or can't) sync.
-            return element(WbxmlCodePage.ItemEstimate, "Response", [
-                textElement(WbxmlCodePage.ItemEstimate, "Status", "2"),
-            ]);
-        }
-
         // Never count against a folder the caller can't even read - see this class's own doc comment.
-        if (!(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.READ))) {
-            return element(WbxmlCodePage.ItemEstimate, "Response", [
-                textElement(WbxmlCodePage.ItemEstimate, "Status", "2"),
-            ]);
+        if (!folderUid || !(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.READ))) {
+            return this.statusResponse("2");
+        }
+        const folder: (Folder & { uid: string }) | undefined = await this.folderRepo!.findOne(folderUid, { ignoreACL: true });
+        if (!folder) {
+            return this.statusResponse("2");
+        }
+        const stored: EasCollectionState | undefined = (
+            await this.collectionStateRepo!.find({ mailboxUid: ctx.mailboxUid, deviceId: ctx.deviceId, folderUid } as any, {
+                ignoreACL: true,
+                limit: 1,
+            })
+        )[0];
+        const collectionClass: string = requestedClass ?? stored?.collectionClass ?? classForFolderType(folder.type);
+        const repo = this.repos.get(collectionClass);
+        if (!repo) {
+            return this.statusResponse("2");
         }
 
-        const storedSyncKey = ctx.deviceSyncState.folderSyncKeys[folderUid];
-        const resolution = resolveSyncKey(clientSyncKey, storedSyncKey);
-        if (resolution.kind === "invalid") {
-            return element(WbxmlCodePage.ItemEstimate, "Response", [
-                textElement(WbxmlCodePage.ItemEstimate, "Status", "2"),
-                this.collectionElement(collectionClass, folderUid, undefined),
-            ]);
-        }
-
-        // A brand-new (or never-synced-by-this-device) folder: every live item would be reported as an Add on
-        // the device's first real Sync round - a plain count() of non-deleted rows (excluded by default; see
-        // computeChanges()'s own doc comment on this query builder behavior), not computeChanges() itself,
-        // which would incorrectly also count this folder's entire soft-deleted history (irrelevant to a client
-        // that has never seen any of those rows in the first place).
         let count: number;
-        if (resolution.kind === "initial") {
+        if (!clientSyncKey || clientSyncKey === "0") {
+            // Every live item would be an Add on the device's first real Sync round.
             count = await repo.count({ folderUid } as any, { ignoreACL: true });
+        } else if (stored && clientSyncKey === stored.syncKey) {
+            const working = workingStateFromRow(stored);
+            const { commands } = await enumerateCollection(working, {
+                repo,
+                folderUid,
+                folderMailboxUid: folder.mailboxUid,
+                windowSize: this.maxCount,
+                moveScanLimit: MOVE_SCAN_LIMIT,
+                include: filterPredicate(collectionClass, working.filterType),
+            });
+            count = commands.length;
         } else {
-            const changes = await computeChanges(repo, "folderUid", folderUid, resolution.key.watermark, this.maxCount);
-            count = changes.adds.length + changes.changes.length + changes.deletes.length;
+            return this.statusResponse("2", [this.collectionElement(collectionClass, folderUid, undefined)]);
         }
 
-        return element(WbxmlCodePage.ItemEstimate, "Response", [
-            textElement(WbxmlCodePage.ItemEstimate, "Status", "1"),
-            this.collectionElement(collectionClass, folderUid, count),
-        ]);
+        return this.statusResponse("1", [this.collectionElement(collectionClass, folderUid, count)]);
     }
 
     private collectionElement(collectionClass: string, folderUid: string, estimate: number | undefined): WbxmlElement {

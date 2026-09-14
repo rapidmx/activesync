@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { MessageMongo, ContactMongo, CalendarEventMongo, TaskMongo, MailboxMongo } from "@rapidmx/restapi/mongo";
+import { MessageMongo, ContactMongo, CalendarEventMongo, TaskMongo, MailboxMongo, FolderMongo } from "@rapidmx/restapi/mongo";
+import { EasCollectionStateMongo } from "../../models/mongo/EasCollectionStateMongo.js";
 import { EmailSyncAdapterMongo } from "../../adapters/mongo/EmailSyncAdapterMongo.js";
 import { ContactsSyncAdapter } from "../../adapters/ContactsSyncAdapter.js";
 import { CalendarSyncAdapter } from "../../adapters/CalendarSyncAdapter.js";
@@ -14,6 +15,8 @@ import { SyncCommand, type SyncCollectionBinding } from "../SyncCommand.js";
  */
 export class SyncCommandMongo extends SyncCommand {
     protected mailboxClass: any = MailboxMongo;
+    protected folderClass: any = FolderMongo;
+    protected collectionStateClass: any = EasCollectionStateMongo;
     protected collectionBindings: Record<string, SyncCollectionBinding<any>> = {
         Email: { entityClass: MessageMongo, adapterClass: EmailSyncAdapterMongo },
         Contacts: { entityClass: ContactMongo, adapterClass: ContactsSyncAdapter },

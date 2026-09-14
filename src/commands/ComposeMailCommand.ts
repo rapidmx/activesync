@@ -5,12 +5,13 @@
 import * as crypto from "crypto";
 import { simpleParser, type AddressObject, type EmailAddress, type ParsedMail } from "mailparser";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
-import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory } from "@rapidrest/service-core";
+import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { ScanPipeline } from "@rapidmx/restapi/scan";
 import {
     BlobStore,
     findOrCreateWellKnownFolder,
     FolderType,
+    type Mailbox,
     type Message,
     MessageImportance,
     RecipientType,
@@ -19,7 +20,10 @@ import {
 } from "@rapidmx/restapi";
 import { childText, findChild, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
-const { Init, Inject } = ObjectDecorators;
+const { Init, Inject, Logger } = ObjectDecorators;
+
+/** Most envelope recipients (To + Cc + Bcc) one composed message may carry. */
+export const MAX_COMPOSE_RECIPIENTS = 500;
 
 /** Flattens mailparser's `AddressObject | AddressObject[] | undefined` union (grouped addresses can nest an
  * `AddressObject` per group) into a plain list of SMTP addresses, dropping any entry with no address (a
@@ -45,29 +49,60 @@ function collectAddresses(entry: EmailAddress, out: string[]): void {
 }
 
 /**
+ * Returns a copy of `raw` with every top-level header named `name` (case-insensitive, including its folded
+ * continuation lines) removed. Only the header block is touched; the body is copied verbatim. Works on the
+ * `latin1` view of the bytes so no byte sequence is altered.
+ */
+export function stripHeader(raw: Buffer, name: string): Buffer {
+    const text = raw.toString("latin1");
+    const crlf = text.indexOf("\r\n\r\n");
+    const lf = text.indexOf("\n\n");
+    const end = crlf !== -1 && (lf === -1 || crlf < lf) ? crlf + 2 : lf !== -1 ? lf + 1 : text.length;
+    const lines = text.slice(0, end).split(/(?<=\n)/);
+    const kept: string[] = [];
+    let dropping = false;
+    const prefix = `${name.toLowerCase()}:`;
+    for (const line of lines) {
+        if (line.startsWith(" ") || line.startsWith("\t")) {
+            if (!dropping) {
+                kept.push(line);
+            }
+            continue;
+        }
+        dropping = line.toLowerCase().startsWith(prefix);
+        if (!dropping) {
+            kept.push(line);
+        }
+    }
+    return Buffer.from(kept.join("") + text.slice(end), "latin1");
+}
+
+/**
  * Shared implementation for EAS `SendMail`, `SmartForward`, and `SmartReply` (MS-ASCMD `ComposeMail` namespace)
  * — all three submit a client-composed raw MIME body directly (`<Mime>`, opaque WBXML content) rather than
  * referencing a pre-existing draft `Message`, unlike the webmail REST API's `POST /messages/:id/send` (see
  * `BaseMessageRoute.send()`, which this class's `scanAndRelay()` call shares its scan-then-relay core with via
  * `MailSendUtils.ts`).
  *
+ * **Sender and envelope checks** (the MIME is entirely device-controlled): every `From` address - and a `Sender`
+ * header, if present - must be the caller's own mailbox's primary or alias address (HTTP 403 otherwise), so a
+ * device can't send as anyone else; the envelope sender is that validated `From`. The envelope is capped at
+ * `MAX_COMPOSE_RECIPIENTS` recipients (HTTP 400). `Bcc` recipients are delivered via the envelope, but the `Bcc`
+ * header itself is stripped from the relayed copy so other recipients never see it (the Sent Items copy keeps it).
+ *
  * **Pragmatic subset, deliberately not the full MS-ASCMD semantics**:
  * - `SmartForward`/`SmartReply`'s `<Source>` (the message being forwarded/replied to) is used only to thread
  * the outgoing message (`inReplyTo`/`references`) and to flip the original's `Answered`/`Forwarded` flag - the
- * real spec has the *server* splice the original message's full content into the outgoing MIME so the client
- * never has to download-then-reupload it; this pragmatic subset instead expects the client's own `<Mime>` to
- * already be the complete outgoing message (which is what every mainstream client's own compose UI naturally
- * produces once it has fetched the original for display), matching this library's "pragmatic subset, not full
- * fidelity" precedent elsewhere (e.g. `FolderSyncCommand`'s SyncKey replay-protection gap).
+ * real spec has the *server* splice the original message's full content into the outgoing MIME; this subset
+ * expects the client's own `<Mime>` to already be the complete outgoing message. The flag flip needs `UPDATE` on
+ * the original's folder and is best-effort: the message has already been sent, so a denied or conflicting flag
+ * update is logged, never turned into a failed request.
  * - `ReplaceMime`/`AccountId`/`InstanceId` are not read - single-account, non-recurring-meeting compose only.
- * - Attachments present in the composed MIME are relayed correctly (`scanAndRelay()`'s `ScanPipeline` handles
- * the full raw message) but are not additionally persisted as `Attachment` records on the saved Sent Items
- * copy - `Message.hasAttachments` is still set correctly from the parsed MIME, just not each attachment's own
- * row (deferred, matching `ItemOperationsCommand`'s own future `Fetch`-of-Sent-Items scope).
+ * - Attachments present in the composed MIME are relayed correctly but are not additionally persisted as
+ * `Attachment` records on the saved Sent Items copy (`Message.hasAttachments` is still set).
  *
- * `folderClass`/`messageClass` are supplied by the Mongo/SQL concrete subclasses, and `markOriginal()` by the
- * `SmartForwardCommand`/`SmartReplyCommand` subclasses (a no-op here, since plain `SendMailCommand` never has a
- * `<Source>` to act on).
+ * `folderClass`/`messageClass`/`mailboxClass` are supplied by the Mongo/SQL concrete subclasses, and
+ * `markOriginal()` by the `SmartForwardCommand`/`SmartReplyCommand` subclasses.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -76,12 +111,14 @@ export abstract class ComposeMailCommand implements EasCommandHandler {
 
     protected abstract folderClass: any;
     protected abstract messageClass: any;
+    protected abstract mailboxClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
     protected folderRepo?: RecoverableRepoUtils<any>;
     protected messageRepo?: RecoverableRepoUtils<any>;
+    protected mailboxRepo?: RepoUtils<any>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -95,6 +132,9 @@ export abstract class ComposeMailCommand implements EasCommandHandler {
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
 
+    @Logger
+    private logger: any;
+
     @Init
     public async init(): Promise<void> {
         this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
@@ -105,17 +145,21 @@ export abstract class ComposeMailCommand implements EasCommandHandler {
             name: this.messageClass.name,
             args: [this.messageClass],
         });
+        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.mailboxClass.name,
+            args: [this.mailboxClass],
+        });
     }
 
-    /** Called once the outgoing message has been sent, only when the request carried a `<Source>` (i.e. this
-     * is a `SmartForward`/`SmartReply`, never a plain `SendMail`) - flips the referenced original message's own
-     * `Answered`/`Forwarded` flag. A no-op here; overridden by the two subclasses that need it. */
+    /** Called once the outgoing message has been sent, only when the request carried a `<Source>` the caller may
+     * update - flips the referenced original message's own `Answered`/`Forwarded` flag. A no-op here; overridden by
+     * the two subclasses that need it. */
     protected async markOriginal(_ctx: EasCommandContext, _original: Message & { uid: string }): Promise<void> {
-        // No-op by default (SendMailCommand never calls this - it never resolves a Source).
+        // No-op by default (plain SendMail has nothing to flag).
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
-        if (!this.folderRepo || !this.messageRepo || !this.blobStore || !this.mailTransport || !this.scanPipeline) {
+        if (!this.folderRepo || !this.messageRepo || !this.mailboxRepo || !this.blobStore || !this.mailTransport || !this.scanPipeline) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         if (!ctx.request) {
@@ -131,8 +175,7 @@ export abstract class ComposeMailCommand implements EasCommandHandler {
         }
 
         // A `SmartForward`/`SmartReply` request identifies the message being acted on via `<Source><ItemId>` -
-        // the same `Message.uid` this library already exposes as `ServerId` in Sync/FolderSync responses, so
-        // no separate lookup table is needed. `SendMail` never carries a `<Source>` at all.
+        // the same `Message.uid` this library already exposes as `ServerId` in Sync/FolderSync responses.
         let original: (Message & { uid: string; version: number }) | undefined;
         const sourceEl = findChild(ctx.request, "Source");
         if (sourceEl) {
@@ -151,13 +194,34 @@ export abstract class ComposeMailCommand implements EasCommandHandler {
         }
 
         const parsed: ParsedMail = await simpleParser(raw);
-        const envelopeFrom: string | undefined = parsed.from?.value[0]?.address;
+        const fromAddresses: string[] = addressesOf(parsed.from);
+        const envelopeFrom: string | undefined = fromAddresses[0];
         const envelopeTo: string[] = [...addressesOf(parsed.to), ...addressesOf(parsed.cc), ...addressesOf(parsed.bcc)];
         if (!envelopeFrom || envelopeTo.length === 0) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "The composed Mime has no resolvable From/To address.");
         }
+        if (envelopeTo.length > MAX_COMPOSE_RECIPIENTS) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `A composed message may have at most ${MAX_COMPOSE_RECIPIENTS} recipients.`);
+        }
 
-        const { sanitizedHtmlBlobKey } = await scanAndRelay(raw, envelopeFrom, envelopeTo, this.scanPipeline, this.mailTransport, this.blobStore);
+        const mailbox: Mailbox | undefined = await this.mailboxRepo.findOne(ctx.mailboxUid, { ignoreACL: true });
+        if (!mailbox) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        const ownAddresses = new Set([mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].map((a) => a.toLowerCase()));
+        const senderAddresses: string[] = addressesOf(parsed.headers.get("sender") as AddressObject | undefined);
+        if ([...fromAddresses, ...senderAddresses].some((address) => !ownAddresses.has(address.toLowerCase()))) {
+            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, "The composed message's From address is not one of this mailbox's addresses.");
+        }
+
+        const { sanitizedHtmlBlobKey } = await scanAndRelay(
+            stripHeader(raw, "bcc"),
+            envelopeFrom,
+            envelopeTo,
+            this.scanPipeline,
+            this.mailTransport,
+            this.blobStore,
+        );
 
         if (findChild(ctx.request, "SaveInSentItems")) {
             const bodyBlobKey = `bodies/${crypto.randomUUID()}`;
@@ -195,7 +259,14 @@ export abstract class ComposeMailCommand implements EasCommandHandler {
         }
 
         if (original) {
-            await this.markOriginal(ctx, original);
+            // The message is already on its way - flagging the original is best-effort bookkeeping.
+            try {
+                if (await this.aclUtils!.hasPermission(ctx.user, original.folderUid, ACLAction.UPDATE)) {
+                    await this.markOriginal(ctx, original);
+                }
+            } catch (err: any) {
+                this.logger?.warn(`${this.command}: failed to flag original message ${original.uid}: ${err?.message}`);
+            }
         }
 
         // Per MS-ASCMD: a successful SendMail/SmartForward/SmartReply response is an empty HTTP 200 body, not

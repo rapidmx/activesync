@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { FolderMongo, MessageMongo } from "@rapidmx/restapi/mongo";
+import { FolderMongo, MailboxMongo, MessageMongo } from "@rapidmx/restapi/mongo";
 import { SendMailCommand } from "../SendMailCommand.js";
 
 /**
@@ -11,4 +11,5 @@ import { SendMailCommand } from "../SendMailCommand.js";
 export class SendMailCommandMongo extends SendMailCommand {
     protected folderClass: any = FolderMongo;
     protected messageClass: any = MessageMongo;
+    protected mailboxClass: any = MailboxMongo;
 }

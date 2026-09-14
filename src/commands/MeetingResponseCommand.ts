@@ -2,13 +2,25 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import * as crypto from "crypto";
+import { simpleParser } from "mailparser";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
-import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
-import { AttendeeResponseStatus, type CalendarEvent, type Mailbox, RecoverableRepoUtils } from "@rapidmx/restapi";
+import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
+import {
+    type Attendee,
+    AttendeeResponseStatus,
+    type BlobStore,
+    buildEventIcs,
+    type CalendarEvent,
+    type Mailbox,
+    type Message,
+    parseIcsEvent,
+    RecoverableRepoUtils,
+} from "@rapidmx/restapi";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
-const { Init, Inject } = ObjectDecorators;
+const { Init, Inject, Logger } = ObjectDecorators;
 
 /** MS-ASCMD `UserResponse`: 1=Accepted, 2=Tentatively accepted, 3=Declined. */
 const USER_RESPONSE_STATUS: Record<string, AttendeeResponseStatus> = {
@@ -17,24 +29,46 @@ const USER_RESPONSE_STATUS: Record<string, AttendeeResponseStatus> = {
     "3": AttendeeResponseStatus.DECLINED,
 };
 
+const USER_RESPONSE_LABEL: Record<string, string> = { "1": "Accepted", "2": "Tentative", "3": "Declined" };
+
 const USER_RESPONSE_DECLINED = "3";
 
+/** MS-ASCMD `MeetingResponse` `Result/Status` values this command reports. */
+const STATUS_SUCCESS = "1";
+const STATUS_INVALID_REQUEST = "2";
+const STATUS_MAILBOX_ERROR = "3";
+
+/** Most `Request` elements one `MeetingResponse` may carry. */
+export const MAX_MEETING_RESPONSES = 100;
+
+type StoredEvent = CalendarEvent & { uid: string; version: number };
+
 /**
- * Handles EAS `MeetingResponse`: records the caller's own accept/tentative/decline response to a meeting on
- * the referenced `CalendarEvent`. `RequestId` is the same `Message`/`CalendarEvent.uid` this library already
- * exposes as `ServerId` elsewhere (Sync/FolderSync) - no separate lookup table is needed.
+ * Handles EAS `MeetingResponse`: records the caller's own accept/tentative/decline response to each meeting the
+ * request's `<Request>` elements name, each answered with its own `<Result>`.
  *
- * **Pragmatic subset**: only the first `<Request>` in the command is processed (the real spec allows several
- * per request, matching `Sync`'s own single-`Collection`-per-request scope in this library). A **decline**
- * soft-deletes the `CalendarEvent` (matching real Exchange behavior) rather than merely flipping the caller's
- * own `Attendee.responseStatus` - each attendee has their own row already (`CalendarEvent.mailboxUid` scopes
- * every event to a single mailbox, per this library's architecture), so deleting *this* row only removes the
- * meeting from the declining attendee's own calendar, leaving the organizer's and every other attendee's own
- * copy untouched. Accept/Tentative still update `Attendee.responseStatus` in place. The response omits
- * `CalendarId` for a decline either way, matching the spec's own convention, so a client relying on that
- * signal isn't misled into thinking a new item was created.
+ * **`RequestId`** is either the `CalendarEvent.uid` (a response from the calendar) or the `Message.uid` of the
+ * meeting request in the Inbox (a response from the mail view - what most clients send). For a message, the
+ * caller needs `READ` on its folder; its `text/calendar` part's `UID` is then resolved to the caller's own copy of
+ * the event (`icalUid` within the caller's mailbox).
  *
- * `calendarEventClass`/`mailboxClass` are supplied by the Mongo/SQL concrete subclasses.
+ * **Effect**: the caller must be an attendee and have `UPDATE` on the event's folder. Accept/Tentative update
+ * the caller's `Attendee.responseStatus`. A decline removes the caller's own copy of the event (matching Exchange)
+ * when the caller also has `DELETE` on the folder, and otherwise just records the declined status - a delegate
+ * with edit-only rights can't delete. Each mailbox has its own event row, so neither touches the organizer's or
+ * any other attendee's copy. `CalendarId` is omitted for a removed event.
+ *
+ * **Reply to the organizer**: in protocol 16.x the client asks the server to notify the organizer with
+ * `SendResponse`; when it's present an iTIP `REPLY` (built with restapi's `buildEventIcs`, the same payload
+ * `BaseCalendarEventRoute.respond` sends) is mailed from the caller's attendee address to the organizer,
+ * best-effort. Without it (14.x clients send their own reply via `SendMail`) nothing is mailed, so the organizer
+ * never receives two replies.
+ *
+ * Failures are per request: an unknown/unresolvable meeting, a meeting the caller may not respond to, or a
+ * malformed `Request` gets Status 2 (indistinguishable, so nothing about other mailboxes leaks); a failed write
+ * Status 3.
+ *
+ * `calendarEventClass`/`mailboxClass`/`messageClass` are supplied by the Mongo/SQL concrete subclasses.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -43,15 +77,26 @@ export abstract class MeetingResponseCommand implements EasCommandHandler {
 
     protected abstract calendarEventClass: any;
     protected abstract mailboxClass: any;
+    protected abstract messageClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
     private calendarEventRepo?: RecoverableRepoUtils<any>;
     private mailboxRepo?: RepoUtils<any>;
+    private messageRepo?: RepoUtils<any>;
 
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
+
+    @Inject("BlobStore")
+    private blobStore?: BlobStore;
+
+    @Inject("MailTransport")
+    private mailTransport?: any;
+
+    @Logger
+    private logger: any;
 
     @Init
     public async init(): Promise<void> {
@@ -63,68 +108,149 @@ export abstract class MeetingResponseCommand implements EasCommandHandler {
             name: this.mailboxClass.name,
             args: [this.mailboxClass],
         });
+        this.messageRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.messageClass.name,
+            args: [this.messageClass],
+        });
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
-        if (!this.calendarEventRepo || !this.mailboxRepo) {
+        if (!this.calendarEventRepo || !this.mailboxRepo || !this.messageRepo) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
-        const requestEl = ctx.request ? findChild(ctx.request, "Request") : undefined;
-        if (!requestEl) {
+        const requestEls = ctx.request ? findChildren(ctx.request, "Request") : [];
+        if (requestEls.length === 0 || requestEls.length > MAX_MEETING_RESPONSES) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
-        }
-
-        const userResponse: string | undefined = childText(requestEl, "UserResponse");
-        const requestId: string | undefined = childText(requestEl, "RequestId");
-        if (!userResponse || !requestId || !USER_RESPONSE_STATUS[userResponse]) {
-            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
-        }
-
-        const event: (CalendarEvent & { uid: string; version: number }) | undefined = await this.calendarEventRepo.findOne(
-            requestId,
-            { ignoreACL: true },
-        );
-        if (!event) {
-            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
-        }
-        if (!(await this.aclUtils!.hasPermission(ctx.user, event.folderUid, ACLAction.UPDATE))) {
-            throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
         const mailbox: Mailbox | undefined = await this.mailboxRepo.findOne(ctx.mailboxUid, { ignoreACL: true });
         if (!mailbox) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        const callerAddresses = new Set([mailbox.primarySmtpAddress.toLowerCase(), ...mailbox.aliasAddresses.map((a: string) => a.toLowerCase())]);
+
+        const results: WbxmlElement[] = [];
+        for (const requestEl of requestEls) {
+            results.push(await this.respond(ctx, mailbox, requestEl));
+        }
+        return element(WbxmlCodePage.MeetingResponse, "MeetingResponse", results);
+    }
+
+    private result(requestId: string | undefined, status: string, calendarId?: string): WbxmlElement {
+        return element(WbxmlCodePage.MeetingResponse, "Result", [
+            ...(requestId ? [textElement(WbxmlCodePage.MeetingResponse, "RequestId", requestId)] : []),
+            textElement(WbxmlCodePage.MeetingResponse, "Status", status),
+            ...(calendarId ? [textElement(WbxmlCodePage.MeetingResponse, "CalendarId", calendarId)] : []),
+        ]);
+    }
+
+    private async respond(ctx: EasCommandContext, mailbox: Mailbox, requestEl: WbxmlElement): Promise<WbxmlElement> {
+        const userResponse: string | undefined = childText(requestEl, "UserResponse");
+        const requestId: string | undefined = childText(requestEl, "RequestId");
+        if (!userResponse || !requestId || !USER_RESPONSE_STATUS[userResponse]) {
+            return this.result(requestId, STATUS_INVALID_REQUEST);
+        }
+
+        const event: StoredEvent | undefined = await this.resolveEvent(ctx, requestId);
+        if (!event || !(await this.aclUtils!.hasPermission(ctx.user, event.folderUid, ACLAction.UPDATE))) {
+            return this.result(requestId, STATUS_INVALID_REQUEST);
+        }
+
+        const callerAddresses = new Set([mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].map((a) => a.toLowerCase()));
         const attendeeIndex = event.attendees.findIndex((attendee) => callerAddresses.has(attendee.address.toLowerCase()));
         if (attendeeIndex === -1) {
-            throw new ApiError(ApiErrors.NOT_FOUND, 404, "The caller is not an attendee of this calendar event.");
+            return this.result(requestId, STATUS_INVALID_REQUEST);
+        }
+        const updatedAttendee: Attendee = { ...event.attendees[attendeeIndex], responseStatus: USER_RESPONSE_STATUS[userResponse] };
+
+        let removed = false;
+        try {
+            if (userResponse === USER_RESPONSE_DECLINED && (await this.aclUtils!.hasPermission(ctx.user, event.folderUid, ACLAction.DELETE))) {
+                await this.calendarEventRepo!.delete(event.uid, { ignoreACL: true, user: ctx.user });
+                removed = true;
+            } else {
+                const attendees = event.attendees.map((attendee, i) => (i === attendeeIndex ? updatedAttendee : attendee));
+                await this.calendarEventRepo!.update({ uid: event.uid, version: event.version, attendees } as any, event, {
+                    ignoreACL: true,
+                    user: ctx.user,
+                });
+            }
+        } catch (err: any) {
+            this.logger?.warn(`MeetingResponseCommand: failed to record response to event ${event.uid}: ${err?.message}`);
+            return this.result(requestId, STATUS_MAILBOX_ERROR);
         }
 
-        if (userResponse === USER_RESPONSE_DECLINED) {
-            // Soft-delete this attendee's own copy of the event - see this class's own doc comment for why
-            // that's correct here rather than merely flipping responseStatus (the real spec's own behavior:
-            // declining removes the meeting from the declining attendee's calendar).
-            await this.calendarEventRepo.delete(event.uid, { ignoreACL: true, user: ctx.user });
-        } else {
-            const attendees = event.attendees.map((attendee, i) =>
-                i === attendeeIndex ? { ...attendee, responseStatus: USER_RESPONSE_STATUS[userResponse] } : attendee,
-            );
-            await this.calendarEventRepo.update(
-                { uid: event.uid, version: event.version, attendees } as any,
-                event,
-                { ignoreACL: true, user: ctx.user },
-            );
+        if (findChild(requestEl, "SendResponse")) {
+            await this.sendReply(mailbox, event, updatedAttendee, userResponse);
         }
 
-        return element(WbxmlCodePage.MeetingResponse, "MeetingResponse", [
-            element(WbxmlCodePage.MeetingResponse, "Result", [
-                textElement(WbxmlCodePage.MeetingResponse, "RequestId", requestId),
-                textElement(WbxmlCodePage.MeetingResponse, "Status", "1"),
-                ...(userResponse !== USER_RESPONSE_DECLINED
-                    ? [textElement(WbxmlCodePage.MeetingResponse, "CalendarId", event.uid)]
-                    : []),
-            ]),
-        ]);
+        return this.result(requestId, STATUS_SUCCESS, removed ? undefined : event.uid);
+    }
+
+    /** Resolves `requestId` to the caller's event: an event uid directly, or a meeting request message's
+     * `text/calendar` `UID` looked up among the caller's own mailbox's events. */
+    private async resolveEvent(ctx: EasCommandContext, requestId: string): Promise<StoredEvent | undefined> {
+        const direct: StoredEvent | undefined = await this.calendarEventRepo!.findOne(requestId, { ignoreACL: true });
+        if (direct) {
+            return direct;
+        }
+        const message: Message | undefined = await this.messageRepo!.findOne(requestId, { ignoreACL: true });
+        if (!message || !(await this.aclUtils!.hasPermission(ctx.user, message.folderUid, ACLAction.READ))) {
+            return undefined;
+        }
+        const icalUid: string | undefined = await this.meetingUidOf(message);
+        if (!icalUid) {
+            return undefined;
+        }
+        const events: StoredEvent[] = await this.calendarEventRepo!.find({ mailboxUid: ctx.mailboxUid, icalUid, limit: 10 } as any, {
+            ignoreACL: true,
+            limit: 10,
+        });
+        // The series master (no `recurrenceId`) is what a response to the whole invitation applies to.
+        return events.find((candidate) => !candidate.recurrenceId) ?? events[0];
+    }
+
+    /** The iCalendar `UID` of a meeting request message's `text/calendar` part, if it has one. */
+    private async meetingUidOf(message: Message): Promise<string | undefined> {
+        try {
+            const parsed = await simpleParser(await this.blobStore!.get(message.bodyBlobKey));
+            const calendarPart = parsed.attachments.find((part) => part.contentType === "text/calendar");
+            return calendarPart ? parseIcsEvent(calendarPart.content.toString("utf-8"))?.uid : undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** Mails an iTIP `REPLY` for `attendee`'s response to the event's organizer. Best-effort: the response itself is
+     * already recorded, so a transport failure is only logged. */
+    private async sendReply(mailbox: Mailbox, event: StoredEvent, attendee: Attendee, userResponse: string): Promise<void> {
+        try {
+            const ics = buildEventIcs({ ...event, attendees: [attendee] }, "REPLY", { onlyAttendee: attendee });
+            const boundary = `eas-${crypto.randomUUID()}`;
+            const subject = `${USER_RESPONSE_LABEL[userResponse]}: ${event.title}`.replace(/[\r\n]+/g, " ");
+            const fromName = (mailbox.displayName ?? "").replace(/[\r\n"]+/g, " ");
+            const raw = [
+                `From: "${fromName}" <${attendee.address}>`,
+                `To: <${event.organizer.address}>`,
+                `Subject: ${subject}`,
+                `Date: ${new Date().toUTCString()}`,
+                `Message-ID: <${crypto.randomUUID()}@eas>`,
+                "MIME-Version: 1.0",
+                `Content-Type: multipart/alternative; boundary="${boundary}"`,
+                "",
+                `--${boundary}`,
+                "Content-Type: text/plain; charset=utf-8",
+                "",
+                `${attendee.displayName ?? attendee.address} has responded ${USER_RESPONSE_LABEL[userResponse].toLowerCase()} to: ${event.title}`,
+                `--${boundary}`,
+                'Content-Type: text/calendar; charset=utf-8; method=REPLY',
+                "",
+                ics,
+                `--${boundary}--`,
+                "",
+            ].join("\r\n");
+            await this.mailTransport.send({ raw: Buffer.from(raw, "utf-8"), envelopeFrom: attendee.address, envelopeTo: [event.organizer.address] });
+        } catch (err: any) {
+            this.logger?.warn(`MeetingResponseCommand: failed to send iTIP REPLY for event ${event.uid}: ${err?.message}`);
+        }
     }
 }

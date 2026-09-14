@@ -12,78 +12,100 @@ import {
     RepoUtils,
     type RecoverableBaseEntity,
 } from "@rapidrest/service-core";
-import { RecoverableRepoUtils, type Mailbox } from "@rapidmx/restapi";
+import { findOrCreateWellKnownFolder, type Folder, FolderType, RecoverableRepoUtils, type Mailbox } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
-import { computeChanges, formatSyncKey, persistDeviceSyncState, resolveSyncKey } from "../EasSyncKeyUtils.js";
+import { formatSyncKey } from "../EasSyncKeyUtils.js";
+import {
+    classForFolderType,
+    cloneWorkingState,
+    type CollectionWorkingState,
+    enumerateCollection,
+    filterPredicate,
+    roundRecord,
+    workingStateFromRound,
+    workingStateFromRow,
+} from "../EasCollectionSync.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 import type { EasCollectionSyncAdapter } from "../adapters/EasCollectionSyncAdapter.js";
-const { Config, Init, Inject } = ObjectDecorators;
+import type { EasCollectionState } from "../models/EasCollectionState.js";
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 
-/** Caps how many item changes are enumerated per `Sync` round - a real device-visible "MoreAvailable" trigger
- * for a busy folder, not a real-world binding constraint (unlike `FolderSyncCommand`'s much smaller folder
- * hierarchy, an Inbox can easily exceed this in one round). */
+/** Default most item changes reported per collection per `Sync` round. */
 const DEFAULT_WINDOW_SIZE = 100;
+
+/** [MS-ASCMD]'s own ceiling for `WindowSize`. */
+const MAX_WINDOW_SIZE = 512;
+
+/** Most `<Collection>`s one `Sync` request may carry - more is answered with a top-level Status 4. */
+export const MAX_SYNC_COLLECTIONS = 300;
+
+/** Most client `Add`/`Change`/`Delete` commands one collection of a `Sync` request may carry - more is answered
+ * with that collection's Status 4, without applying any of them. */
+export const MAX_SYNC_COMMANDS_PER_COLLECTION = 512;
+
+/** Rows read per round from the stream of items outside a collection's folder (see `enumerateCollection`). */
+const DEFAULT_MOVE_SCAN_LIMIT = 1000;
+
+/** Slack subtracted from "now" when a collection is (re)started, for the out-of-folder cursor. */
+const MOVE_CURSOR_SLACK_MS = 60_000;
 
 /** Binds one MS-ASCMD `Class` value (`"Email"`, `"Contacts"`, ...) to the concrete entity class `SyncCommand`
  * should build a `RepoUtils` for, and the adapter class that maps that entity to/from `ApplicationData`.
- * Supplied by the Mongo/SQL concrete subclasses, one map entry per supported collection type.
- *
- * `adapterClass`, not a pre-built `adapter` instance: `SyncCommand.init()` instantiates each one itself via
- * `ObjectFactory`, so an adapter can `@Inject` its own dependencies (`EmailSyncAdapter` needs `BlobStore` for a
- * Draft's body) exactly like any other DI-managed class in this library - a bare `new EmailSyncAdapter()` has
- * no way to satisfy that. */
+ * Supplied by the Mongo/SQL concrete subclasses, one map entry per supported collection type. */
 export interface SyncCollectionBinding<T extends RecoverableBaseEntity> {
     entityClass: any;
     adapterClass: any;
 }
 
+/** Everything one collection's round needs while applying client commands. */
+interface CollectionRound {
+    ctx: EasCommandContext;
+    folder: Folder & { uid: string };
+    collectionClass: string;
+    adapter: EasCollectionSyncAdapter<any>;
+    repo: RepoUtils<any>;
+    working: CollectionWorkingState;
+    /** Set when the client retried the previous round's `SyncKey`. */
+    retry?: { removedIds: Set<string>; clientIds: Map<string, string> };
+    clientIds: Map<string, string>;
+    deletesAsMoves: boolean;
+    getMailbox: () => Promise<Mailbox>;
+}
+
 /**
- * Handles EAS `Sync`: enumerates `Add`/`Change`/`Delete`s for a single folder's contents since the device's last
- * `Sync` of that folder, using the same watermark-based cursor mechanism `FolderSyncCommand` uses (via
- * `EasSyncKeyUtils`), scoped by `folderUid` instead of `mailboxUid`, and keyed per-folder in
- * `DeviceSyncState.folderSyncKeys` (the `CollectionId` a client sends *is* the `folderUid` - this library never
- * invents a separate collection identifier).
+ * Handles EAS `Sync` for `Email`/`Contacts`/`Calendar`/`Tasks` folders.
  *
- * **Multi-collection requests**: every `<Collection>` in a request's `<Collections>` is processed and gets its
- * own `<Collection>` entry in the response, each with its own independent `SyncKey`/`Status` - a client
- * syncing several folders in one round trip (the common case once the initial per-folder backlog is done)
- * gets one response covering all of them. All per-collection `SyncKey`/remembered-`Class` writes for the whole
- * request are batched into a single `persistDeviceSyncState` call after every collection has been processed
- * (never one call per collection) - see `EasSyncKeyUtils.persistDeviceSyncState`'s own doc comment for why a
- * second write to the same `DeviceSyncState` within one request must never be built off a stale copy.
+ * **Per-collection state** lives in its own `EasCollectionState` row per (mailbox, device, folder) - see that
+ * model - rather than in `DeviceSyncState`, so concurrent `Sync`s of different folders never contend for one row.
+ * Besides the issued `SyncKey`, the row records exactly which items the device holds (`serverIds`). That is what
+ * makes the reported commands correct rather than guessed: an item the device doesn't hold is always an `Add`
+ * (including on the first round after `SyncKey 0`), an item it holds is a `Change`, and an item it holds that has
+ * been deleted *or moved to another folder* is a `Delete` - see `EasCollectionSync.enumerateCollection`.
  *
- * **`Class` is only required on a collection's first (`SyncKey "0"`) request**, per `[MS-ASCMD]` - once seen,
- * it's remembered in `DeviceSyncState.folderCollectionClasses` (keyed by `folderUid`) so a later request may
- * omit it; omitting it for a folder never previously synced still gets `Status 4` (nothing to fall back to).
+ * **Round order**: the client's own `Commands` are applied first, then server changes are enumerated. The device's
+ * own writes are not echoed back: each successful `Add`/`Change` records the resulting `dateModified` in the row's
+ * `echoes`, and a changed row still carrying exactly that timestamp is skipped. The cursor itself only ever advances
+ * past rows actually enumerated, never past a pending server change.
  *
- * **Every `CollectionId` is ACL-checked against the caller before it's touched**: `processCollection()` requires
- * `ACLAction.READ` on the folder before enumerating or accepting any Commands for it at all (a folder the caller
- * can't read is reported the same as an unrecognized collection - Status `4` - rather than leaking whether it
- * exists); `applyAdd`/`applyChange`/`applyDelete` additionally require `CREATE`/`UPDATE`/`DELETE` respectively,
- * and `applyChange`/`applyDelete` re-verify the resolved item's own `folderUid` actually matches the collection
- * being synced (treating a mismatch identically to "not found" - Status `8` - never revealing that the
- * `ServerId` resolves to something real elsewhere). Without this, a client could supply any other mailbox's
- * folder/item uid as its own `CollectionId`/`ServerId` and read or mutate that mailbox's data directly - the
- * same ownership-verification-after-an-`ignoreACL`-lookup pattern `ItemOperationsCommand`/`MoveItemsCommand`
- * already use, applied consistently here too.
+ * **Retries**: a client that never received a response re-sends the `SyncKey` it still holds. The row keeps the
+ * previous round's key and delta (`previous`), so that key is accepted and the round is recomputed from the state
+ * before it; an `Add` re-sent with the same `ClientId` is answered with the item created the first time, and a
+ * `Delete` of an item that round already removed succeeds silently.
  *
- * **Pragmatic subset, deliberately not the full MS-ASCMD `Sync` surface**:
- * - **Client-originated `Add`/`Change`/`Delete` commands are accepted for every collection type**, including
- * `Email` (a device creating/editing a Draft, or deleting a message locally - see `applyAdd`/`applyChange`/
- * `applyDelete`). `[MS-ASCMD]` itself disallows `Add`/`Change` for any *non-draft* `Email` item - this library
- * doesn't verify a Sync `Email` Add/Change actually targets the caller's own Drafts folder *specifically*
- * (only that it's a folder the caller actually owns/can write to - see above), matching how Contacts/Calendar/
- * Tasks folder targeting is equally unchecked beyond ownership elsewhere. The one exception is a `Body` change:
- * `EmailSyncAdapter` refuses it (Status `6`) for any message outside the Drafts folder, since that would rewrite
- * a received/sent message's original MIME blob. A collection whose adapter has no
- * `fromApplicationData` at all would get Status `6` for `Add`/`Change` instead, but every adapter today
- * implements it. Per `[MS-ASCMD]`'s own "Add (Sync)"/"Status (Sync)" pages: `Add` always gets a `Responses`
- * entry (it must report the assigned `ServerId`); `Change`/`Delete` only get one on **failure** - a silent
- * success means "assume it worked."
- * - Only a body preview is returned per item (see `EmailSyncAdapter`'s own doc comment) - full body content is
- * fetched separately via `ItemOperationsCommand`. A Draft's `Email` Add/Change is plain-text-only, with no
- * attachment support (mirrors `ComposeMailCommand`'s own already-documented attachment gap).
+ * **Options honoured**: `WindowSize` (capped by `mail:eas:sync_window_size` and 512), `FilterType` (age window for
+ * `Email`/`Calendar`, incomplete-only for `Tasks`; applied to items the device doesn't hold yet - a request whose
+ * `FilterType` differs from the one the collection was synced with gets Status 3 so the client re-syncs from 0),
+ * `DeletesAsMoves` (default `true`: an `Email` delete moves the message to Deleted Items; a delete inside Deleted
+ * Items, or with `DeletesAsMoves` `0`, deletes it) and `GetChanges` `0` (no server changes this round).
+ *
+ * **Access**: every `CollectionId` needs `READ` on the folder (otherwise Status 4, indistinguishable from an unknown
+ * collection); `Add`/`Change`/`Delete` additionally need `CREATE`/`UPDATE`/`DELETE`, and a `ServerId` that resolves
+ * to an item outside the synced folder is reported as not found (Status 8). An `Email` `Add` is only accepted in
+ * a Drafts folder ([MS-ASCMD]: no non-draft email may be added by a client), and a new item's `mailboxUid` is the
+ * folder's own mailbox, so an item added to a shared folder belongs to that folder's mailbox.
+ *
+ * Per `[MS-ASCMD]`, `Add` always gets a `Responses` entry; `Change`/`Delete` only on failure.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -92,13 +114,15 @@ export abstract class SyncCommand implements EasCommandHandler {
 
     protected abstract collectionBindings: Record<string, SyncCollectionBinding<any>>;
 
-    /** Supplied by the Mongo/SQL concrete subclasses so a client-originated `Add`'s `newEntityDefaults()` can
-     * be given the caller's own `Mailbox` (`EmailSyncAdapter` needs it for a new Draft's `from`) - same
-     * one-line-per-backend pattern `MeetingResponseCommand`/`SettingsCommand` already use. */
+    /** Supplied by the Mongo/SQL concrete subclasses. */
     protected abstract mailboxClass: any;
+    protected abstract folderClass: any;
+    protected abstract collectionStateClass: any;
 
     @Config("mail:eas:sync_window_size", DEFAULT_WINDOW_SIZE)
     private windowSize: number = DEFAULT_WINDOW_SIZE;
+
+    protected moveScanLimit: number = DEFAULT_MOVE_SCAN_LIMIT;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -106,9 +130,14 @@ export abstract class SyncCommand implements EasCommandHandler {
     @Inject(ACLUtils)
     private aclUtils?: ACLUtils;
 
+    @Logger
+    private logger: any;
+
     private repos = new Map<string, RepoUtils<any>>();
     private adapters = new Map<string, EasCollectionSyncAdapter<any>>();
     private mailboxRepo?: RepoUtils<any>;
+    private folderRepo?: RecoverableRepoUtils<any>;
+    private collectionStateRepo?: RepoUtils<any>;
 
     @Init
     public async init(): Promise<void> {
@@ -116,11 +145,17 @@ export abstract class SyncCommand implements EasCommandHandler {
             name: this.mailboxClass.name,
             args: [this.mailboxClass],
         });
+        this.folderRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+            name: this.folderClass.name,
+            args: [this.folderClass],
+        });
+        this.collectionStateRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.collectionStateClass.name,
+            args: [this.collectionStateClass],
+        });
         for (const [collectionClass, binding] of Object.entries(this.collectionBindings)) {
-            // RecoverableRepoUtils, not plain RepoUtils: SyncCommand now originates its own deletes
-            // (`applyDelete`) - without it, a soft-delete here wouldn't bump `dateModified`/`version`,
-            // breaking this exact class's own watermark-based deletion detection for anything deleted via
-            // Sync instead of the REST API. The same fix `BaseMapiEmsmdbRoute.ts` already needed for MAPI.
+            // RecoverableRepoUtils: a soft-delete must bump `dateModified`/`version`, or the change stream this
+            // class enumerates would never see it.
             this.repos.set(
                 collectionClass,
                 await this._objectFactory!.newInstance(RecoverableRepoUtils, {
@@ -132,8 +167,7 @@ export abstract class SyncCommand implements EasCommandHandler {
         }
     }
 
-    /** Resolves the caller's own `Mailbox` at most once per request, and only if actually needed - most `Sync`
-     * requests contain no client-originated `Add` at all, so most requests never pay this extra round trip. */
+    /** Resolves the caller's own `Mailbox` at most once per request, and only if actually needed. */
     private mailboxLoader(ctx: EasCommandContext): () => Promise<Mailbox> {
         let cached: Mailbox | undefined;
         return async () => {
@@ -148,7 +182,7 @@ export abstract class SyncCommand implements EasCommandHandler {
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
-        if (!this.aclUtils) {
+        if (!this.aclUtils || !this.folderRepo || !this.collectionStateRepo) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         const collections = ctx.request ? findChild(ctx.request, "Collections") : undefined;
@@ -156,180 +190,218 @@ export abstract class SyncCommand implements EasCommandHandler {
         if (collectionEls.length === 0) {
             return element(WbxmlCodePage.AirSync, "Sync", [textElement(WbxmlCodePage.AirSync, "Status", "3")]);
         }
+        if (collectionEls.length > MAX_SYNC_COLLECTIONS) {
+            return element(WbxmlCodePage.AirSync, "Sync", [textElement(WbxmlCodePage.AirSync, "Status", "4")]);
+        }
 
-        const collectionElements: WbxmlElement[] = [];
-        // Accumulated across every collection below, then written in exactly ONE persistDeviceSyncState call
-        // after the loop - never one call per collection (see this class's own doc comment on why).
-        let folderSyncKeys: Record<string, string> | undefined;
-        let folderCollectionClasses: Record<string, string> | undefined;
-
+        const requestWindowSize: string | undefined = childText(ctx.request!, "WindowSize");
         const getMailbox = this.mailboxLoader(ctx);
+        const collectionElements: WbxmlElement[] = [];
         for (const collectionEl of collectionEls) {
-            const result = await this.processCollection(ctx, collectionEl, getMailbox);
-            collectionElements.push(result.collectionElement);
-            if (result.folderUid && result.newSyncKey) {
-                folderSyncKeys = {
-                    ...(folderSyncKeys ?? ctx.deviceSyncState.folderSyncKeys),
-                    [result.folderUid]: result.newSyncKey,
-                };
-            }
-            if (result.folderUid && result.rememberedClass) {
-                folderCollectionClasses = {
-                    ...(folderCollectionClasses ?? ctx.deviceSyncState.folderCollectionClasses ?? {}),
-                    [result.folderUid]: result.rememberedClass,
-                };
-            }
+            collectionElements.push(await this.processCollection(ctx, collectionEl, getMailbox, requestWindowSize));
         }
 
-        if (folderSyncKeys || folderCollectionClasses) {
-            await persistDeviceSyncState(ctx.deviceSyncState, ctx.deviceSyncStateRepo, {
-                ...(folderSyncKeys ? { folderSyncKeys } : {}),
-                ...(folderCollectionClasses ? { folderCollectionClasses } : {}),
-            });
-        }
-
-        return element(WbxmlCodePage.AirSync, "Sync", [
-            element(WbxmlCodePage.AirSync, "Collections", collectionElements),
-        ]);
+        return element(WbxmlCodePage.AirSync, "Sync", [element(WbxmlCodePage.AirSync, "Collections", collectionElements)]);
     }
 
-    /** Processes one `<Collection>` from the request into its own `<Collection>` response element, plus (when
-     * this round advanced anything) the `folderUid`/new `SyncKey`/remembered `Class` for `handle()` to fold
-     * into its single end-of-request `persistDeviceSyncState` call - this method itself never persists
-     * anything, so it's safe to call once per collection in a request without the write-batching hazard
-     * `EasSyncKeyUtils.persistDeviceSyncState`'s doc comment describes. */
+    private effectiveWindowSize(requested: string | undefined): number {
+        const limit = Math.min(this.windowSize, MAX_WINDOW_SIZE);
+        const value = Number(requested);
+        return requested !== undefined && Number.isInteger(value) && value > 0 ? Math.min(value, limit) : limit;
+    }
+
     private async processCollection(
         ctx: EasCommandContext,
         collectionEl: WbxmlElement,
         getMailbox: () => Promise<Mailbox>,
-    ): Promise<{ collectionElement: WbxmlElement; folderUid?: string; newSyncKey?: string; rememberedClass?: string }> {
+        requestWindowSize: string | undefined,
+    ): Promise<WbxmlElement> {
         const requestedClass: string | undefined = childText(collectionEl, "Class");
         const folderUid: string | undefined = childText(collectionEl, "CollectionId");
         const clientSyncKey: string | undefined = childText(collectionEl, "SyncKey");
 
-        // Class is only required on a collection's first (SyncKey "0") request - see this class's own doc
-        // comment. A folder never previously synced has no remembered value to fall back to, so omitting Class
-        // there still (correctly) falls through to the "missing" branch below.
-        const collectionClass: string | undefined =
-            requestedClass ?? (folderUid ? ctx.deviceSyncState.folderCollectionClasses?.[folderUid] : undefined);
-        if (!collectionClass || !folderUid) {
-            return { collectionElement: this.collectionResponse(collectionClass, folderUid, "4", clientSyncKey) };
-        }
-
-        const repo: RepoUtils<any> | undefined = this.repos.get(collectionClass);
-        const adapter: EasCollectionSyncAdapter<any> | undefined = this.adapters.get(collectionClass);
-        if (!repo || !adapter) {
-            return { collectionElement: this.collectionResponse(collectionClass, folderUid, "4", clientSyncKey) };
-        }
-
         // A folder the caller can't even read is reported identically to an unrecognized collection - never
         // reveal whether a client-supplied CollectionId belonging to someone else's mailbox actually exists.
-        // See this class's own doc comment for why this check (and the matching ones in applyAdd/applyChange/
-        // applyDelete below) is required, not optional.
-        if (!(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.READ))) {
-            return { collectionElement: this.collectionResponse(collectionClass, folderUid, "4", clientSyncKey) };
+        if (!folderUid || !(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.READ))) {
+            return this.collectionResponse(requestedClass, folderUid, "4", clientSyncKey);
+        }
+        const folder: (Folder & { uid: string }) | undefined = await this.folderRepo!.findOne(folderUid, { ignoreACL: true });
+        if (!folder) {
+            return this.collectionResponse(requestedClass, folderUid, "4", clientSyncKey);
         }
 
-        const storedSyncKey: string | undefined = ctx.deviceSyncState.folderSyncKeys[folderUid];
-        const resolution = resolveSyncKey(clientSyncKey, storedSyncKey);
-
-        if (resolution.kind === "invalid") {
-            return { collectionElement: this.collectionResponse(collectionClass, folderUid, "3", undefined) };
+        const stored: (EasCollectionState & { version: number }) | undefined = (
+            await this.collectionStateRepo!.find({ mailboxUid: ctx.mailboxUid, deviceId: ctx.deviceId, folderUid } as any, {
+                ignoreACL: true,
+                limit: 1,
+            })
+        )[0];
+        const collectionClass: string = requestedClass ?? stored?.collectionClass ?? classForFolderType(folder.type);
+        const repo: RepoUtils<any> | undefined = this.repos.get(collectionClass);
+        const adapter: EasCollectionSyncAdapter<any> | undefined = this.adapters.get(collectionClass);
+        const commandsEl: WbxmlElement | undefined = findChild(collectionEl, "Commands");
+        if (!repo || !adapter || (commandsEl?.children.length ?? 0) > MAX_SYNC_COMMANDS_PER_COLLECTION) {
+            return this.collectionResponse(collectionClass, folderUid, "4", clientSyncKey);
         }
 
-        if (resolution.kind === "initial") {
-            // Same epoch-not-"now" reasoning as FolderSyncCommand's own initial-sync branch: the client's next
-            // request (echoing this key) is its true first full sync of this folder and must see every
-            // existing item as an Add, not just ones modified after this handshake started.
-            const newKey = formatSyncKey({ generation: 1, watermark: new Date(0) });
-            return {
-                collectionElement: this.collectionResponse(collectionClass, folderUid, "1", newKey),
-                folderUid,
-                newSyncKey: newKey,
-                rememberedClass: requestedClass,
+        const optionsEl: WbxmlElement | undefined = findChild(collectionEl, "Options");
+        const requestedFilter: string | undefined = optionsEl ? childText(optionsEl, "FilterType") : undefined;
+
+        if (!clientSyncKey || clientSyncKey === "0") {
+            return await this.startCollection(ctx, stored, folderUid, collectionClass, requestedFilter ?? "0");
+        }
+
+        let working: CollectionWorkingState;
+        let retry: CollectionRound["retry"];
+        if (stored && clientSyncKey === stored.syncKey) {
+            working = workingStateFromRow(stored);
+        } else if (stored?.previous && clientSyncKey === stored.previous.syncKey) {
+            working = workingStateFromRound(stored, stored.previous);
+            retry = {
+                removedIds: new Set(stored.previous.removedIds),
+                clientIds: new Map(stored.previous.clientIds.map((entry) => [entry.clientId, entry.serverId])),
             };
+        } else {
+            return this.collectionResponse(collectionClass, folderUid, "3", undefined);
+        }
+        if (requestedFilter !== undefined && requestedFilter !== working.filterType) {
+            // The window the device's items were selected with no longer matches - restart from SyncKey 0.
+            return this.collectionResponse(collectionClass, folderUid, "3", undefined);
         }
 
-        // Computed against the OLD watermark, BEFORE this round's own client-originated writes below are
-        // applied - this is what stops a client's own fresh Add/Change/Delete from being echoed straight back
-        // as a Commands/Add|Change|Delete in this SAME response.
-        const changes = await computeChanges(repo, "folderUid", folderUid, resolution.key.watermark, this.windowSize);
+        const base: CollectionWorkingState = cloneWorkingState(working);
+        const round: CollectionRound = {
+            ctx,
+            folder,
+            collectionClass,
+            adapter,
+            repo,
+            working,
+            retry,
+            clientIds: new Map(),
+            deletesAsMoves: childText(collectionEl, "DeletesAsMoves") !== "0",
+            getMailbox,
+        };
 
-        // Process the client's own Commands (if any) - after the read above, before computing the new SyncKey
-        // below (which must cover these writes too, or the NEXT round would re-report them as incoming
-        // server-side changes).
-        const requestCommands = findChild(collectionEl, "Commands");
         const responseEntries: WbxmlElement[] = [];
-        let maxWriteWatermark: Date | undefined;
-        const note = (date: Date | undefined) => {
-            if (date && (!maxWriteWatermark || date > maxWriteWatermark)) maxWriteWatermark = date;
-        };
-        if (requestCommands) {
-            for (const el of findChildren(requestCommands, "Add")) {
-                const outcome = await this.applyAdd(ctx, adapter, repo, folderUid, el, getMailbox);
-                if (outcome.response) responseEntries.push(outcome.response);
-                note(outcome.writtenAt);
-            }
-            for (const el of findChildren(requestCommands, "Change")) {
-                const outcome = await this.applyChange(ctx, adapter, repo, folderUid, el);
-                if (outcome.response) responseEntries.push(outcome.response);
-                note(outcome.writtenAt);
-            }
-            for (const el of findChildren(requestCommands, "Delete")) {
-                const outcome = await this.applyDelete(ctx, repo, folderUid, el);
-                if (outcome.response) responseEntries.push(outcome.response);
-                note(outcome.writtenAt);
+        if (commandsEl) {
+            for (const el of commandsEl.children) {
+                const response =
+                    el.tag === "Add"
+                        ? await this.applyAdd(round, el)
+                        : el.tag === "Change"
+                          ? await this.applyChange(round, el)
+                          : el.tag === "Delete"
+                            ? await this.applyDelete(round, el)
+                            : undefined;
+                if (response) {
+                    responseEntries.push(response);
+                }
             }
         }
 
-        // Only ever extends the watermark forward past what `computeChanges` itself already determined - never
-        // jumps all the way to "now" unconditionally, which would silently skip over not-yet-enumerated
-        // pending changes whenever `changes.moreAvailable` is true.
-        const newWatermark =
-            maxWriteWatermark && maxWriteWatermark > changes.newWatermark ? maxWriteWatermark : changes.newWatermark;
-        const newKey = formatSyncKey({ generation: resolution.key.generation + 1, watermark: newWatermark });
+        const { commands, moreAvailable } =
+            childText(collectionEl, "GetChanges") === "0"
+                ? { commands: [], moreAvailable: false }
+                : await enumerateCollection(working, {
+                      repo,
+                      folderUid,
+                      folderMailboxUid: folder.mailboxUid,
+                      windowSize: this.effectiveWindowSize(childText(collectionEl, "WindowSize") ?? requestWindowSize),
+                      moveScanLimit: this.moveScanLimit,
+                      include: filterPredicate(collectionClass, working.filterType),
+                  });
 
-        const totalChanges: number = changes.adds.length + changes.changes.length + changes.deletes.length;
-        if (totalChanges === 0 && responseEntries.length === 0) {
-            return {
-                collectionElement: this.collectionResponse(collectionClass, folderUid, "1", newKey),
-                folderUid,
-                newSyncKey: newKey,
-                rememberedClass: requestedClass,
-            };
-        }
-
-        const upserts: RecoverableBaseEntity[] = [...changes.adds, ...changes.changes];
-        const applicationData: WbxmlElement[] = adapter.toApplicationDataBatch
-            ? await adapter.toApplicationDataBatch(upserts)
-            : await Promise.all(upserts.map(async (item) => await adapter.toApplicationData(item)));
-        const commandElements: WbxmlElement[] = [
-            ...upserts.map((item, i) => this.itemToCommandElement(i < changes.adds.length ? "Add" : "Change", item, applicationData[i])),
-            ...changes.deletes.map((item) =>
-                element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", item.uid)]),
-            ),
-        ];
-
-        return {
-            collectionElement: this.collectionResponse(collectionClass, folderUid, "1", newKey, [
-                ...(changes.moreAvailable ? [element(WbxmlCodePage.AirSync, "MoreAvailable", [])] : []),
-                ...(commandElements.length > 0 ? [element(WbxmlCodePage.AirSync, "Commands", commandElements)] : []),
-                ...(responseEntries.length > 0 ? [element(WbxmlCodePage.AirSync, "Responses", responseEntries)] : []),
-            ]),
+        const newKey = formatSyncKey({ generation: working.generation + 1, watermark: working.cursor.date, uid: working.cursor.uid });
+        await this.saveState(stored, {
+            mailboxUid: ctx.mailboxUid,
+            deviceId: ctx.deviceId,
             folderUid,
-            newSyncKey: newKey,
-            rememberedClass: requestedClass,
-        };
+            collectionClass,
+            syncKey: newKey,
+            cursorDate: working.cursor.date,
+            cursorUid: working.cursor.uid,
+            moveCursorDate: working.moveCursor.date,
+            moveCursorUid: working.moveCursor.uid,
+            serverIds: [...working.serverIds],
+            echoes: Object.fromEntries(working.echoes),
+            filterType: working.filterType,
+            previous: roundRecord(clientSyncKey, base, working, round.clientIds),
+        });
+
+        const upserts = commands.filter((c): c is { kind: "Add" | "Change"; item: any } => c.kind !== "Delete");
+        const applicationData: WbxmlElement[] =
+            upserts.length === 0
+                ? []
+                : adapter.toApplicationDataBatch
+                  ? await adapter.toApplicationDataBatch(upserts.map((c) => c.item))
+                  : await Promise.all(upserts.map(async (c) => await adapter.toApplicationData(c.item)));
+        const commandElements: WbxmlElement[] = commands.map((c) =>
+            c.kind === "Delete"
+                ? element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", c.uid)])
+                : element(WbxmlCodePage.AirSync, c.kind, [
+                      textElement(WbxmlCodePage.AirSync, "ServerId", c.item.uid),
+                      applicationData[upserts.indexOf(c)],
+                  ]),
+        );
+
+        return this.collectionResponse(collectionClass, folderUid, "1", newKey, [
+            ...(moreAvailable ? [element(WbxmlCodePage.AirSync, "MoreAvailable", [])] : []),
+            ...(commandElements.length > 0 ? [element(WbxmlCodePage.AirSync, "Commands", commandElements)] : []),
+            ...(responseEntries.length > 0 ? [element(WbxmlCodePage.AirSync, "Responses", responseEntries)] : []),
+        ]);
     }
 
-    private itemToCommandElement(kind: "Add" | "Change", item: RecoverableBaseEntity, applicationData: WbxmlElement): WbxmlElement {
-        return element(WbxmlCodePage.AirSync, kind, [textElement(WbxmlCodePage.AirSync, "ServerId", item.uid), applicationData]);
+    /** `SyncKey 0`: (re)starts the collection with an empty item set. Per [MS-ASCMD] the response carries only the
+     * new key; the next round reports every item as an `Add`. */
+    private async startCollection(
+        ctx: EasCommandContext,
+        stored: (EasCollectionState & { version: number }) | undefined,
+        folderUid: string,
+        collectionClass: string,
+        filterType: string,
+    ): Promise<WbxmlElement> {
+        const epoch = new Date(0);
+        const newKey = formatSyncKey({ generation: 1, watermark: epoch });
+        await this.saveState(stored, {
+            mailboxUid: ctx.mailboxUid,
+            deviceId: ctx.deviceId,
+            folderUid,
+            collectionClass,
+            syncKey: newKey,
+            cursorDate: epoch,
+            cursorUid: "",
+            moveCursorDate: new Date(Date.now() - MOVE_CURSOR_SLACK_MS),
+            moveCursorUid: "",
+            serverIds: [],
+            echoes: {},
+            filterType,
+            previous: undefined,
+        });
+        return this.collectionResponse(collectionClass, folderUid, "1", newKey);
     }
 
-    /** One client-originated command's outcome: `response` is a `Responses/{Add,Change,Delete}` entry to
-     * include (per MS-ASCMD, always present for `Add`, only present on failure for `Change`/`Delete`);
-     * `writtenAt` is the resulting `dateModified` of whatever was actually written, used to advance the
-     * persisted watermark past this round's own writes (see `handle()`'s own comment on why). */
+    /** Creates or updates the collection's state row. A lost race (another request for the same collection wrote
+     * the row first) is logged rather than failing a request whose side effects already happened - the client's
+     * next request then simply gets Status 3 and re-syncs. */
+    private async saveState(
+        stored: (EasCollectionState & { version: number }) | undefined,
+        values: Omit<EasCollectionState, "uid" | "version" | "dateCreated" | "dateModified">,
+    ): Promise<void> {
+        try {
+            if (stored) {
+                await this.collectionStateRepo!.update({ ...values, uid: stored.uid, version: stored.version } as any, stored, {
+                    ignoreACL: true,
+                    skipPush: true,
+                });
+            } else {
+                await this.collectionStateRepo!.create(new this.collectionStateClass(values), { ignoreACL: true, skipPush: true });
+            }
+        } catch (err: any) {
+            this.logger?.warn(`SyncCommand: failed to save sync state for folder ${values.folderUid}: ${err?.message}`);
+        }
+    }
+
     private addResponseElement(clientId: string | undefined, serverId: string | undefined, status: string): WbxmlElement {
         return element(WbxmlCodePage.AirSync, "Add", [
             ...(clientId ? [textElement(WbxmlCodePage.AirSync, "ClientId", clientId)] : []),
@@ -345,130 +417,135 @@ export abstract class SyncCommand implements EasCommandHandler {
         ]);
     }
 
-    private async applyAdd(
-        ctx: EasCommandContext,
-        adapter: EasCollectionSyncAdapter<any>,
-        repo: RepoUtils<any>,
-        folderUid: string,
-        el: WbxmlElement,
-        getMailbox: () => Promise<Mailbox>,
-    ): Promise<{ response?: WbxmlElement; writtenAt?: Date }> {
-        const clientId = childText(el, "ClientId");
-        const appData = findChild(el, "ApplicationData");
-        // [MS-ASCMD] "Add (Sync)": "The Add element cannot be used to add any non-draft email items from the
-        // client to the server" - this pragmatic subset extends that same Status 6 to every collection whose
-        // adapter has no fromApplicationData at all, rather than special-casing "Email" by name.
-        if (!adapter.fromApplicationData || !appData) {
-            return { response: this.addResponseElement(clientId, undefined, "6") };
-        }
-        // The top-level per-collection READ check (processCollection) only proves the caller can see this
-        // folder - a shared/read-only folder still needs its own CREATE check before anything is written into it.
-        if (!(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.CREATE))) {
-            return { response: this.addResponseElement(clientId, undefined, "6") };
-        }
-        try {
-            const defaults = adapter.newEntityDefaults ? adapter.newEntityDefaults(await getMailbox()) : {};
-            const partial = await adapter.fromApplicationData(appData);
-            const created = await repo.create(
-                { ...defaults, ...partial, mailboxUid: ctx.mailboxUid, folderUid } as any,
-                { ignoreACL: true },
-            );
-            return {
-                response: this.addResponseElement(clientId, created.uid, "1"),
-                writtenAt: created.dateModified,
-            };
-        } catch {
-            // A malformed/invalid item (bad enum value, missing required field like Calendar's OrganizerEmail,
-            // ...) - Status 6 is [MS-ASCMD]'s own designated code for exactly this ("client/server conversion
-            // error... client has sent a malformed or invalid item").
-            return { response: this.addResponseElement(clientId, undefined, "6") };
+    /** Remembers the `dateModified` the device's own write left on `item`, so the write isn't echoed back. */
+    private noteWrite(round: CollectionRound, item: { uid: string; dateModified?: Date | string }): void {
+        round.working.serverIds.add(item.uid);
+        if (item.dateModified !== undefined) {
+            round.working.echoes.set(item.uid, new Date(item.dateModified).toISOString());
         }
     }
 
-    private async applyChange(
-        ctx: EasCommandContext,
-        adapter: EasCollectionSyncAdapter<any>,
-        repo: RepoUtils<any>,
-        folderUid: string,
-        el: WbxmlElement,
-    ): Promise<{ response?: WbxmlElement; writtenAt?: Date }> {
+    private async applyAdd(round: CollectionRound, el: WbxmlElement): Promise<WbxmlElement> {
+        const { ctx, adapter, repo, folder } = round;
+        const clientId = childText(el, "ClientId");
+        const replayed: string | undefined = clientId ? round.retry?.clientIds.get(clientId) : undefined;
+        if (clientId && replayed) {
+            // The first attempt already created the item: answer with it, and treat its current state as the device's own
+            // write so the replayed round doesn't send it back as a Change.
+            const item = await repo.findOne(replayed, { ignoreACL: true });
+            if (item) {
+                this.noteWrite(round, item);
+            }
+            round.clientIds.set(clientId, replayed);
+            return this.addResponseElement(clientId, replayed, "1");
+        }
+        const appData = findChild(el, "ApplicationData");
+        if (!adapter.fromApplicationData || !appData) {
+            return this.addResponseElement(clientId, undefined, "6");
+        }
+        // [MS-ASCMD] "Add (Sync)": a client can only add *draft* email.
+        if (round.collectionClass === "Email" && folder.type !== FolderType.DRAFTS) {
+            return this.addResponseElement(clientId, undefined, "6");
+        }
+        if (!(await this.aclUtils!.hasPermission(ctx.user, folder.uid, ACLAction.CREATE))) {
+            return this.addResponseElement(clientId, undefined, "6");
+        }
+        try {
+            const mailbox = await round.getMailbox();
+            const defaults = adapter.newEntityDefaults ? adapter.newEntityDefaults(mailbox) : {};
+            const partial = await adapter.fromApplicationData(appData, undefined, mailbox);
+            const created = await repo.create(
+                { ...defaults, ...partial, mailboxUid: folder.mailboxUid, folderUid: folder.uid } as any,
+                { ignoreACL: true },
+            );
+            this.noteWrite(round, created);
+            if (clientId) {
+                round.clientIds.set(clientId, created.uid);
+            }
+            return this.addResponseElement(clientId, created.uid, "1");
+        } catch {
+            // Status 6: "the client has sent a malformed or invalid item".
+            return this.addResponseElement(clientId, undefined, "6");
+        }
+    }
+
+    private async applyChange(round: CollectionRound, el: WbxmlElement): Promise<WbxmlElement | undefined> {
+        const { ctx, adapter, repo, folder } = round;
         const serverId = childText(el, "ServerId");
         if (!serverId) {
-            return {};
+            return undefined;
         }
         if (!adapter.fromApplicationData) {
-            return { response: this.statusResponseElement("Change", serverId, "6") };
+            return this.statusResponseElement("Change", serverId, "6");
         }
         const existing = await repo.findOne(serverId, { ignoreACL: true });
-        // A ServerId that resolves to an item outside this (already ACL-verified-for-READ) collection is
-        // reported identically to "doesn't exist" - never reveal that it's real, just filed elsewhere (a
-        // different folder, or another mailbox's entirely). See this class's own doc comment.
-        if (!existing || existing.folderUid !== folderUid) {
-            return { response: this.statusResponseElement("Change", serverId, "8") };
+        // An item outside this (READ-checked) collection is reported identically to "doesn't exist".
+        if (!existing || existing.folderUid !== folder.uid) {
+            return this.statusResponseElement("Change", serverId, "8");
         }
-        if (!(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.UPDATE))) {
-            return { response: this.statusResponseElement("Change", serverId, "6") };
+        if (!(await this.aclUtils!.hasPermission(ctx.user, folder.uid, ACLAction.UPDATE))) {
+            return this.statusResponseElement("Change", serverId, "6");
         }
         const appData = findChild(el, "ApplicationData");
         if (!appData) {
-            return { response: this.statusResponseElement("Change", serverId, "6") };
+            return this.statusResponseElement("Change", serverId, "6");
         }
         try {
-            const partial = await adapter.fromApplicationData(appData, existing);
-            const updated = await repo.update(
-                { uid: existing.uid, version: existing.version, ...partial },
-                existing,
-                { ignoreACL: true },
-            );
-            // Success is silent per [MS-ASCMD]'s own "the client only receives responses for ... failed
-            // changes" rule - no response entry.
-            return { writtenAt: updated.dateModified };
+            const partial = await adapter.fromApplicationData(appData, existing, await round.getMailbox());
+            const updated = await repo.update({ uid: existing.uid, version: existing.version, ...partial }, existing, { ignoreACL: true });
+            this.noteWrite(round, updated);
+            return undefined;
         } catch (err: any) {
             if (err instanceof ApiError && err.code === ApiErrors.INVALID_OBJECT_VERSION) {
-                return { response: this.statusResponseElement("Change", serverId, "7") };
+                return this.statusResponseElement("Change", serverId, "7");
             }
-            return { response: this.statusResponseElement("Change", serverId, "6") };
+            return this.statusResponseElement("Change", serverId, "6");
         }
     }
 
-    private async applyDelete(
-        ctx: EasCommandContext,
-        repo: RepoUtils<any>,
-        folderUid: string,
-        el: WbxmlElement,
-    ): Promise<{ response?: WbxmlElement; writtenAt?: Date }> {
+    private async applyDelete(round: CollectionRound, el: WbxmlElement): Promise<WbxmlElement | undefined> {
+        const { ctx, repo, folder } = round;
         const serverId = childText(el, "ServerId");
         if (!serverId) {
-            return {};
+            return undefined;
         }
         const existing = await repo.findOne(serverId, { ignoreACL: true });
-        // Same "treat as not found" rule applyChange uses - see its own comment.
-        if (!existing || existing.folderUid !== folderUid) {
-            return { response: this.statusResponseElement("Delete", serverId, "8") };
+        if (!existing || existing.folderUid !== folder.uid) {
+            // The retried round already deleted (or moved) this item - the device's retry is already satisfied.
+            if (round.retry?.removedIds.has(serverId)) {
+                round.working.serverIds.delete(serverId);
+                return undefined;
+            }
+            return this.statusResponseElement("Delete", serverId, "8");
         }
-        if (!(await this.aclUtils!.hasPermission(ctx.user, folderUid, ACLAction.DELETE))) {
-            return { response: this.statusResponseElement("Delete", serverId, "6") };
+        if (!(await this.aclUtils!.hasPermission(ctx.user, folder.uid, ACLAction.DELETE))) {
+            return this.statusResponseElement("Delete", serverId, "6");
         }
         try {
-            await repo.delete(existing.uid, { ignoreACL: true });
-            // Re-read the now-soft-deleted row's own `dateModified` (`RecoverableRepoUtils.delete()` stamps it
-            // as part of the delete itself) rather than approximating with a fresh `new Date()` here. A plain
-            // `new Date()` captured after the write resolves is always >= that real timestamp (the delete's own
-            // internal write already completed by the time this line runs) - close enough for THIS row, but
-            // `newWatermark` is folder-wide: if it's inflated even slightly past this row's true write time, it
-            // can also run past a genuinely concurrent, unrelated write to a DIFFERENT message in the same
-            // folder that `computeChanges` already missed (it snapshotted before this Delete ran), permanently
-            // skipping that other change instead of picking it up next round. Falls back to `new Date()` only
-            // if the re-read is unexpectedly empty, which real code paths never hit.
-            const deleted = await repo.findOne(existing.uid, { ignoreACL: true, includeDeleted: true });
-            return { writtenAt: deleted?.dateModified ?? new Date() };
+            if (round.collectionClass === "Email" && round.deletesAsMoves && folder.type !== FolderType.DELETED_ITEMS) {
+                const deletedItems: Folder & { uid: string } = await findOrCreateWellKnownFolder(
+                    this.folderRepo!,
+                    this.folderClass,
+                    folder.mailboxUid,
+                    FolderType.DELETED_ITEMS,
+                    ctx.user,
+                );
+                await repo.update({ uid: existing.uid, version: existing.version, folderUid: deletedItems.uid }, existing, {
+                    ignoreACL: true,
+                    user: ctx.user,
+                });
+            } else {
+                await repo.delete(existing.uid, { ignoreACL: true });
+            }
+            round.working.serverIds.delete(serverId);
+            round.working.echoes.delete(serverId);
+            return undefined;
         } catch {
-            return { response: this.statusResponseElement("Delete", serverId, "6") };
+            return this.statusResponseElement("Delete", serverId, "6");
         }
     }
 
-    /** Builds one `<Collection>` response element - `handle()` collects one of these per request `<Collection>`
-     * and wraps the whole set in a single `<Sync><Collections>`. */
+    /** Builds one `<Collection>` response element. */
     private collectionResponse(
         collectionClass: string | undefined,
         folderUid: string | undefined,

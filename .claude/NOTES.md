@@ -49,6 +49,85 @@ Keep entries terse — this is a reference, not a transcript.
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
 
+### 2026-09-14 (3) — Round-3 review fixes (Sync state redesign, spoofing, DoS bounds, Ping, provisioning)
+
+All 15 findings confirmed against HEAD `9888059` and fixed; nothing skipped. Uncommitted.
+
+**Sync protocol state (findings 1, 2, 6, 9, 15 cursor) - redesigned, not patched.** New model
+`EasCollectionState{Mongo,SQL}` (`@MailboxScopedData`, unique `(mailboxUid, deviceId, folderUid)`, exported from
+`./mongo`/`./sql`, purged by `EasDeviceStateCleanupJob` before the device row) holds one `Sync` collection's key,
+class, `FilterType`, two `(dateModified, uid)` cursors, the exact `serverIds` the device holds, `echoes` (uid ->
+`dateModified` of the device's own write) and `previous` (last round's key + cursors + added/removed delta +
+ClientId -> ServerId list; a list because ClientId is client text, unsafe as a Mongo key). Enumeration lives in `EasCollectionSync.enumerateCollection`:
+- Add vs Change is decided by `serverIds`, never by the old dateCreated≈dateModified heuristic; a deleted row only
+  yields a Delete if the device holds it.
+- Moves: a second stream (same mailbox, `folderUid: ne(folder)`, live + deleted) turns a held item that left the
+  folder into a Delete; read *after* the folder stream so the newer location wins. Skipped (cursor fast-forwarded
+  to now-60s) while the device holds nothing, so the first scan never crawls mailbox history. Gap: an item moved to
+  a *different mailbox* via REST isn't seen (MoveItems now refuses that, see 12).
+- Client commands are applied first; their writes are recorded as echoes and skipped when enumerated with an
+  unchanged `dateModified`. Cursors only ever advance past rows actually processed (window-limited), so the old
+  "watermark jumps past unsent changes" bug is structurally gone.
+- `scanAfter` uses `$or: [dateModified gt, dateModified range(=) + uid gt]` sorted by `{dateModified, uid}` -
+  confirmed both query builders support `$or` and JSON sort strings.
+- Retry: `previous.syncKey` is accepted; state is rebuilt from `previous` (serverIds minus added plus removed), a
+  replayed ClientId Add returns the stored ServerId (its current row is noted as an echo so it isn't sent back as a
+  Change), a Delete of an id that round removed is silent.
+- Separate rows also end cross-folder contention. `persistDeviceSyncState` now re-reads + re-applies (function
+  patches merge `folderSyncKeys`) on `INVALID_OBJECT_VERSION`, 5 attempts; `lastSyncAt` failures are logged only.
+  A lost race on the collection row itself is logged (client gets Status 3 next round) instead of a 409.
+- **Migration**: existing devices' Sync keys in `DeviceSyncState.folderSyncKeys[folderUid]` are no longer read -
+  the first Sync after upgrade answers Status 3 and the client re-syncs from SyncKey 0 (spec-sanctioned).
+  `folderCollectionClasses` is now unused (kept so rows load). FolderSync still uses `folderSyncKeys["$foldersync"]`;
+  its key may now carry `#uid`. New collection needs no index migration beyond the entity's own `@Index`.
+
+**Other fixes**
+- 3: `WbxmlDecoder` caps elements 50k / children 10k / depth 64, bounds-checks OPAQUE and string-table lengths,
+  throws `WbxmlDecodeError`/`WbxmlLimitError` -> HTTP 400. service-core has no per-route body limit (confirmed:
+  only global `max_body_size`), so `BaseEasRoute` rejects `mail:eas:max_request_bytes` (16 MB) by Content-Length or
+  rawBody length with 413.
+- 4: ComposeMail requires every `From` and any `Sender` to be the mailbox's primary/alias (403), caps envelope at
+  500 (400), strips `Bcc` (with folds) from the relayed copy only (`stripHeader`). Calendar Add organizer must be
+  own address, else primary; a Change never reassigns organizer (attendee copies keep the real organizer).
+- 5: Ping (done by a sub-agent, reviewed): one shared subscriber per Redis URL with per-listener
+  subscribe/unsubscribe, one active Ping per (mailbox, device), `ctx.res.onFinish` cancels (new optional `res` on
+  `EasCommandContext`), Status 6 + `MaxFolders` over `mail:eas:ping_max_folders` (300), ACL checks in chunks of 25,
+  no-Redis waits the heartbeat.
+- 7: FolderSync SyncKey 0 returns every folder as Add (all pages) with the new key; later rounds classify by
+  creation time vs cursor (created after -> Add, deleted-and-created-after -> skipped).
+- 8: remote-wipe request clears `policyKey`; any Provision request while a wipe is pending gets the directive;
+  unsolicited wipe ack is Status 2; `BaseEasRoute` requires `X-MS-PolicyKey` (or `PolicyKey` query) == stored key for
+  everything but Provision/Settings (449). Route tests send the header via a `policyKeyOf()` helper.
+- 10: Calendar Change keeps attendee fields the device didn't send and the series' exceptions; bumps `sequence` on
+  time/location/attendee/recurrence change (normalized compare - SQL `null` vs Mongo `undefined`); DayOfMonth/
+  MonthOfYear fallback computed in the event's timezone (`localDayAndMonth`, UTC fallback).
+- 11: `Flag` container (`FlagStatus` token) both ways; `DeletesAsMoves` (default true -> Deleted Items via
+  `findOrCreateWellKnownFolder`, hard delete inside Deleted Items or with `0`); `FilterType` (Email 1-5 receivedDate,
+  Calendar 4-7 endDate/recurring, Tasks 8 incomplete) applied to Adds only - a changed FilterType answers Status 3
+  (simplest spec-plausible choice: items aging out of the window are not soft-deleted); `WindowSize` (collection then
+  request level) capped by config and 512; `GetChanges 0` honoured.
+- 12: MoveItems rejects a destination outside the message's own mailbox; Sync Add uses the folder's `mailboxUid`;
+  Email Add only in Drafts (Status 6); a new Draft always gets a body blob.
+- 13: `WbxmlEncoder` builds a `Buffer[]` with one concat (+ optional `maxBytes`); ItemOperations caps embedded
+  content at `mail:eas:itemoperations_max_response_bytes` (64 MB) -> that Fetch gets Status 11 (attachments
+  pre-checked by `sizeBytes`, re-checked after load).
+- 14: GetItemEstimate uses the collection row (dry-run of the same enumeration), falls back to remembered class then
+  folder type. MeetingResponse processes every `Request` (<=100) with per-Result Status (2 invalid/denied/not found,
+  3 write failure), accepts an Inbox meeting-request Message uid (READ on its folder, `text/calendar` UID ->
+  caller's own event, series master preferred), decline deletes only with DELETE (else records DECLINED), and mails
+  an iTIP REPLY (restapi `buildEventIcs`; `respond()`'s mailer isn't exported) only when `SendResponse` is present
+  (16.x semantics - 14.x clients send their own reply, so no duplicate).
+- 15: Sync caps 300 collections (top Status 4) / 512 commands per collection (collection Status 4); MoveItems caps
+  500 (400); SmartReply/Forward flag flip needs UPDATE and is best-effort after send; attachment Fetch checks READ on
+  the message's current folder.
+- Manifest gained `mail:eas:max_request_bytes`, `mail:eas:ping_max_folders`,
+  `mail:eas:itemoperations_max_response_bytes`.
+
+**Test notes**: `test/EasCollectionSync.test.ts` (fake repo evaluating the real query shapes), rewritten
+`SyncCommand.test.ts`/`MeetingResponseCommand.test.ts`, a "Round-3 protocol fixes (end to end)" block in both route
+files. Full-suite runs intermittently failed with 404/ECONNRESET/204 while *other repos'* vitest runs (restapi) were
+active - they share mongo port 9999 / HTTP 3737; rerun when those finish (each file passes alone).
+
 ### 2026-09-14 (2) — Round-2 review fixes (remote-wipe purge, ResolveRecipients DoS/status, labelUids, Draft-only body)
 
 Each finding was confirmed in code first. Not committed; no version or peerDependency changes.

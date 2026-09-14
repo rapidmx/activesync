@@ -14,6 +14,7 @@ import { In, Repository } from "typeorm";
 import config from "../../config.sql.js";
 import { EasDeviceStateCleanupJobSQL } from "../../../src/jobs/sql/EasDeviceStateCleanupJobSQL.js";
 import { DeviceSyncStateSQL } from "../../../src/models/sql/DeviceSyncStateSQL.js";
+import { EasCollectionStateSQL } from "../../../src/models/sql/EasCollectionStateSQL.js";
 
 const DEVICE_TTL_DAYS = 90; // matches mail:jobs:eas_device_cleanup:device_ttl_days in test/config.ts
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -23,6 +24,7 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
     let objectFactory: ObjectFactory;
     let connectionManager: ConnectionManager;
     let job: EasDeviceStateCleanupJobSQL;
+    let collectionStateRepo: Repository<EasCollectionStateSQL>;
     let deviceSyncStateRepo: Repository<DeviceSyncStateSQL>;
 
     const createDevice = async (data?: Partial<DeviceSyncStateSQL>): Promise<DeviceSyncStateSQL> => {
@@ -49,6 +51,7 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
         // throws "No metadata found" from `getRepository()` for any entity not explicitly in this map.
         models.set("AccessControlListSQL", AccessControlListSQL);
         models.set("DeviceSyncStateSQL", DeviceSyncStateSQL);
+        models.set("EasCollectionStateSQL", EasCollectionStateSQL);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("sql");
@@ -56,6 +59,7 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
             throw new Error("Could not find sql connection");
         }
         deviceSyncStateRepo = conn.getRepository(DeviceSyncStateSQL);
+        collectionStateRepo = conn.getRepository(EasCollectionStateSQL);
 
         // Constructed once via real ObjectFactory DI: `@Init` builds its one real `RepoUtils` against the live
         // connection above.
@@ -68,6 +72,7 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
 
     beforeEach(async () => {
         await deviceSyncStateRepo.clear();
+        await collectionStateRepo.clear();
         // Restore the job's batch size to the configured default between tests, in case a test overrode it.
         (job as any).batchSize = config.get("mail:jobs:eas_device_cleanup:batch_size") ?? 500;
     });
@@ -183,5 +188,32 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
         const goodFound = await deviceSyncStateRepo.findOne({ where: { uid: goodDevice.uid } });
         expect(badFound).not.toBeNull();
         expect(goodFound).toBeNull();
+    });
+    it("Purges a forgotten device's per-collection Sync state (in batches), leaving other devices' state alone.", async () => {
+        (job as any).batchSize = 2;
+        const stale = await createDevice({ lastSyncAt: new Date(Date.now() - (DEVICE_TTL_DAYS + 5) * DAY_MS) });
+        const recent = await createDevice({ lastSyncAt: new Date() });
+        const collection = (device: DeviceSyncStateSQL, folderUid: string) =>
+            collectionStateRepo.save(
+                new EasCollectionStateSQL({ mailboxUid: device.mailboxUid, deviceId: device.deviceId, folderUid, collectionClass: "Email", syncKey: "1:x" }) as any,
+            );
+        for (const folderUid of ["f1", "f2", "f3"]) {
+            await collection(stale, folderUid);
+        }
+        await collection(recent, "f1");
+
+        await job.run();
+
+        expect(await collectionStateRepo.count({ where: { deviceId: stale.deviceId } })).toBe(0);
+        expect(await collectionStateRepo.count({ where: { deviceId: recent.deviceId } })).toBe(1);
+    });
+
+    it("Logs a warning and keeps a device whose collection state couldn't be purged, so the next run retries it.", async () => {
+        const stale = await createDevice({ lastSyncAt: new Date(Date.now() - (DEVICE_TTL_DAYS + 5) * DAY_MS) });
+        vi.spyOn((job as any).collectionStateRepo, "find").mockRejectedValueOnce(new Error("simulated collection state failure"));
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        expect(await deviceSyncStateRepo.findOne({ where: { uid: stale.uid } })).not.toBeNull();
     });
 });

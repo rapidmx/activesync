@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { JWTUser } from "@rapidrest/core";
-import type { HttpRequest, RepoUtils } from "@rapidrest/service-core";
+import type { HttpRequest, HttpResponse, RepoUtils } from "@rapidrest/service-core";
 import type { WbxmlElement } from "./codec/WbxmlElement.js";
 import type { DeviceSyncState } from "./models/DeviceSyncState.js";
 
@@ -23,9 +23,9 @@ export interface EasCommandContext {
     readonly deviceId: string;
     /** The client-supplied `?DeviceType=` query value (e.g. `iPhone`, `Android`). */
     readonly deviceType: string;
-    /** The client-supplied `?PolicyKey=` query value, if present - the provisioning policy key the device is
-     * currently operating under. Not yet validated against `deviceSyncState.policyKey` here (deferred to
-     * `ProvisionCommand`'s own implementation); handlers that care should compare it themselves for now. */
+    /** The policy key the device presented (`X-MS-PolicyKey` header, else the `?PolicyKey=` query value). For every
+     * command except `Provision`/`Settings`, `BaseEasRoute` has already refused the request unless this equals the
+     * stored `deviceSyncState.policyKey`. */
     readonly policyKey?: string;
     /** This device's persisted sync/provisioning state, looked up (or newly created) by `BaseEasRoute` before
      * dispatch. Handlers read/write cursor and provisioning fields on this directly. */
@@ -46,6 +46,9 @@ export interface EasCommandContext {
     /** The raw underlying HTTP request, for the rare handler that needs something this context doesn't
      * already surface (e.g. a header). */
     readonly req: HttpRequest;
+    /** The underlying HTTP response, when dispatched over HTTP - `PingCommand` registers `onFinish()` on it so a
+     * long-poll stops waiting as soon as the client disconnects. Optional so isolated handler tests can omit it. */
+    readonly res?: HttpResponse;
 }
 
 /**

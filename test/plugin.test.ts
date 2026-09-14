@@ -34,6 +34,7 @@ describe("plugin entry points", () => {
             [`EasRoute${suffix}`]: "route /Microsoft-Server-ActiveSync",
             [`DeviceSyncStateRoute${suffix}`]: "route /api/mail/devices",
             [`DeviceSyncState${suffix}`]: `model ${datastore}`,
+            [`EasCollectionState${suffix}`]: `model ${datastore}`,
             [`EasDeviceStateCleanupJob${suffix}`]: "job",
         });
     });

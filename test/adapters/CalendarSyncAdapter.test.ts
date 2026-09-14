@@ -7,8 +7,8 @@
 // fromApplicationData's own ghosting/error-path edge cases - see the identical rationale in
 // ContactsSyncAdapter.test.ts.
 import { WbxmlCodePage } from "../../src/codec/WbxmlCodePages.js";
-import { element, textElement, type WbxmlElement } from "../../src/codec/WbxmlElement.js";
-import { CalendarSyncAdapter } from "../../src/adapters/CalendarSyncAdapter.js";
+import { childText, element, findChild, textElement, type WbxmlElement } from "../../src/codec/WbxmlElement.js";
+import { CalendarSyncAdapter, localDayAndMonth } from "../../src/adapters/CalendarSyncAdapter.js";
 import { AttendeeResponseStatus, AttendeeRole, BusyStatus, RecipientType, RecurrenceFrequency } from "@rapidmx/restapi";
 
 const adapter = new CalendarSyncAdapter();
@@ -201,4 +201,133 @@ describe("CalendarSyncAdapter Tests", () => {
             expect(a.icalUid).not.toBe(b.icalUid);
         });
     });
+
+    describe("organizer (with the caller's mailbox)", () => {
+        const mailbox: any = { primarySmtpAddress: "me@example.com", aliasAddresses: ["alias@example.com"], displayName: "Me" };
+
+        it("Keeps an OrganizerEmail that is one of the mailbox's own addresses on an Add.", () => {
+            const partial = adapter.fromApplicationData(appData([cal("OrganizerEmail", "Alias@example.com")]), undefined, mailbox);
+            expect(partial.organizer).toEqual({ address: "Alias@example.com", displayName: "Me", type: RecipientType.TO });
+            const named = adapter.fromApplicationData(appData([cal("OrganizerEmail", "me@example.com"), cal("OrganizerName", "Boss Me")]), undefined, mailbox);
+            expect(named.organizer?.displayName).toBe("Boss Me");
+        });
+
+        it("Replaces a foreign or missing OrganizerEmail with the mailbox's primary address on an Add.", () => {
+            const spoofed = adapter.fromApplicationData(appData([cal("OrganizerEmail", "ceo@example.com"), cal("OrganizerName", "CEO")]), undefined, mailbox);
+            expect(spoofed.organizer).toEqual({ address: "me@example.com", displayName: "Me", type: RecipientType.TO });
+            const missing = adapter.fromApplicationData(appData([cal("Subject", "x")]), undefined, { ...mailbox, aliasAddresses: undefined });
+            expect(missing.organizer?.address).toBe("me@example.com");
+        });
+
+        it("Never reassigns the organizer on a Change.", () => {
+            const existing: any = { ...baseEvent(), organizer: { address: "boss@example.com", type: RecipientType.TO } };
+            const partial = adapter.fromApplicationData(appData([cal("OrganizerEmail", "me@example.com")]), existing, mailbox);
+            expect("organizer" in partial).toBe(false);
+        });
+    });
+
+    describe("Change merging", () => {
+        it("Keeps an existing attendee's unsent fields and marks a new attendee with defaults.", () => {
+            const existing: any = {
+                ...baseEvent(),
+                attendees: [
+                    { address: "Pat@example.com", displayName: "Pat", role: AttendeeRole.OPTIONAL, responseStatus: AttendeeResponseStatus.ACCEPTED, isOrganizer: true },
+                ],
+            };
+            const el = appData([
+                element(WbxmlCodePage.Calendar, "Attendees", [
+                    element(WbxmlCodePage.Calendar, "Attendee", [cal("Email", "pat@example.com")]),
+                    element(WbxmlCodePage.Calendar, "Attendee", [cal("Email", "new@example.com")]),
+                ]),
+            ]);
+
+            const partial = adapter.fromApplicationData(el, existing);
+
+            expect(partial.attendees).toEqual([
+                { address: "pat@example.com", displayName: "Pat", role: AttendeeRole.OPTIONAL, responseStatus: AttendeeResponseStatus.ACCEPTED, isOrganizer: true },
+                { address: "new@example.com", displayName: undefined, role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
+            ]);
+            // A new attendee is a scheduling change.
+            expect(partial.sequence).toBe(4);
+        });
+
+        it("Keeps the series' existing exceptions when the recurrence is rebuilt, bumping sequence only when the rule changed.", () => {
+            const exceptions = [new Date("2026-02-02T09:00:00.000Z")];
+            const existing: any = {
+                ...baseEvent(),
+                recurrenceRule: { freq: RecurrenceFrequency.WEEKLY, interval: 1, byDay: ["MO"], exceptions },
+            };
+            const same = adapter.fromApplicationData(appData([element(WbxmlCodePage.Calendar, "Recurrence", [cal("Type", "1"), cal("DayOfWeek", "2")])]), existing);
+            expect(same.recurrenceRule?.exceptions).toBe(exceptions);
+            expect("sequence" in same).toBe(false);
+
+            const changed = adapter.fromApplicationData(appData([element(WbxmlCodePage.Calendar, "Recurrence", [cal("Type", "1"), cal("DayOfWeek", "4")])]), existing);
+            expect(changed.sequence).toBe(4);
+
+            const added = adapter.fromApplicationData(appData([element(WbxmlCodePage.Calendar, "Recurrence", [cal("Type", "0"), cal("Until", "20260301T000000Z")])]), baseEvent());
+            expect(added.recurrenceRule?.exceptions).toEqual([]);
+            expect(added.sequence).toBe(4);
+        });
+
+        it("Bumps sequence for a time or location change, but not for a subject/reminder-only change or an identical value.", () => {
+            const existing: any = baseEvent();
+            expect(adapter.fromApplicationData(appData([cal("StartTime", "20260101T090000Z")]), existing).sequence).toBe(4);
+            expect(adapter.fromApplicationData(appData([cal("EndTime", "20260101T120000Z")]), existing).sequence).toBe(4);
+            expect(adapter.fromApplicationData(appData([cal("Location", "Room 9")]), existing).sequence).toBe(4);
+            expect(adapter.fromApplicationData(appData([cal("Location", "")]), { ...existing, location: null }).sequence).toBeUndefined();
+            expect(adapter.fromApplicationData(appData([cal("Subject", "Renamed"), cal("Reminder", "5")]), existing).sequence).toBeUndefined();
+            expect(
+                adapter.fromApplicationData(appData([cal("StartTime", "20260101T100000Z"), cal("EndTime", "20260101T110000Z"), cal("Location", "Room 1")]), existing)
+                    .sequence,
+            ).toBeUndefined();
+            expect(adapter.fromApplicationData(appData([cal("StartTime", "20260101T090000Z")]), { ...existing, sequence: undefined }).sequence).toBe(1);
+        });
+
+        it("Treats removing all attendees as a scheduling change, and matching attendees as none.", () => {
+            const attendee = { address: "a@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false };
+            const existing: any = { ...baseEvent(), attendees: [attendee] };
+            expect(adapter.fromApplicationData(appData([element(WbxmlCodePage.Calendar, "Attendees", [])]), existing).sequence).toBe(4);
+            const same = appData([element(WbxmlCodePage.Calendar, "Attendees", [element(WbxmlCodePage.Calendar, "Attendee", [cal("Email", "a@example.com")])])]);
+            expect(adapter.fromApplicationData(same, existing).sequence).toBeUndefined();
+            expect(adapter.fromApplicationData(same, { ...existing, attendees: undefined }).sequence).toBe(4);
+        });
+    });
+
+    describe("toApplicationData recurrence day/month fallback", () => {
+        it("Derives DayOfMonth/MonthOfYear from the start date in the event's own timezone.", () => {
+            // 2026-01-01T02:00Z is still 31 December in New York.
+            const event: any = {
+                ...baseEvent(),
+                startDate: new Date("2026-01-01T02:00:00.000Z"),
+                timezone: "America/New_York",
+                recurrenceRule: { freq: RecurrenceFrequency.YEARLY, interval: 1, exceptions: [] },
+            };
+            const recurrence = findChild(adapter.toApplicationData(event), "Recurrence")!;
+            expect(childText(recurrence, "DayOfMonth")).toBe("31");
+            expect(childText(recurrence, "MonthOfYear")).toBe("12");
+        });
+
+        it("Falls back to UTC for a timezone Intl doesn't recognize.", () => {
+            expect(localDayAndMonth(new Date("2026-01-01T02:00:00.000Z"), "Not/AZone")).toEqual({ day: 1, month: 1 });
+            expect(localDayAndMonth(new Date("2026-07-04T12:00:00.000Z"), "UTC")).toEqual({ day: 4, month: 7 });
+        });
+    });
 });
+
+function baseEvent(): any {
+    return {
+        uid: "event-1",
+        version: 1,
+        title: "Existing",
+        location: "Room 1",
+        startDate: new Date("2026-01-01T10:00:00.000Z"),
+        endDate: new Date("2026-01-01T11:00:00.000Z"),
+        allDay: false,
+        timezone: "UTC",
+        dateModified: new Date("2026-01-01T00:00:00.000Z"),
+        busyStatus: BusyStatus.BUSY,
+        organizer: { address: "me@example.com", type: RecipientType.TO },
+        attendees: [],
+        sequence: 3,
+    };
+}

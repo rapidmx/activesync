@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ObjectDecorators } from "@rapidrest/core";
-import { ACLAction, ACLUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { ApiError, ObjectDecorators } from "@rapidrest/core";
+import { ACLAction, ACLUtils, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import type { Folder, Message } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
@@ -17,9 +17,13 @@ const { Init, Inject } = ObjectDecorators;
 const STATUS_SUCCESS = "1";
 const STATUS_FAILURE = "3";
 
+/** Most `Move` elements one `MoveItems` request may carry - more is rejected with HTTP 400. */
+export const MAX_MOVES_PER_REQUEST = 500;
+
 /**
  * Handles the standalone EAS `MoveItems` command: moves one or more `Message`s between folders in the caller's
- * own mailbox by `ServerId`/`uid`.
+ * own mailbox by `ServerId`/`uid`. A move never crosses mailboxes (the destination folder must belong to the
+ * message's own mailbox) and a request may carry at most `MAX_MOVES_PER_REQUEST` moves.
  *
  * **Pragmatic subset**: `Message` only - `Contacts`/`Calendar`/`Tasks` moves are rare in practice (unlike
  * `Message`, whose Inbox-to-subfolder filing is a real, common client action) and would each need their own
@@ -60,6 +64,9 @@ export abstract class MoveItemsCommand implements EasCommandHandler {
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
         const moveEls = ctx.request ? findChildren(ctx.request, "Move") : [];
+        if (moveEls.length > MAX_MOVES_PER_REQUEST) {
+            throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `MoveItems supports at most ${MAX_MOVES_PER_REQUEST} Move elements per request.`);
+        }
         const responses: WbxmlElement[] = [];
         for (const moveEl of moveEls) {
             responses.push(await this.moveOne(ctx, moveEl));
@@ -89,7 +96,9 @@ export abstract class MoveItemsCommand implements EasCommandHandler {
         }
 
         const destFolder: Folder | undefined = await this.folderRepo!.findOne(dstFldId, { ignoreACL: true });
-        if (!destFolder || destFolder.mailboxUid !== ctx.mailboxUid) {
+        // A message never changes mailbox by moving: its `mailboxUid` (quota, retention, search scoping) must keep
+        // matching its folder's mailbox, so a destination in any other mailbox is refused.
+        if (!destFolder || destFolder.mailboxUid !== message.mailboxUid) {
             return this.responseElement(srcMsgId, STATUS_FAILURE, undefined);
         }
 

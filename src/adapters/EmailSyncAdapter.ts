@@ -37,6 +37,9 @@ const IMPORTANCE_BY_CODE: Record<string, MessageImportance> = {
 /** MS-ASAIRSYNCBASE `Body.Type`: 1 = plain text, 2 = HTML, 3 = RTF, 4 = MIME. */
 const BODY_TYPE_PLAIN_TEXT = "1";
 
+/** MS-ASEMAIL `Flag/Status` value for an active (flagged, not completed) follow-up flag. */
+const FLAG_STATUS_ACTIVE = "2";
+
 /** Max label uids per `in(...)` lookup - well under `RepoUtils.find()`'s 1000-row page cap. */
 const LABEL_LOOKUP_CHUNK = 500;
 
@@ -61,7 +64,12 @@ function labelKey(mailboxUid: string, labelUid: string): string {
  * the only `Email` write EAS itself allows) - a plain-text-only pragmatic subset: no HTML body, no attachments
  * (mirrors `ComposeMailCommand`'s own already-documented attachment gap). `To`/`Cc`/`Bcc` (the latter MS-ASEMAIL2's
  * own `Bcc` tag) are ghosted independently per recipient type, not as one combined group - a `Change` touching
- * only one of them leaves the others untouched, carried over from `existing.recipients`.
+ * only one of them leaves the others untouched, carried over from `existing.recipients`. A new Draft always gets a body
+ * blob (empty when no `Body` was sent), so `ItemOperations` can fetch it like any other message.
+ *
+ * `Flag` is the MS-ASEMAIL container form in both directions: `<Flag><Status>2</Status></Flag>` (tokenized as
+ * `FlagStatus`) for a flagged message, an empty `<Flag/>` otherwise; `Status` 0/1 (cleared/complete) or an empty
+ * `Flag` from the device clears `flags.flagged`.
  *
  * Emits MS-ASEMAIL2's `Email2:ConversationId` (read-only - no `fromApplicationData` handling, since EAS itself
  * never lets a client set it) whenever `Message.conversationId` is populated, so a device's threaded-view UI can
@@ -146,7 +154,8 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
             textElement(WbxmlCodePage.Email, "DateReceived", message.receivedDate.toISOString()),
             textElement(WbxmlCodePage.Email, "Importance", IMPORTANCE_CODES[message.importance]),
             textElement(WbxmlCodePage.Email, "Read", message.flags.read ? "1" : "0"),
-            textElement(WbxmlCodePage.Email, "Flag", message.flags.flagged ? "1" : "0"),
+            // MS-ASEMAIL `Flag` is a container: `<Flag><Status>2</Status></Flag>` (active) or an empty `<Flag/>`.
+            element(WbxmlCodePage.Email, "Flag", message.flags.flagged ? [textElement(WbxmlCodePage.Email, "FlagStatus", FLAG_STATUS_ACTIVE)] : []),
             element(WbxmlCodePage.AirSyncBase, "Body", [
                 textElement(WbxmlCodePage.AirSyncBase, "Type", BODY_TYPE_PLAIN_TEXT),
                 textElement(WbxmlCodePage.AirSyncBase, "EstimatedDataSize", String(Buffer.byteLength(message.bodyPreview, "utf8"))),
@@ -215,7 +224,7 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
      * for every consumer, not just this write path - a Draft created/edited via `Sync` must `Fetch` correctly
      * the same way any other message does.
      */
-    public async fromApplicationData(el: WbxmlElement, existing?: Message): Promise<Partial<Message>> {
+    public async fromApplicationData(el: WbxmlElement, existing?: Message, mailbox?: Mailbox): Promise<Partial<Message>> {
         const partial: Partial<Message> = {};
 
         const subject = childText(el, "Subject");
@@ -248,18 +257,23 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
         }
 
         const read = childText(el, "Read");
-        const flag = childText(el, "Flag");
+        // `Flag` is a container whose `Status` (tokenized as `FlagStatus`) is 0 = cleared, 1 = complete, 2 = active;
+        // an empty `<Flag/>` clears the flag.
+        const flagEl = findChild(el, "Flag");
+        const flag: string | undefined = flagEl ? (childText(flagEl, "FlagStatus") ?? "0") : undefined;
         if (read !== undefined || flag !== undefined) {
             const baseFlags = existing?.flags ?? { read: false, flagged: false, answered: false, forwarded: false };
             partial.flags = {
                 ...baseFlags,
                 ...(read !== undefined ? { read: read === "1" } : {}),
-                ...(flag !== undefined ? { flagged: flag === "1" } : {}),
+                ...(flag !== undefined ? { flagged: flag === FLAG_STATUS_ACTIVE } : {}),
             };
         }
 
         const bodyEl = findChild(el, "Body");
-        if (bodyEl) {
+        // A new Draft always gets a body blob (empty when the device sent no Body) - every consumer of
+        // `bodyBlobKey` (`ItemOperations` Fetch, exports) expects it to resolve to real MIME.
+        if (bodyEl || !existing) {
             // [MS-ASCMD]/[MS-ASEMAIL] only let a client change the body of a Draft. Any other message's blob is its
             // original MIME - evidence a retention/legal hold may depend on, and possibly shared with other rows
             // (an inbox-rule copy reuses the delivered message's `bodyBlobKey`) - so a Change is refused (the
@@ -267,13 +281,13 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
             if (existing && !(await this.isDraft(existing))) {
                 throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Only a Draft's body can be changed.");
             }
-            const text = childText(bodyEl, "Data") ?? "";
+            const text = (bodyEl && childText(bodyEl, "Data")) ?? "";
             // Always a fresh key, never an overwrite of `existing.bodyBlobKey`: an existing blob may be shared, and
             // leaving it intact means a Change that then fails its version check can't corrupt the stored body.
             const bodyBlobKey = `bodies/${crypto.randomUUID()}`;
             const mime = buildPlainTextMime({
                 subject: partial.subject ?? existing?.subject ?? "",
-                from: existing?.from,
+                from: existing?.from ?? (mailbox ? { address: mailbox.primarySmtpAddress, displayName: mailbox.displayName, type: RecipientType.TO } : undefined),
                 recipients: partial.recipients ?? existing?.recipients ?? [],
                 date: existing?.sentDate ?? new Date(),
                 text,

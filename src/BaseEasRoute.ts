@@ -12,14 +12,14 @@ import {
     RepoUtils,
     RouteDecorators,
 } from "@rapidrest/service-core";
-import { WbxmlDecoder } from "./codec/WbxmlDecoder.js";
+import { WbxmlDecodeError, WbxmlDecoder } from "./codec/WbxmlDecoder.js";
 import { WbxmlEncoder } from "./codec/WbxmlEncoder.js";
 import type { WbxmlElement } from "./codec/WbxmlElement.js";
 import type { EasCommandHandler } from "./EasCommandHandler.js";
 import { persistDeviceSyncState } from "./EasSyncKeyUtils.js";
 import { Mailbox, resolveCallerMailboxUid } from "@rapidmx/restapi";
 import { DeviceSyncState } from "./models/DeviceSyncState.js";
-const { Init, Logger } = ObjectDecorators;
+const { Config, Init, Logger } = ObjectDecorators;
 const { Auth, Options, Post, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** HTTP 449 ("Retry With") is not a standard HTTP status, but is the long-established Exchange ActiveSync
@@ -40,6 +40,13 @@ const HTTP_STATUS_RETRY_WITH = 449;
  * between 14.1 and 16.1 outside `Oof`/IRM. Ascending, matching the order Microsoft's own spec lists them in. */
 const MS_AS_PROTOCOL_VERSIONS = "14.0,14.1,16.0,16.1";
 
+/** Default `mail:eas:max_request_bytes` - comfortably above a real device's largest request (a `SendMail` with
+ * attachments), far below the host-wide body limit. The WBXML decoder's own element limits bound memory further. */
+const DEFAULT_MAX_REQUEST_BYTES = 16 * 1024 * 1024;
+
+/** Commands a device may send before it is provisioned (and without a policy key). */
+const COMMANDS_WITHOUT_PROVISIONING = new Set(["Provision", "Settings"]);
+
 function firstQueryValue(value: string | string[] | undefined): string | undefined {
     return Array.isArray(value) ? value[0] : value;
 }
@@ -57,10 +64,11 @@ function firstQueryValue(value: string | string[] | undefined): string | undefin
  * deliberately does not implement itself — see the architecture plan's "Auth" section for the full reasoning
  * behind this choice over a per-request Basic Auth strategy.
  *
- * **Dispatch flow**: resolve the caller's own `Mailbox` (never a client-supplied one — `resolveCallerMailboxUid`,
- * the same helper `BaseSearchRoute` already uses), find-or-create that (mailbox, device) pair's
- * `DeviceSyncState`, enforce the provisioning gate, decode the WBXML request body (if any), dispatch to the
- * matching registered `EasCommandHandler`, bump `lastSyncAt`, and encode the handler's response back to WBXML.
+ * **Dispatch flow**: reject a body over `mail:eas:max_request_bytes` (413), resolve the caller's own `Mailbox` (never
+ * a client-supplied one — `resolveCallerMailboxUid`), find-or-create that (mailbox, device) pair's `DeviceSyncState`,
+ * enforce the provisioning gate (provisioned *and* presenting the stored policy key, else 449), decode the WBXML
+ * request body (if any; malformed or over the decoder's element limits -> 400), dispatch to the matching registered
+ * `EasCommandHandler`, record `lastSyncAt` (best-effort), and encode the handler's response back to WBXML.
  *
  * **Command handlers** are supplied via `commandHandlerClasses` (empty by default — this class alone is just
  * the transport skeleton; concrete command support, e.g. `ProvisionCommand`/`FolderSyncCommand`, is added
@@ -95,6 +103,10 @@ export abstract class BaseEasRoute<D extends DeviceSyncState, M extends Mailbox 
     private deviceSyncStateRepo?: RepoUtils<D>;
     private mailboxRepo?: RepoUtils<M>;
     private readonly handlers = new Map<string, EasCommandHandler>();
+
+    /** Largest request body `dispatch()` accepts (HTTP 413 beyond it). */
+    @Config("mail:eas:max_request_bytes", DEFAULT_MAX_REQUEST_BYTES)
+    private maxRequestBytes: number = DEFAULT_MAX_REQUEST_BYTES;
 
     @Logger
     private logger: any;
@@ -149,6 +161,14 @@ export abstract class BaseEasRoute<D extends DeviceSyncState, M extends Mailbox 
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
 
+        // service-core has no per-route body limit, so the host-wide `max_body_size` still bounds how much was
+        // read; this rejects anything beyond the (much lower) EAS limit before any decoding or database work.
+        const declaredLength = Number(firstQueryValue(req.headers["content-length"]));
+        if ((Number.isFinite(declaredLength) && declaredLength > this.maxRequestBytes) || (req.rawBody?.length ?? 0) > this.maxRequestBytes) {
+            res.status(413).send();
+            return;
+        }
+
         const mailboxUid: string | undefined = await resolveCallerMailboxUid(this.mailboxRepo, user);
         if (!mailboxUid) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
@@ -158,10 +178,16 @@ export abstract class BaseEasRoute<D extends DeviceSyncState, M extends Mailbox 
 
         // Every command except the two that must work on an unprovisioned device (Provision itself, and
         // Settings - real clients query Settings/DeviceInformation as part of first-run setup, before
-        // provisioning completes) requires the device to have already been provisioned.
-        if (!deviceSyncState.provisioned && cmd !== "Provision" && cmd !== "Settings") {
-            res.status(HTTP_STATUS_RETRY_WITH).send();
-            return;
+        // provisioning completes) requires the device to be provisioned AND to present the policy key it
+        // acknowledged ([MS-ASPROV]: `X-MS-PolicyKey`, or the `PolicyKey` query value). A missing or stale key -
+        // e.g. one from before an admin-requested remote wipe, which clears the stored key - is sent back through
+        // Provision with the same 449 rather than being served.
+        if (!COMMANDS_WITHOUT_PROVISIONING.has(cmd)) {
+            const presentedKey: string | undefined = firstQueryValue(req.headers["x-ms-policykey"]) ?? policyKey;
+            if (!deviceSyncState.provisioned || !deviceSyncState.policyKey || presentedKey !== deviceSyncState.policyKey) {
+                res.status(HTTP_STATUS_RETRY_WITH).send();
+                return;
+            }
         }
 
         const handler: EasCommandHandler | undefined = this.handlers.get(cmd);
@@ -170,23 +196,37 @@ export abstract class BaseEasRoute<D extends DeviceSyncState, M extends Mailbox 
             return;
         }
 
-        const request: WbxmlElement | undefined =
-            req.rawBody && req.rawBody.length > 0 ? new WbxmlDecoder().decode(req.rawBody) : undefined;
+        let request: WbxmlElement | undefined;
+        try {
+            request = req.rawBody && req.rawBody.length > 0 ? new WbxmlDecoder().decode(req.rawBody) : undefined;
+        } catch (err) {
+            if (err instanceof WbxmlDecodeError) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `Malformed WBXML request: ${err.message}`);
+            }
+            throw err;
+        }
 
         const response: WbxmlElement | undefined = await handler.handle({
             user,
             mailboxUid,
             deviceId,
             deviceType,
-            policyKey,
+            policyKey: firstQueryValue(req.headers["x-ms-policykey"]) ?? policyKey,
             deviceSyncState,
             deviceSyncStateRepo: this.deviceSyncStateRepo,
             query: req.query,
             request,
             req,
+            res,
         });
 
-        await persistDeviceSyncState(deviceSyncState, this.deviceSyncStateRepo, { lastSyncAt: new Date() });
+        // Bookkeeping only - the command already ran, so failing to record the timestamp must never turn a
+        // successful response into an error.
+        try {
+            await persistDeviceSyncState(deviceSyncState, this.deviceSyncStateRepo, { lastSyncAt: new Date() });
+        } catch (err: any) {
+            this.logger?.warn(`BaseEasRoute: failed to record lastSyncAt for device ${deviceId}: ${err?.message}`);
+        }
 
         if (!response) {
             res.status(200).send();

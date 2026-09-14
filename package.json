@@ -144,6 +144,24 @@
                     "help": "Rows read per database query while fetching."
                 },
                 {
+                    "key": "mail:eas:itemoperations_max_response_bytes",
+                    "label": "Fetch response size limit (bytes)",
+                    "type": "number",
+                    "default": 67108864,
+                    "min": 1048576,
+                    "max": 1073741824,
+                    "help": "Largest combined size of the bodies and attachments one fetch response embeds."
+                },
+                {
+                    "key": "mail:eas:max_request_bytes",
+                    "label": "Request size limit (bytes)",
+                    "type": "number",
+                    "default": 16777216,
+                    "min": 65536,
+                    "max": 1073741824,
+                    "help": "Largest request body a device may send."
+                },
+                {
                     "key": "mail:eas:ping_min_heartbeat_seconds",
                     "label": "Minimum push heartbeat (seconds)",
                     "type": "number",
@@ -160,6 +178,15 @@
                     "min": 60,
                     "max": 3600,
                     "help": "Longest Ping interval a device may request."
+                },
+                {
+                    "key": "mail:eas:ping_max_folders",
+                    "label": "Push folder limit",
+                    "type": "number",
+                    "default": 300,
+                    "min": 1,
+                    "max": 5000,
+                    "help": "Most folders one Ping may watch."
                 },
                 {
                     "key": "mail:eas:search_default_range",

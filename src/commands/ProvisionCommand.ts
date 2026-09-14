@@ -27,16 +27,18 @@ const DEFAULT_POLICY_TYPE = "MS-EAS-Provisioning-WBXML";
  * no way for the server to inspect device state directly either).
  *
  * - **Request 1** (no `PolicyKey` in the body): mint a new policy key, store it on `DeviceSyncState` (not yet
- * provisioned), and send back the policy document under that key. If a `RemoteWipe` was requested for this
- * device (`DeviceSyncState.remoteWipeRequested`, set by an admin - see the remote-wipe route), skip normal
- * policy issuance entirely and send the `RemoteWipe` directive instead.
+ * provisioned), and send back the policy document under that key.
  * - **Request 2** (client echoes the `PolicyKey` back, acknowledging the policy): if the key matches what was
  * minted in request 1 *and* the client's own `Status` is `1`, mark the device provisioned and re-confirm the
  * same key; anything else (a stale/replayed key, a device that never actually saw request 1's response, or a
  * device reporting it could not comply) is rejected without provisioning.
+ * - **While a wipe is pending**, every other Provision request (a policy request *or* an acknowledgement of an
+ * older key) gets the `RemoteWipe` directive and never provisions. Requesting the wipe also clears the stored
+ * policy key (`BaseDeviceSyncStateRoute.remoteWipe`), and `BaseEasRoute` refuses any command whose presented
+ * `X-MS-PolicyKey` doesn't match the stored key, so a device can't keep syncing on its old key.
  * - **RemoteWipe acknowledgement**: after wiping itself, a device sends a bare `<Provision><RemoteWipe>
  * <Status>1</Status></RemoteWipe></Provision>` (no `Policies`). Detected first, ahead of the normal
- * issue/acknowledge branching. Clears `remoteWipeRequested` and stamps `remoteWipeAcknowledgedAt` for audit,
+ * issue/acknowledge branching, and ignored (Status 2) unless a wipe is actually pending. Clears `remoteWipeRequested` and stamps `remoteWipeAcknowledgedAt` for audit,
  * but deliberately leaves `provisioned` untouched (`false`, from when the wipe was requested) - the device
  * must complete a genuine fresh Provision handshake to re-add the account, it does not fall straight back into
  * "provisioned". `remoteWipeAccountOnly` is recorded for admin audit only; the wire directive sent to the
@@ -68,6 +70,15 @@ export class ProvisionCommand implements EasCommandHandler {
             return await this.acknowledgeRemoteWipe(ctx);
         }
 
+        // While a wipe is pending, no Provision request - neither a fresh policy request nor an acknowledgement of a
+        // key issued before the wipe was requested - may (re)provision the device: every one gets the directive.
+        if (ctx.deviceSyncState.remoteWipeRequested) {
+            return element(WbxmlCodePage.Provision, "Provision", [
+                textElement(WbxmlCodePage.Provision, "Status", "1"),
+                element(WbxmlCodePage.Provision, "RemoteWipe", [textElement(WbxmlCodePage.Provision, "Status", "1")]),
+            ]);
+        }
+
         const policiesEl = ctx.request ? findChild(ctx.request, "Policies") : undefined;
         const policyEl = policiesEl ? findChild(policiesEl, "Policy") : undefined;
         const policyType: string = (policyEl ? childText(policyEl, "PolicyType") : undefined) ?? DEFAULT_POLICY_TYPE;
@@ -80,16 +91,8 @@ export class ProvisionCommand implements EasCommandHandler {
         return await this.acknowledgePolicy(ctx, policyType, clientPolicyKey, clientStatus);
     }
 
-    /** Request 1: mint and store a new policy key, send the policy document - or, if a remote wipe is
-     * pending for this device, the `RemoteWipe` directive instead. */
+    /** Request 1: mint and store a new policy key and send the policy document. */
     private async issuePolicy(ctx: EasCommandContext, policyType: string): Promise<WbxmlElement> {
-        if (ctx.deviceSyncState.remoteWipeRequested) {
-            return element(WbxmlCodePage.Provision, "Provision", [
-                textElement(WbxmlCodePage.Provision, "Status", "1"),
-                element(WbxmlCodePage.Provision, "RemoteWipe", [textElement(WbxmlCodePage.Provision, "Status", "1")]),
-            ]);
-        }
-
         const policyKey: string = crypto.randomBytes(8).toString("hex");
         await this.persist(ctx, { policyKey, provisioned: false });
 
@@ -160,6 +163,10 @@ export class ProvisionCommand implements EasCommandHandler {
     /** The device has wiped itself and is acknowledging - clear the pending flag but leave `provisioned`
      * alone (still `false`, from when the wipe was requested) so a genuine re-provision is required. */
     private async acknowledgeRemoteWipe(ctx: EasCommandContext): Promise<WbxmlElement> {
+        // Only a wipe that was actually requested can be acknowledged; an unsolicited acknowledgement changes nothing.
+        if (!ctx.deviceSyncState.remoteWipeRequested) {
+            return element(WbxmlCodePage.Provision, "Provision", [textElement(WbxmlCodePage.Provision, "Status", "2")]);
+        }
         await persistDeviceSyncState(ctx.deviceSyncState, ctx.deviceSyncStateRepo, {
             remoteWipeRequested: false,
             remoteWipeAcknowledgedAt: new Date(),

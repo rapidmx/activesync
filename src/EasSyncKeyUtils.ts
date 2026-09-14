@@ -2,23 +2,56 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import type { RecoverableBaseEntity, RepoUtils } from "@rapidrest/service-core";
+import { ApiError } from "@rapidrest/core";
+import { ApiErrors, type RecoverableBaseEntity, type RepoUtils } from "@rapidrest/service-core";
 import type { DeviceSyncState } from "./models/DeviceSyncState.js";
 
 /**
+ * A position in a `(dateModified, uid)`-ordered change stream. `dateModified` alone is not a total order - several
+ * rows can share one timestamp (a bulk update inside one millisecond) - so a cursor that only remembered the
+ * timestamp would either re-send or skip the rows sharing the page boundary's timestamp. `uid` breaks the tie;
+ * `""` means "before every row at `date`".
+ */
+export interface ChangeCursor {
+    date: Date;
+    uid: string;
+}
+
+/** The cursor that precedes every row ever written. */
+export function epochCursor(): ChangeCursor {
+    return { date: new Date(0), uid: "" };
+}
+
+/** Orders two `(date, uid)` positions: negative when `a` sorts before `b`, positive when after, `0` when equal. */
+export function compareCursor(a: ChangeCursor, b: ChangeCursor): number {
+    const byDate = a.date.getTime() - b.date.getTime();
+    if (byDate !== 0) {
+        return byDate;
+    }
+    return a.uid < b.uid ? -1 : a.uid > b.uid ? 1 : 0;
+}
+
+/** The cursor position of `row`. */
+export function cursorOf(row: { dateModified: Date | string; uid: string }): ChangeCursor {
+    return { date: new Date(row.dateModified), uid: row.uid };
+}
+
+/**
  * A parsed EAS `SyncKey`. The wire value is opaque to the client per spec, so this library encodes it as
- * `"<generation>:<watermarkIso>"` (e.g. `"3:2026-09-04T12:00:00.000Z"`) - a monotonic generation counter (bumped
- * once per successful sync round, satisfying the spec's "the server MUST return a different SyncKey every
- * time" requirement) paired with the `dateModified` watermark that generation was issued at.
+ * `"<generation>:<watermarkIso>"`, optionally followed by `"#<uid>"` when the cursor has a tie-breaking uid (e.g.
+ * `"3:2026-09-04T12:00:00.000Z#6f1c..."`) - a monotonic generation counter (bumped once per successful sync round,
+ * satisfying the spec's "the server MUST return a different SyncKey every time" requirement) paired with the
+ * `(dateModified, uid)` cursor that generation was issued at.
  */
 export interface SyncKey {
     generation: number;
     watermark: Date;
+    uid?: string;
 }
 
 /** Formats a `SyncKey` back into its wire string form. */
 export function formatSyncKey(key: SyncKey): string {
-    return `${key.generation}:${key.watermark.toISOString()}`;
+    return `${key.generation}:${key.watermark.toISOString()}${key.uid ? `#${key.uid}` : ""}`;
 }
 
 /** Parses a stored/previously-issued `SyncKey` string. Returns `undefined` for a malformed value - callers
@@ -30,11 +63,13 @@ export function parseSyncKey(value: string): SyncKey | undefined {
         return undefined;
     }
     const generation = Number(value.slice(0, separator));
-    const watermark = new Date(value.slice(separator + 1));
+    const rest = value.slice(separator + 1);
+    const hash = rest.indexOf("#");
+    const watermark = new Date(hash === -1 ? rest : rest.slice(0, hash));
     if (!Number.isFinite(generation) || Number.isNaN(watermark.getTime())) {
         return undefined;
     }
-    return { generation, watermark };
+    return hash === -1 ? { generation, watermark } : { generation, watermark, uid: rest.slice(hash + 1) };
 }
 
 export type SyncKeyResolution =
@@ -44,7 +79,7 @@ export type SyncKeyResolution =
 
 /**
  * Resolves an incoming client `SyncKey` string against the value this library itself previously issued and
- * stored (`storedValue`, e.g. `DeviceSyncState.folderSyncKeys[folderUid]`) — deliberately a plain string
+ * stored (`storedValue`, e.g. `DeviceSyncState.folderSyncKeys["$foldersync"]`) — deliberately a plain string
  * equality check, not a re-parse-and-compare of the client's value, so a client that echoes back anything
  * other than the exact opaque string it was handed is treated as `"invalid"` even if it happens to parse.
  *
@@ -66,118 +101,125 @@ export function resolveSyncKey(clientValue: string | undefined, storedValue: str
     return parsed ? { kind: "valid", key: parsed } : { kind: "invalid" };
 }
 
+/** How many times `persistDeviceSyncState` re-reads and re-applies its patch after losing an optimistic-lock race. */
+const PERSIST_MAX_ATTEMPTS = 5;
+
 /**
  * Applies `patch` to `deviceSyncState` and persists it - the one correct way any EAS command handler (or
- * `BaseEasRoute` itself) should ever write to a `DeviceSyncState`, replacing the inline
- * `deviceSyncStateRepo.update(...)` calls `ProvisionCommand`/`FolderSyncCommand`/`SyncCommand` used to each
- * repeat individually.
+ * `BaseEasRoute` itself) should ever write to a `DeviceSyncState`.
  *
- * This exists because `RepoUtils.update()` does **not** mutate the `existing` object passed to it - confirmed
- * by reading its implementation directly - it only returns a freshly-fetched instance reflecting the write,
- * leaving the caller's in-memory copy (including its optimistic-concurrency `version`) stale. A single write
- * per request is harmless (nothing re-reads the stale copy), but a *second* write to the same `deviceSyncState`
- * later in the same request - e.g. `BaseEasRoute.dispatch()`'s own trailing `lastSyncAt` update, or a second
- * collection's SyncKey in a multi-collection `Sync` - would build its own patch's `version` off that stale
- * value. `RepoUtils.update()` filters its underlying write by exactly that `version`, so the write silently
- * matches zero rows instead of throwing - a silent no-op, not a visible error. Copying `update()`'s own
- * returned result back onto `deviceSyncState` (last line below) keeps every field, including `version`, current
- * for whatever writes this same request still has left to make.
+ * `RepoUtils.update()` does **not** mutate the `existing` object passed to it - it only returns a freshly-fetched
+ * instance reflecting the write - so the returned row (including its bumped `version`) is copied back onto
+ * `deviceSyncState`, keeping a second write later in the same request from being built off a stale version.
+ *
+ * **Concurrent requests**: one device routinely has several requests in flight at once (a long-poll `Ping`
+ * alongside a `Sync`, or two `Sync`s for different folders), and the row's optimistic lock covers the whole row.
+ * Losing that race used to surface as a 409 *after* the command's side effects had already happened. Instead, a
+ * version conflict re-reads the row, re-applies the patch on top of the fresh copy and retries (bounded). Pass
+ * `patch` as a function when it derives from the row's current content (e.g. updating one entry of the
+ * `folderSyncKeys` map) so the retry merges into what the other request wrote rather than overwriting it.
  */
 export async function persistDeviceSyncState(
     deviceSyncState: DeviceSyncState,
     deviceSyncStateRepo: RepoUtils<any>,
-    patch: Record<string, unknown>,
+    patch: Record<string, unknown> | ((current: DeviceSyncState) => Record<string, unknown>),
 ): Promise<void> {
-    Object.assign(deviceSyncState, patch);
-    const updated = await deviceSyncStateRepo.update(
-        { uid: deviceSyncState.uid, version: (deviceSyncState as any).version, ...patch } as any,
-        deviceSyncState,
-        { ignoreACL: true, skipPush: true },
-    );
-    Object.assign(deviceSyncState, updated);
+    for (let attempt = 1; ; attempt++) {
+        const values: Record<string, unknown> = typeof patch === "function" ? patch(deviceSyncState) : patch;
+        Object.assign(deviceSyncState, values);
+        try {
+            const updated = await deviceSyncStateRepo.update(
+                { uid: deviceSyncState.uid, version: (deviceSyncState as any).version, ...values } as any,
+                deviceSyncState,
+                { ignoreACL: true, skipPush: true },
+            );
+            Object.assign(deviceSyncState, updated);
+            return;
+        } catch (err: any) {
+            if (!(err instanceof ApiError) || err.code !== ApiErrors.INVALID_OBJECT_VERSION || attempt >= PERSIST_MAX_ATTEMPTS) {
+                throw err;
+            }
+            const fresh = await deviceSyncStateRepo.findOne(deviceSyncState.uid, { ignoreACL: true });
+            if (!fresh) {
+                throw err;
+            }
+            Object.assign(deviceSyncState, fresh);
+        }
+    }
 }
 
-/** One page of enumerated changes for a `RecoverableBaseEntity` collection scoped by a single field (e.g.
- * `folderUid` for `Message`/`CalendarEvent`/.../`mailboxUid` for `Folder`), since the last sync at `watermark`. */
+/** The JSON sort expression both backends' query builders accept for a `(dateModified, uid)` ordering. */
+const CURSOR_SORT = JSON.stringify({ dateModified: "ASC", uid: "ASC" });
+
+/**
+ * Reads up to `limit` rows matching `criteria` that sort strictly after `cursor` in `(dateModified, uid)` order,
+ * live and soft-deleted rows merged into one stream. `more` is `true` when rows beyond the returned page exist.
+ *
+ * `RepoUtils.find()` excludes soft-deleted rows unless the query names `deleted` explicitly, so the two halves are
+ * separate queries (the second with a literal `deleted: true`), each over-fetched by one and merged. `limit`/`sort`
+ * are baked into the query object as well as the options - the SQL query builder only reads the former.
+ */
+export async function scanAfter<T extends RecoverableBaseEntity>(
+    repo: RepoUtils<T>,
+    criteria: Record<string, unknown>,
+    cursor: ChangeCursor,
+    limit: number,
+): Promise<{ rows: T[]; more: boolean }> {
+    const iso = cursor.date.toISOString();
+    const position: Record<string, unknown> = cursor.uid
+        ? { $or: [{ dateModified: `gt(${iso})` }, { dateModified: `range(${iso},${iso})`, uid: `gt(${cursor.uid})` }] }
+        : { dateModified: `gt(${iso})` };
+    const query: any = { ...criteria, ...position, sort: CURSOR_SORT, limit: limit + 1 };
+    const options: any = { ignoreACL: true, limit: limit + 1 };
+    const [live, deleted] = await Promise.all([repo.find(query, options), repo.find({ ...query, deleted: true }, options)]);
+    const merged: T[] = [...live, ...deleted].sort((a: any, b: any) => compareCursor(cursorOf(a), cursorOf(b)));
+    return { rows: merged.slice(0, limit), more: merged.length > limit };
+}
+
+/** One page of enumerated changes for a `RecoverableBaseEntity` collection scoped by a single field. */
 export interface ChangeSet<T extends RecoverableBaseEntity> {
     adds: T[];
     changes: T[];
     deletes: T[];
-    /** The new watermark to persist as this generation's cursor - the latest `dateModified` actually included
-     * in this page, never simply "now" (which would silently skip any row modified after this page was read
-     * but before the caller finishes processing it). Equal to the input `watermark` when nothing changed. */
-    newWatermark: Date;
-    /** `true` when more changed rows exist beyond `windowSize` - the caller should set the response's
-     * `MoreAvailable` flag so the client immediately re-syncs for the rest, rather than waiting a full poll
-     * interval. */
+    /** The cursor to persist for the next round - the last row actually included in this page, never simply
+     * "now" (which would silently skip any row modified after this page was read). Equal to the input cursor when
+     * nothing changed. */
+    cursor: ChangeCursor;
+    /** `true` when more changed rows exist beyond `windowSize`. */
     moreAvailable: boolean;
 }
 
-/** A tolerance window for treating a row's `dateCreated`/`dateModified` as "close enough" to be an `Add`
- * rather than a `Change` - the two are set within the same request handler and so are typically only
- * milliseconds apart, never exactly equal down to the microsecond depending on the datastore's clock
- * resolution. */
-const NEWLY_CREATED_TOLERANCE_MS = 1000;
-
 /**
- * Enumerates `Add`/`Change`/`Delete`s for one scoped collection since `watermark`, for `FolderSyncCommand` and
- * (eventually) `SyncCommand`'s shared cursor mechanism. Requires `T` to be `RecoverableBaseEntity` (soft
- * delete) — see `RecoverableRepoUtils`'s own doc comment for why a plain hard-deleted entity can't support
- * this at all (nothing left to enumerate once a row is actually gone).
- *
- * `RepoUtils.find()` does **not** support an `includeDeleted` option - confirmed by reading its source: unlike
- * `count()`/`findOne()`, it never strips `ModelUtils.buildSearchQuery()`'s default `deleted: false` exclusion
- * back out. Rather than the (harmless-looking but silently no-op) `includeDeleted: true` this function used to
- * pass, deleted rows are fetched via a **second** `find()` call with an explicit, literal `deleted: true` in
- * the query object itself - `buildSearchQuery()`'s exclusion only applies when the caller's query has no
- * `"deleted"` key at all, so supplying one directly (rather than relying on an option `find()` doesn't honor)
- * reliably selects exactly the soft-deleted rows instead. The two result sets are then merged and re-windowed
- * together so `windowSize`/`MoreAvailable` still describe the combined stream, not each half independently.
+ * Enumerates `Add`/`Change`/`Delete`s for one scoped collection after `cursor` - used by `FolderSyncCommand`
+ * (scoped by `mailboxUid` over `Folder`). `Sync` item collections use `EasCollectionSync` instead, which tracks the
+ * exact set of items each device holds; the folder hierarchy is small and always fully re-sent on `SyncKey 0`, so
+ * a creation-time rule is enough here: a row created after the cursor can't be on the device yet, so a live one is
+ * an `Add` (never an `Update` for a `ServerId` the device has never seen) and a deleted one is not reported at all.
  */
 export async function computeChanges<T extends RecoverableBaseEntity>(
     repo: RepoUtils<T>,
     scopeField: string,
     scopeUid: string,
-    watermark: Date,
+    cursor: ChangeCursor,
     windowSize: number,
 ): Promise<ChangeSet<T>> {
-    // Overfetch by one (per stream) so a full window can be distinguished from an exact-fit window without a
-    // separate count() round trip - the same trick `ExternalShareExpirationJob`/`MailboxQuotaRecalcJob` already
-    // use for their own MoreAvailable-shaped bookkeeping. `limit`/`sort` must be baked into the query object
-    // itself (not just `options`) for the SQL backend - see those same jobs' comments on this exact requirement.
-    const baseCriteria: any = { [scopeField]: scopeUid, dateModified: `gt(${watermark.toISOString()})` };
-    const findOptions: any = { ignoreACL: true, limit: windowSize + 1, sort: "dateModified" };
-    const [liveRows, deletedRows] = await Promise.all([
-        repo.find({ ...baseCriteria, sort: "dateModified", limit: windowSize + 1 }, findOptions),
-        repo.find({ ...baseCriteria, deleted: true, sort: "dateModified", limit: windowSize + 1 }, findOptions),
-    ]);
-
-    const merged: T[] = [...liveRows, ...deletedRows].sort(
-        (a, b) => new Date((a as any).dateModified).getTime() - new Date((b as any).dateModified).getTime(),
-    );
-
-    const moreAvailable: boolean = merged.length > windowSize;
-    const page: T[] = moreAvailable ? merged.slice(0, windowSize) : merged;
+    const { rows, more } = await scanAfter(repo, { [scopeField]: scopeUid }, cursor, windowSize);
 
     const adds: T[] = [];
     const changes: T[] = [];
     const deletes: T[] = [];
-    let newWatermark: Date = watermark;
-
-    for (const row of page) {
-        const dateModified = new Date((row as any).dateModified);
-        if (dateModified.getTime() > newWatermark.getTime()) {
-            newWatermark = dateModified;
-        }
-
+    let next: ChangeCursor = cursor;
+    for (const row of rows) {
+        next = cursorOf(row);
+        const createdAfterCursor = new Date((row as any).dateCreated).getTime() > cursor.date.getTime();
         if ((row as any).deleted === true) {
-            deletes.push(row);
+            if (!createdAfterCursor) {
+                deletes.push(row);
+            }
         } else {
-            const dateCreated = new Date((row as any).dateCreated);
-            const isNewlyCreated = Math.abs(dateModified.getTime() - dateCreated.getTime()) < NEWLY_CREATED_TOLERANCE_MS;
-            (isNewlyCreated ? adds : changes).push(row);
+            (createdAfterCursor ? adds : changes).push(row);
         }
     }
 
-    return { adds, changes, deletes, newWatermark, moreAvailable };
+    return { adds, changes, deletes, cursor: next, moreAvailable: more };
 }

@@ -19,11 +19,13 @@ const { Config, Init, Logger } = ObjectDecorators;
  */
 export abstract class EasDeviceStateCleanupJob<D extends DeviceSyncState> extends BackgroundService {
     protected abstract deviceSyncStateClass: any;
+    protected abstract collectionStateClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
     private deviceSyncStateRepo?: RepoUtils<D>;
+    private collectionStateRepo?: RepoUtils<any>;
 
     @Config("mail:jobs:eas_device_cleanup:schedule", "0 0 4 * * *")
     private scheduleExpr: string = "0 0 4 * * *";
@@ -46,6 +48,10 @@ export abstract class EasDeviceStateCleanupJob<D extends DeviceSyncState> extend
         this.deviceSyncStateRepo = await this._objectFactory!.newInstance(RepoUtils, {
             name: this.deviceSyncStateClass.name,
             args: [this.deviceSyncStateClass],
+        });
+        this.collectionStateRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.collectionStateClass.name,
+            args: [this.collectionStateClass],
         });
     }
 
@@ -101,9 +107,28 @@ export abstract class EasDeviceStateCleanupJob<D extends DeviceSyncState> extend
 
         for (const row of [...stale, ...neverSynced]) {
             try {
+                await this.deleteCollectionStates(row);
                 await this.deviceSyncStateRepo.delete(row.uid, { ignoreACL: true, purge: true });
             } catch (err: any) {
                 this.logger?.warn(`EasDeviceStateCleanupJob: failed to delete stale device sync state ${row.uid}: ${err.message}`);
+            }
+        }
+    }
+
+    /** Purges the device's per-collection `Sync` state rows (`EasCollectionState`) before the device row itself,
+     * so a forgotten device leaves nothing behind - deleted first, so a failure here leaves the device row in place
+     * for the next run to retry. */
+    private async deleteCollectionStates(row: D): Promise<void> {
+        for (;;) {
+            const states: any[] = await this.collectionStateRepo!.find(
+                { mailboxUid: row.mailboxUid, deviceId: row.deviceId, limit: this.batchSize } as any,
+                { ignoreACL: true, limit: this.batchSize },
+            );
+            for (const state of states) {
+                await this.collectionStateRepo!.delete(state.uid, { ignoreACL: true, purge: true });
+            }
+            if (states.length < this.batchSize) {
+                return;
             }
         }
     }

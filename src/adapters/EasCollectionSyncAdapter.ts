@@ -50,8 +50,10 @@ export interface EasCollectionSyncAdapter<T extends RecoverableBaseEntity> {
      * @param existing The item being changed, for a `Change` command; `undefined` for `Add`. Adapters that
      * need to know the item's current field values to correctly interpret a partial update - `EmailSyncAdapter`
      * uses this to refuse a `Body` change on anything but a Draft, and to carry over unchanged MIME headers.
+     * @param mailbox The caller's own mailbox - `CalendarSyncAdapter` uses it so a device can never make someone
+     * else the organizer of an event it creates.
      */
-    fromApplicationData?(el: WbxmlElement, existing?: T): Partial<T> | Promise<Partial<T>>;
+    fromApplicationData?(el: WbxmlElement, existing?: T, mailbox?: Mailbox): Partial<T> | Promise<Partial<T>>;
 
     /**
      * Supplies default field values for a brand-new entity created via a client-originated `Add`, applied

@@ -2,49 +2,224 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-// Isolated unit tests for MeetingResponseCommand's defensive guard clauses only. The dependency-missing guard
-// follows the same rationale as ComposeMailCommand.test.ts's own; the "mailbox vanished" 404 is a genuine
-// race-condition-only branch (BaseEasRoute already resolved ctx.mailboxUid to a real, currently-existing
-// mailbox moments before dispatching to this handler, so it can only return undefined here if the mailbox was
-// deleted in between) - exercised with a directly-poked repo double rather than an unreproducible real race.
-// Every other MeetingResponse behavior (accept/decline, threading, 404/403/400 branches) is exercised via real
-// HTTP+DB requests in test/routes/{mongo,sql}/EasRoute.test.ts.
+// Isolated unit tests for MeetingResponseCommand's guard clauses and the branches a real request can't reach
+// deterministically: the caller's mailbox vanishing mid-request, a failed write, a transport failure while mailing
+// the iTIP reply, and a meeting request message whose MIME can't be read. The common flows (accept/decline, a
+// response by meeting request message, the reply to the organizer, per-request Status 2) run over real HTTP+DB in
+// test/routes/{mongo,sql}/EasRoute.test.ts.
 import config from "../config.js";
 import { ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
+import { AttendeeResponseStatus, AttendeeRole, RecipientType } from "@rapidmx/restapi";
 import { MeetingResponseCommandMongo } from "../../src/commands/mongo/MeetingResponseCommandMongo.js";
-import { element, textElement } from "../../src/codec/WbxmlElement.js";
+import { MAX_MEETING_RESPONSES } from "../../src/commands/MeetingResponseCommand.js";
+import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../../src/codec/WbxmlElement.js";
 import { WbxmlCodePage } from "../../src/codec/WbxmlCodePages.js";
 import type { EasCommandContext } from "../../src/EasCommandHandler.js";
 
-describe("MeetingResponseCommand Tests (guard clauses only)", () => {
+const MAILBOX = { uid: "mbx-1", primarySmtpAddress: "me@example.com", aliasAddresses: [], displayName: "Me" };
+
+function event(overrides: Record<string, any> = {}): any {
+    return {
+        uid: "event-1",
+        version: 1,
+        folderUid: "calendar",
+        mailboxUid: "mbx-1",
+        title: "Planning",
+        icalUid: "ical-1@example.com",
+        sequence: 0,
+        status: "confirmed",
+        startDate: new Date("2026-03-01T10:00:00.000Z"),
+        endDate: new Date("2026-03-01T11:00:00.000Z"),
+        organizer: { address: "boss@example.com", type: RecipientType.TO },
+        attendees: [{ address: "me@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false }],
+        ...overrides,
+    };
+}
+
+function request(...requests: WbxmlElement[][]): WbxmlElement {
+    return element(
+        WbxmlCodePage.MeetingResponse,
+        "MeetingResponse",
+        requests.map((children) => element(WbxmlCodePage.MeetingResponse, "Request", children)),
+    );
+}
+
+function reply(userResponse: string, requestId: string, sendResponse = false): WbxmlElement[] {
+    return [
+        textElement(WbxmlCodePage.MeetingResponse, "UserResponse", userResponse),
+        textElement(WbxmlCodePage.MeetingResponse, "RequestId", requestId),
+        ...(sendResponse ? [element(WbxmlCodePage.MeetingResponse, "SendResponse", [])] : []),
+    ];
+}
+
+function build(overrides: { calendarEventRepo?: any; messageRepo?: any; aclUtils?: any; blobStore?: any; mailTransport?: any; mailbox?: any } = {}) {
+    const objectFactory = new ObjectFactory(config, Logger());
+    const command = objectFactory.newInstance<MeetingResponseCommandMongo>(MeetingResponseCommandMongo, { initialize: false }) as MeetingResponseCommandMongo;
+    const logger = { warn: vi.fn() };
+    const calendarEventRepo = overrides.calendarEventRepo ?? {
+        findOne: vi.fn().mockResolvedValue(event()),
+        find: vi.fn().mockResolvedValue([]),
+        update: vi.fn().mockResolvedValue({}),
+        delete: vi.fn().mockResolvedValue(undefined),
+    };
+    const mailTransport = overrides.mailTransport ?? { send: vi.fn().mockResolvedValue({ accepted: [], rejected: [] }) };
+    (command as any).calendarEventRepo = calendarEventRepo;
+    (command as any).messageRepo = overrides.messageRepo ?? { findOne: vi.fn().mockResolvedValue(undefined) };
+    (command as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue("mailbox" in overrides ? overrides.mailbox : MAILBOX) };
+    (command as any).aclUtils = overrides.aclUtils ?? { hasPermission: vi.fn().mockResolvedValue(true) };
+    (command as any).blobStore = overrides.blobStore ?? { get: vi.fn() };
+    (command as any).mailTransport = mailTransport;
+    (command as any).logger = logger;
+    return { command, calendarEventRepo, mailTransport, logger };
+}
+
+function ctx(req: WbxmlElement | undefined): EasCommandContext {
+    return { user: { uid: "user-1", roles: [], scopes: [] }, mailboxUid: "mbx-1", request: req } as unknown as EasCommandContext;
+}
+
+function statuses(response: WbxmlElement | undefined): string[] {
+    return findChildren(response!, "Result").map((result) => childText(result, "Status")!);
+}
+
+describe("MeetingResponseCommand Tests (isolated)", () => {
     it("handle() throws INTERNAL_ERROR when a required dependency is not set.", async () => {
         const objectFactory = new ObjectFactory(config, Logger());
         const command = objectFactory.newInstance<MeetingResponseCommandMongo>(MeetingResponseCommandMongo, { initialize: false });
 
-        await expect(command.handle({})).rejects.toThrow(/internal error/i);
+        await expect((command as any).handle({})).rejects.toThrow(/internal error/i);
     });
 
     it("handle() throws NOT_FOUND when the caller's own mailbox has vanished since being resolved.", async () => {
-        const objectFactory = new ObjectFactory(config, Logger());
-        const command = objectFactory.newInstance<MeetingResponseCommandMongo>(MeetingResponseCommandMongo, { initialize: false });
-        (command as any).calendarEventRepo = {
-            findOne: vi.fn().mockResolvedValue({ uid: "event-1", version: 1, folderUid: "folder-1", attendees: [] }),
+        const { command } = build({ mailbox: undefined });
+
+        await expect(command.handle(ctx(request(reply("1", "event-1"))))).rejects.toThrow(/no resource could be found/i);
+    });
+
+    it("handle() rejects a request with more Request elements than allowed.", async () => {
+        const { command } = build();
+        const requests = Array.from({ length: MAX_MEETING_RESPONSES + 1 }, () => reply("1", "event-1"));
+
+        await expect(command.handle(ctx(request(...requests)))).rejects.toThrow(/invalid/i);
+    });
+
+    it("Answers every Request with its own Result, including an invalid UserResponse and a missing RequestId.", async () => {
+        const { command } = build();
+
+        const response = await command.handle(
+            ctx(request(reply("1", "event-1"), reply("9", "event-1"), [textElement(WbxmlCodePage.MeetingResponse, "UserResponse", "1")])),
+        );
+
+        expect(statuses(response)).toEqual(["1", "2", "2"]);
+        expect(childText(findChildren(response!, "Result")[0], "CalendarId")).toBe("event-1");
+        expect(findChild(findChildren(response!, "Result")[2], "RequestId")).toBeUndefined();
+    });
+
+    it("Records a decline as a status (keeping the event) when the caller may update but not delete it.", async () => {
+        const aclUtils = { hasPermission: vi.fn().mockImplementation(async (_u: any, _f: any, action: string) => action !== "delete") };
+        const { command, calendarEventRepo } = build({ aclUtils });
+
+        const response = await command.handle(ctx(request(reply("3", "event-1"))));
+
+        expect(statuses(response)).toEqual(["1"]);
+        expect(childText(findChild(response!, "Result")!, "CalendarId")).toBe("event-1");
+        expect(calendarEventRepo.delete).not.toHaveBeenCalled();
+        expect(calendarEventRepo.update.mock.calls[0][0].attendees[0].responseStatus).toBe(AttendeeResponseStatus.DECLINED);
+    });
+
+    it("Reports Status 3 when recording the response fails.", async () => {
+        const calendarEventRepo = { findOne: vi.fn().mockResolvedValue(event()), update: vi.fn().mockRejectedValue(new Error("conflict")), delete: vi.fn() };
+        const { command, logger } = build({ calendarEventRepo });
+
+        expect(statuses(await command.handle(ctx(request(reply("1", "event-1")))))).toEqual(["3"]);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("conflict"));
+    });
+
+    it("Mails an iTIP REPLY to the organizer only when SendResponse is present, and survives a transport failure.", async () => {
+        const { command, mailTransport } = build();
+
+        await command.handle(ctx(request(reply("2", "event-1"))));
+        expect(mailTransport.send).not.toHaveBeenCalled();
+
+        await command.handle(ctx(request(reply("2", "event-1", true))));
+        expect(mailTransport.send).toHaveBeenCalledTimes(1);
+        const sent = mailTransport.send.mock.calls[0][0];
+        expect(sent.envelopeFrom).toBe("me@example.com");
+        expect(sent.envelopeTo).toEqual(["boss@example.com"]);
+        const raw = sent.raw.toString("utf-8");
+        expect(raw).toContain("Subject: Tentative: Planning");
+        expect(raw).toContain("method=REPLY");
+        expect(raw).toContain("PARTSTAT=TENTATIVE");
+
+        const failing = build({ mailTransport: { send: vi.fn().mockRejectedValue(new Error("smtp down")) }, mailbox: { ...MAILBOX, displayName: undefined } });
+        expect(statuses(await failing.command.handle(ctx(request(reply("1", "event-1", true)))))).toEqual(["1"]);
+        expect(failing.logger.warn).toHaveBeenCalledWith(expect.stringContaining("smtp down"));
+    });
+
+    it("Resolves a meeting request message to the series master of the caller's own event, and treats unreadable or non-meeting messages as not found.", async () => {
+        const ics = ["BEGIN:VCALENDAR", "METHOD:REQUEST", "BEGIN:VEVENT", "UID:ical-1@example.com", "SEQUENCE:0", "END:VEVENT", "END:VCALENDAR"].join("\r\n");
+        const mime = Buffer.from(
+            [
+                "From: boss@example.com",
+                "To: me@example.com",
+                "Subject: Planning",
+                "MIME-Version: 1.0",
+                'Content-Type: multipart/mixed; boundary="b"',
+                "",
+                "--b",
+                "Content-Type: text/plain",
+                "",
+                "Invite",
+                "--b",
+                "Content-Type: text/calendar; method=REQUEST",
+                "",
+                ics,
+                "--b--",
+                "",
+            ].join("\r\n"),
+        );
+        const calendarEventRepo = {
+            findOne: vi.fn().mockResolvedValue(undefined),
+            find: vi.fn().mockResolvedValue([event({ uid: "override", recurrenceId: new Date() }), event({ uid: "master" })]),
+            update: vi.fn().mockResolvedValue({}),
+            delete: vi.fn(),
         };
-        (command as any).mailboxRepo = { findOne: vi.fn().mockResolvedValue(undefined) };
-        (command as any).aclUtils = { hasPermission: vi.fn().mockResolvedValue(true) };
+        const blobStore = {
+            get: vi.fn().mockImplementation(async (key: string) => {
+                if (key === "plain") return Buffer.from("Subject: hi\r\n\r\nno calendar here");
+                if (key === "broken") throw new Error("missing blob");
+                return mime;
+            }),
+        };
+        const messages: Record<string, any> = {
+            invite: { uid: "invite", folderUid: "inbox", bodyBlobKey: "invite" },
+            plain: { uid: "plain", folderUid: "inbox", bodyBlobKey: "plain" },
+            broken: { uid: "broken", folderUid: "inbox", bodyBlobKey: "broken" },
+        };
+        const messageRepo = { findOne: vi.fn().mockImplementation(async (uid: string) => messages[uid]) };
+        const { command } = build({ calendarEventRepo, messageRepo, blobStore });
 
-        const ctx = {
-            user: { uid: "user-1", roles: [], scopes: [] },
-            mailboxUid: "mbx-1",
-            request: element(WbxmlCodePage.MeetingResponse, "MeetingResponse", [
-                element(WbxmlCodePage.MeetingResponse, "Request", [
-                    textElement(WbxmlCodePage.MeetingResponse, "UserResponse", "1"),
-                    textElement(WbxmlCodePage.MeetingResponse, "RequestId", "event-1"),
-                ]),
-            ]),
-        } as unknown as EasCommandContext;
+        const response = await command.handle(ctx(request(reply("1", "invite"), reply("1", "plain"), reply("1", "broken"), reply("1", "nothing"))));
 
-        await expect(command.handle(ctx)).rejects.toThrow(/no resource could be found/i);
+        expect(statuses(response)).toEqual(["1", "2", "2", "2"]);
+        expect(childText(findChildren(response!, "Result")[0], "CalendarId")).toBe("master");
+        expect(calendarEventRepo.find).toHaveBeenCalledWith(
+            expect.objectContaining({ mailboxUid: "mbx-1", icalUid: "ical-1@example.com" }),
+            expect.objectContaining({ ignoreACL: true }),
+        );
+
+        // Without READ on the message's folder the message is never opened.
+        const denied = build({
+            calendarEventRepo,
+            messageRepo,
+            blobStore,
+            aclUtils: { hasPermission: vi.fn().mockImplementation(async (_u: any, uid: string) => uid !== "inbox") },
+        });
+        expect(statuses(await denied.command.handle(ctx(request(reply("1", "invite")))))).toEqual(["2"]);
+
+        // A resolved UID with only an override row still answers with that row.
+        calendarEventRepo.find.mockResolvedValueOnce([event({ uid: "only-override", recurrenceId: new Date() })]);
+        const single = await command.handle(ctx(request(reply("1", "invite"))));
+        expect(childText(findChild(single!, "Result")!, "CalendarId")).toBe("only-override");
     });
 });

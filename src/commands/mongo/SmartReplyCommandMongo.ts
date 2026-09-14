@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { FolderMongo, MessageMongo } from "@rapidmx/restapi/mongo";
+import { FolderMongo, MailboxMongo, MessageMongo } from "@rapidmx/restapi/mongo";
 import { SmartReplyCommand } from "../SmartReplyCommand.js";
 
 /**
@@ -11,4 +11,5 @@ import { SmartReplyCommand } from "../SmartReplyCommand.js";
 export class SmartReplyCommandMongo extends SmartReplyCommand {
     protected folderClass: any = FolderMongo;
     protected messageClass: any = MessageMongo;
+    protected mailboxClass: any = MailboxMongo;
 }

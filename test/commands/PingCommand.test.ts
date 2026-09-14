@@ -26,8 +26,7 @@ class FakeRedisServer {
         if (!subs) {
             return;
         }
-        // Deferred (not called inline) so a publish issued right after `waitForChange()` starts subscribing
-        // isn't racing a same-tick delivery real Redis could never produce either.
+        // Deferred (not called inline) so delivery never happens in the same tick as the publish, like real Redis.
         const listeners = [...subs];
         queueMicrotask(() => {
             for (const listener of listeners) {
@@ -46,59 +45,101 @@ class FakeRedisServer {
     public unsubscribe(channel: string, listener: PubSubListener): void {
         this.subscribers.get(channel)?.delete(listener);
     }
+
+    public listenerCount(channel: string): number {
+        return this.subscribers.get(channel)?.size ?? 0;
+    }
+
+    public reset(): void {
+        this.subscribers.clear();
+    }
 }
 
-/** Consumed (reset to `false`) by the next `FakeRedisClient.subscribe()` call - lets a single test simulate a
- * `client.subscribe()` rejection (e.g. a dropped connection) without affecting any other test. */
-let nextSubscribeShouldFail = false;
-/** Same idea as `nextSubscribeShouldFail`, for `unsubscribe()`/`disconnect()` - `PingCommand.waitForChange()`'s
- * `finally` block swallows both via their own `.catch(() => undefined)`, since a cleanup failure on an
- * already-answered request shouldn't fail the request itself. */
-let nextUnsubscribeShouldFail = false;
-let nextDisconnectShouldFail = false;
+/** Per-test knobs and counters for the fake client, all reset in `afterEach`. */
+const fake = {
+    createClientCount: 0,
+    connectCount: 0,
+    nextConnectShouldFail: false,
+    nextDestroyShouldFail: false,
+    nextSubscribeShouldFail: false,
+    nextUnsubscribeShouldFail: false,
+    /** When set, `connect()` waits on this before completing. */
+    connectGate: undefined as Promise<void> | undefined,
+    /** When set, `subscribe()` waits on this before completing. */
+    subscribeGate: undefined as Promise<void> | undefined,
+    lastClient: undefined as FakeRedisClient | undefined,
+    reset(): void {
+        this.createClientCount = 0;
+        this.connectCount = 0;
+        this.nextConnectShouldFail = false;
+        this.nextDestroyShouldFail = false;
+        this.nextSubscribeShouldFail = false;
+        this.nextUnsubscribeShouldFail = false;
+        this.connectGate = undefined;
+        this.subscribeGate = undefined;
+        this.lastClient = undefined;
+    },
+};
 
 class FakeRedisClient {
-    private readonly listenersByChannel: Map<string, PubSubListener> = new Map();
+    public readonly handlers: Map<string, Array<(...args: any[]) => void>> = new Map();
+    public destroyed = false;
 
     constructor(private readonly server: FakeRedisServer) {}
 
-    public async connect(): Promise<void> {
-        // no-op
+    public on(event: string, handler: (...args: any[]) => void): this {
+        this.handlers.set(event, [...(this.handlers.get(event) ?? []), handler]);
+        return this;
     }
 
-    public async disconnect(): Promise<void> {
-        if (nextDisconnectShouldFail) {
-            nextDisconnectShouldFail = false;
-            throw new Error("simulated Redis disconnect failure");
+    public emit(event: string, ...args: any[]): void {
+        for (const handler of this.handlers.get(event) ?? []) {
+            handler(...args);
         }
-        for (const [channel, listener] of this.listenersByChannel) {
-            this.server.unsubscribe(channel, listener);
+    }
+
+    public async connect(): Promise<this> {
+        fake.connectCount++;
+        // Consumed at call time, so a gated failing connect doesn't also fail a later, ungated one.
+        const shouldFail = fake.nextConnectShouldFail;
+        fake.nextConnectShouldFail = false;
+        if (fake.connectGate) {
+            await fake.connectGate;
         }
-        this.listenersByChannel.clear();
+        if (shouldFail) {
+            throw new Error("simulated Redis connect failure");
+        }
+        return this;
+    }
+
+    public destroy(): void {
+        this.destroyed = true;
+        if (fake.nextDestroyShouldFail) {
+            fake.nextDestroyShouldFail = false;
+            throw new Error("simulated Redis destroy failure");
+        }
     }
 
     public async subscribe(channels: string[], listener: PubSubListener): Promise<void> {
-        if (nextSubscribeShouldFail) {
-            nextSubscribeShouldFail = false;
+        if (fake.subscribeGate) {
+            await fake.subscribeGate;
+        }
+        if (fake.nextSubscribeShouldFail) {
+            fake.nextSubscribeShouldFail = false;
             throw new Error("simulated Redis connection failure");
         }
         for (const channel of channels) {
             this.server.subscribe(channel, listener);
-            this.listenersByChannel.set(channel, listener);
         }
     }
 
-    public async unsubscribe(channels: string[]): Promise<void> {
-        if (nextUnsubscribeShouldFail) {
-            nextUnsubscribeShouldFail = false;
+    public async unsubscribe(channels: string[], listener: PubSubListener): Promise<void> {
+        if (fake.nextUnsubscribeShouldFail) {
+            fake.nextUnsubscribeShouldFail = false;
             throw new Error("simulated Redis unsubscribe failure");
         }
         for (const channel of channels) {
-            const listener = this.listenersByChannel.get(channel);
-            if (listener) {
-                this.server.unsubscribe(channel, listener);
-            }
-            this.listenersByChannel.delete(channel);
+            this.server.unsubscribe(channel, listener);
         }
     }
 }
@@ -106,8 +147,18 @@ class FakeRedisClient {
 const fakeRedisServer = new FakeRedisServer();
 
 vi.mock("redis", () => ({
-    createClient: () => new FakeRedisClient(fakeRedisServer),
+    createClient: () => {
+        fake.createClientCount++;
+        fake.lastClient = new FakeRedisClient(fakeRedisServer);
+        return fake.lastClient;
+    },
 }));
+
+const REDIS_CONFIG = {
+    "datastores:events": { url: "redis://fake" },
+    "mail:eas:ping_min_heartbeat_seconds": 1,
+    "mail:eas:ping_max_heartbeat_seconds": 5,
+};
 
 /** Builds a minimal nconf-compatible config double exposing only the paths `PingCommand` reads. */
 function makeConfig(values: Record<string, any>): any {
@@ -115,11 +166,9 @@ function makeConfig(values: Record<string, any>): any {
 }
 
 /**
- * Builds a `PingCommand` via a real `ObjectFactory` (so its `@Config` fields resolve normally, matching every
- * other test in this file), then stubs its `@Inject(ACLUtils)` field directly - this file's own config double
- * has no real datastore for `ObjectFactory` to construct a working `ACLUtils` against (by design: `Ping` itself
- * has no database dependency of its own), so DI leaves that field unset. `deniedFolderUids` lets a test assert
- * on the new permission-filtering behavior without needing a real ACL backend.
+ * Builds a `PingCommand` via a real `ObjectFactory` (so its `@Config` fields resolve normally), then stubs its
+ * `@Inject(ACLUtils)` field directly - this file's config double has no real datastore for `ObjectFactory` to
+ * construct a working `ACLUtils` against. `deniedFolderUids` lets a test assert on permission filtering.
  */
 async function createCommand(values: Record<string, any>, deniedFolderUids: string[] = []): Promise<PingCommand> {
     const command = await new ObjectFactory(makeConfig(values), Logger()).newInstance<PingCommand>(PingCommand);
@@ -141,7 +190,16 @@ function pingRequest(heartbeatSeconds: number | undefined, folderUids: string[])
     ]);
 }
 
-function makeContext(request: any): EasCommandContext {
+/** A fake `HttpResponse` exposing only `onFinish()`, plus a `finish()` to fire the registered handlers. */
+function makeRes(): { onFinish: (handler: () => void) => void; finish: () => void } {
+    const handlers: Array<() => void> = [];
+    return {
+        onFinish: (handler) => handlers.push(handler),
+        finish: () => handlers.forEach((handler) => handler()),
+    };
+}
+
+function makeContext(request: any, overrides: Partial<Record<"deviceId" | "mailboxUid" | "res", any>> = {}): EasCommandContext {
     return {
         user: { uid: "user-1", roles: [], scopes: [] },
         mailboxUid: "mbx-1",
@@ -152,12 +210,26 @@ function makeContext(request: any): EasCommandContext {
         query: {},
         request,
         req: {} as any,
+        ...overrides,
     };
+}
+
+function tick(ms: number = 10): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => (resolve = r));
+    return { promise, resolve };
 }
 
 describe("PingCommand Tests", () => {
     afterEach(() => {
         vi.restoreAllMocks();
+        PingCommand.resetSharedState();
+        fakeRedisServer.reset();
+        fake.reset();
     });
 
     it("Returns Status 3 (missing parameters) when the request body is absent.", async () => {
@@ -178,18 +250,34 @@ describe("PingCommand Tests", () => {
         expect(childText(response!, "Status")).toBe("3");
     });
 
+    it("Returns Status 6 with MaxFolders when more folders than the configured cap are requested, before any ACL check.", async () => {
+        const command = await createCommand({ ...REDIS_CONFIG, "mail:eas:ping_max_folders": 2 });
+        const hasPermission = vi.fn(async () => true);
+        (command as any).aclUtils = { hasPermission };
+
+        const response = await command.handle(makeContext(pingRequest(1, ["folder-1", "folder-2", "folder-3"])));
+        expect(childText(response!, "Status")).toBe("6");
+        expect(childText(response!, "MaxFolders")).toBe("2");
+        expect(hasPermission).not.toHaveBeenCalled();
+        expect(fake.createClientCount).toBe(0);
+    });
+
+    it("Accepts exactly the configured folder cap.", async () => {
+        const command = await createCommand({ ...REDIS_CONFIG, "mail:eas:ping_max_folders": 2 });
+        const res = makeRes();
+        const responsePromise = command.handle(makeContext(pingRequest(1, ["folder-1", "folder-2"]), { res }));
+        await tick();
+        res.finish();
+        expect(childText((await responsePromise)!, "Status")).toBe("1");
+    });
+
     it("Filters out a folder the caller has no permission on, still watching the rest.", async () => {
-        const config = {
-            "datastores:events": { url: "redis://fake" },
-            "mail:eas:ping_min_heartbeat_seconds": 1,
-            "mail:eas:ping_max_heartbeat_seconds": 5,
-        };
-        const command = await createCommand(config, ["folder-1"]);
+        const command = await createCommand(REDIS_CONFIG, ["folder-1"]);
 
         const responsePromise = command.handle(makeContext(pingRequest(1, ["folder-1", "folder-2"])));
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        // Only "folder-2" was actually subscribed to (per hasPermission's denial of "folder-1" above) - a
-        // publish on the denied folder must never be observable through this response.
+        await tick();
+        // Only "folder-2" was subscribed to - a publish on the denied folder must never be observable.
+        expect(fakeRedisServer.listenerCount("folder-1")).toBe(0);
         fakeRedisServer.publish("folder-1", JSON.stringify({ type: "Folder", action: "update" }));
         fakeRedisServer.publish("folder-2", JSON.stringify({ type: "Folder", action: "update" }));
 
@@ -199,13 +287,60 @@ describe("PingCommand Tests", () => {
         expect(folders.children.map((f) => f.text)).toEqual(["folder-2"]);
     });
 
-    it("Fails open to Status 1 (no changes) quickly when no datastores:events config is present.", async () => {
-        const command = await createCommand({});
+    it("Evaluates ACL checks in bounded chunks and still filters correctly across more folders than one chunk.", async () => {
+        const command = await createCommand(REDIS_CONFIG);
+        const folderUids = Array.from({ length: 60 }, (_v, i) => `folder-${i}`);
+        const denied = new Set(folderUids.filter((_uid, i) => i % 7 === 0));
+        let inFlight = 0;
+        let maxInFlight = 0;
+        let calls = 0;
+        (command as any).aclUtils = {
+            hasPermission: async (_user: unknown, uid: string) => {
+                calls++;
+                inFlight++;
+                maxInFlight = Math.max(maxInFlight, inFlight);
+                await tick(1);
+                inFlight--;
+                return !denied.has(uid);
+            },
+        };
+
+        const res = makeRes();
+        const responsePromise = command.handle(makeContext(pingRequest(1, folderUids), { res }));
+        await tick(100);
+        expect(calls).toBe(60);
+        expect(maxInFlight).toBeLessThanOrEqual(25);
+        expect(maxInFlight).toBeGreaterThan(1);
+        for (const uid of folderUids) {
+            expect(fakeRedisServer.listenerCount(uid)).toBe(denied.has(uid) ? 0 : 1);
+        }
+
+        fakeRedisServer.publish("folder-0", "{}"); // denied
+        fakeRedisServer.publish("folder-59", "{}"); // permitted, in the last chunk
+        const response = await responsePromise;
+        expect(childText(response!, "Status")).toBe("2");
+        expect(findChild(response!, "Folders")!.children.map((f) => f.text)).toEqual(["folder-59"]);
+    });
+
+    it("Waits the full heartbeat before answering Status 1 when no datastores:events config is present.", async () => {
+        const command = await createCommand({ "mail:eas:ping_min_heartbeat_seconds": 1, "mail:eas:ping_max_heartbeat_seconds": 1 });
         const start = Date.now();
         const response = await command.handle(makeContext(pingRequest(1, ["folder-1"])));
         expect(childText(response!, "Status")).toBe("1");
-        // A real wait would take at least `minHeartbeatSeconds` (60s default) - failing open must not do that.
-        expect(Date.now() - start).toBeLessThan(1000);
+        // Returning immediately would let a device hot-loop Ping requests against the server.
+        expect(Date.now() - start).toBeGreaterThanOrEqual(900);
+        expect(fake.createClientCount).toBe(0);
+    });
+
+    it("Ends the no-Redis heartbeat wait early when the request closes.", async () => {
+        const command = await createCommand({});
+        const res = makeRes();
+        const start = Date.now();
+        const responsePromise = command.handle(makeContext(pingRequest(60, ["folder-1"]), { res }));
+        await tick();
+        res.finish();
+        expect(childText((await responsePromise)!, "Status")).toBe("1");
+        expect(Date.now() - start).toBeLessThan(500);
     });
 
     it("Defaults to minHeartbeatSeconds when HeartbeatInterval is omitted from the request entirely.", async () => {
@@ -214,9 +349,8 @@ describe("PingCommand Tests", () => {
         const start = Date.now();
         const response = await command.handle(makeContext(pingRequest(undefined, ["folder-1"])));
         expect(childText(response!, "Status")).toBe("1");
-        // No datastores:events configured, so this fails open quickly regardless of heartbeat - the point of
-        // this test is only that omitting HeartbeatInterval doesn't throw/NaN its way through the clamp math.
-        expect(Date.now() - start).toBeLessThan(1000);
+        expect(Date.now() - start).toBeGreaterThanOrEqual(900);
+        expect(Date.now() - start).toBeLessThan(3000);
     });
 
     it("Falls back to minHeartbeatSeconds when HeartbeatInterval is present but not a valid number.", async () => {
@@ -228,62 +362,237 @@ describe("PingCommand Tests", () => {
             ]),
         ]);
 
+        const start = Date.now();
         const response = await command.handle(makeContext(request));
         expect(childText(response!, "Status")).toBe("1");
+        expect(Date.now() - start).toBeGreaterThanOrEqual(900);
+        expect(Date.now() - start).toBeLessThan(3000);
     });
 
     it("Returns Status 2 with the changed folder when a publish arrives before the timeout.", async () => {
-        const command = await createCommand({
-            "datastores:events": { url: "redis://fake" },
-            "mail:eas:ping_min_heartbeat_seconds": 1,
-            "mail:eas:ping_max_heartbeat_seconds": 5,
-        });
+        const command = await createCommand(REDIS_CONFIG);
 
         const responsePromise = command.handle(makeContext(pingRequest(1, ["folder-1", "folder-2"])));
-        // Give waitForChange() a tick to actually subscribe before publishing.
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        await tick();
         fakeRedisServer.publish("folder-2", JSON.stringify({ type: "Folder", action: "update" }));
 
         const response = await responsePromise;
         expect(childText(response!, "Status")).toBe("2");
         const folders = findChild(response!, "Folders")!;
         expect(folders.children.map((f) => f.text)).toEqual(["folder-2"]);
+        await tick();
+        // This Ping's own listener was removed once it settled.
+        expect(fakeRedisServer.listenerCount("folder-1")).toBe(0);
+        expect(fakeRedisServer.listenerCount("folder-2")).toBe(0);
     });
 
     it("Returns Status 1 (no changes) when the heartbeat elapses with no publish.", async () => {
-        const command = await createCommand({
-            "datastores:events": { url: "redis://fake" },
-            "mail:eas:ping_min_heartbeat_seconds": 1,
-            "mail:eas:ping_max_heartbeat_seconds": 5,
-        });
+        const command = await createCommand(REDIS_CONFIG);
 
         const response = await command.handle(makeContext(pingRequest(1, ["folder-1"])));
         expect(childText(response!, "Status")).toBe("1");
+        await tick();
+        expect(fakeRedisServer.listenerCount("folder-1")).toBe(0);
+    });
+
+    it("Shares one Redis subscriber client across multiple concurrent and sequential Pings.", async () => {
+        const command = await createCommand(REDIS_CONFIG);
+
+        const first = command.handle(makeContext(pingRequest(1, ["folder-1"]), { deviceId: "dev-1" }));
+        const second = command.handle(makeContext(pingRequest(1, ["folder-1"]), { deviceId: "dev-2" }));
+        await tick();
+        expect(fakeRedisServer.listenerCount("folder-1")).toBe(2);
+        fakeRedisServer.publish("folder-1", "{}");
+        expect(childText((await first)!, "Status")).toBe("2");
+        expect(childText((await second)!, "Status")).toBe("2");
+
+        const third = command.handle(makeContext(pingRequest(1, ["folder-3"])));
+        await tick();
+        fakeRedisServer.publish("folder-3", "{}");
+        expect(childText((await third)!, "Status")).toBe("2");
+
+        // A second command instance in the same process reuses the same client too.
+        const otherCommand = await createCommand(REDIS_CONFIG);
+        const fourth = otherCommand.handle(makeContext(pingRequest(1, ["folder-4"])));
+        await tick();
+        fakeRedisServer.publish("folder-4", "{}");
+        expect(childText((await fourth)!, "Status")).toBe("2");
+
+        expect(fake.createClientCount).toBe(1);
+        expect(fake.connectCount).toBe(1);
+    });
+
+    it("Supersedes an older Ping for the same mailbox and device, leaving other devices unaffected.", async () => {
+        const command = await createCommand(REDIS_CONFIG);
+
+        const older = command.handle(makeContext(pingRequest(5, ["folder-1"]), { deviceId: "dev-1" }));
+        const otherDevice = command.handle(makeContext(pingRequest(5, ["folder-1"]), { deviceId: "dev-2" }));
+        const otherMailbox = command.handle(makeContext(pingRequest(5, ["folder-1"]), { mailboxUid: "mbx-2", deviceId: "dev-1" }));
+        await tick();
+        expect(fakeRedisServer.listenerCount("folder-1")).toBe(3);
+
+        const start = Date.now();
+        const newer = command.handle(makeContext(pingRequest(5, ["folder-1"]), { deviceId: "dev-1" }));
+        expect(childText((await older)!, "Status")).toBe("1");
+        expect(Date.now() - start).toBeLessThan(500);
+        await tick();
+        // older's listener removed, newer's added.
+        expect(fakeRedisServer.listenerCount("folder-1")).toBe(3);
+
+        fakeRedisServer.publish("folder-1", "{}");
+        expect(childText((await newer)!, "Status")).toBe("2");
+        expect(childText((await otherDevice)!, "Status")).toBe("2");
+        expect(childText((await otherMailbox)!, "Status")).toBe("2");
+    });
+
+    it("Stops waiting and answers Status 1 when the request closes, and a later close is harmless.", async () => {
+        const command = await createCommand(REDIS_CONFIG);
+        const res = makeRes();
+
+        const start = Date.now();
+        const responsePromise = command.handle(makeContext(pingRequest(5, ["folder-1"]), { res }));
+        await tick();
+        expect(fakeRedisServer.listenerCount("folder-1")).toBe(1);
+        res.finish();
+        expect(childText((await responsePromise)!, "Status")).toBe("1");
+        expect(Date.now() - start).toBeLessThan(500);
+        await tick();
+        expect(fakeRedisServer.listenerCount("folder-1")).toBe(0);
+
+        // Firing onFinish again (e.g. normal end after an abort) must not throw or affect a newer Ping.
+        const newer = command.handle(makeContext(pingRequest(1, ["folder-1"])));
+        await tick();
+        res.finish();
+        fakeRedisServer.publish("folder-1", "{}");
+        expect(childText((await newer)!, "Status")).toBe("2");
+    });
+
+    it("Releases the subscription when the request closes while the shared client is still connecting.", async () => {
+        const command = await createCommand(REDIS_CONFIG);
+        const gate = deferred();
+        fake.connectGate = gate.promise;
+        const res = makeRes();
+
+        const responsePromise = command.handle(makeContext(pingRequest(5, ["folder-1"]), { res }));
+        await tick();
+        res.finish();
+        expect(childText((await responsePromise)!, "Status")).toBe("1");
+
+        gate.resolve();
+        await tick();
+        expect(fakeRedisServer.listenerCount("folder-1")).toBe(0);
+    });
+
+    it("Releases the subscription when the request closes while subscribe() is still in flight.", async () => {
+        const command = await createCommand(REDIS_CONFIG);
+        const gate = deferred();
+        fake.subscribeGate = gate.promise;
+        const res = makeRes();
+
+        const responsePromise = command.handle(makeContext(pingRequest(5, ["folder-1"]), { res }));
+        await tick();
+        res.finish();
+        expect(childText((await responsePromise)!, "Status")).toBe("1");
+
+        gate.resolve();
+        await tick();
+        expect(fakeRedisServer.listenerCount("folder-1")).toBe(0);
+    });
+
+    it("Fails open on a connect failure and retries connecting on a later Ping.", async () => {
+        const command = await createCommand(REDIS_CONFIG);
+        fake.nextConnectShouldFail = true;
+        const res = makeRes();
+
+        const failed = command.handle(makeContext(pingRequest(5, ["folder-1"]), { res }));
+        await tick();
+        expect(fake.lastClient!.destroyed).toBe(true);
+        expect(fakeRedisServer.listenerCount("folder-1")).toBe(0);
+        // Still waiting (no hot-loop), until the request closes.
+        res.finish();
+        expect(childText((await failed)!, "Status")).toBe("1");
+
+        const retried = command.handle(makeContext(pingRequest(1, ["folder-1"])));
+        await tick();
+        fakeRedisServer.publish("folder-1", "{}");
+        expect(childText((await retried)!, "Status")).toBe("2");
+        expect(fake.createClientCount).toBe(2);
+        expect(fake.connectCount).toBe(2);
+    });
+
+    it("Fails open when destroying a client whose connect failed also throws.", async () => {
+        const command = await createCommand({ ...REDIS_CONFIG, "mail:eas:ping_max_heartbeat_seconds": 1 });
+        fake.nextConnectShouldFail = true;
+        fake.nextDestroyShouldFail = true;
+
+        const response = await command.handle(makeContext(pingRequest(1, ["folder-1"])));
+        expect(childText(response!, "Status")).toBe("1");
+        expect(fake.lastClient!.destroyed).toBe(true);
+    });
+
+    it("Does not evict a newer shared client when an older failed connect settles late.", async () => {
+        const command = await createCommand(REDIS_CONFIG);
+        const gate = deferred();
+        fake.connectGate = gate.promise;
+        fake.nextConnectShouldFail = true;
+        const res1 = makeRes();
+        const first = command.handle(makeContext(pingRequest(5, ["folder-1"]), { res: res1 }));
+        await tick();
+
+        // Simulate the cache having been replaced before the failure lands (e.g. a reset between tests).
+        PingCommand.resetSharedState();
+        fake.connectGate = undefined;
+        const res2 = makeRes();
+        const second = command.handle(makeContext(pingRequest(5, ["folder-2"]), { deviceId: "dev-2", res: res2 }));
+        await tick();
+        expect(fake.createClientCount).toBe(2);
+
+        gate.resolve();
+        await tick();
+        res1.finish();
+        expect(childText((await first)!, "Status")).toBe("1");
+
+        const third = command.handle(makeContext(pingRequest(5, ["folder-3"]), { deviceId: "dev-3" }));
+        await tick();
+        // The second client stayed cached.
+        expect(fake.createClientCount).toBe(2);
+        fakeRedisServer.publish("folder-3", "{}");
+        expect(childText((await third)!, "Status")).toBe("2");
+        res2.finish();
+        expect(childText((await second)!, "Status")).toBe("1");
     });
 
     it("Fails open to Status 1 when the Redis client's subscribe() call itself rejects.", async () => {
-        const command = await createCommand({
-            "datastores:events": { url: "redis://fake" },
-            "mail:eas:ping_min_heartbeat_seconds": 1,
-            "mail:eas:ping_max_heartbeat_seconds": 5,
-        });
+        const command = await createCommand(REDIS_CONFIG);
 
-        nextSubscribeShouldFail = true;
+        fake.nextSubscribeShouldFail = true;
+        const start = Date.now();
         const response = await command.handle(makeContext(pingRequest(1, ["folder-1"])));
         expect(childText(response!, "Status")).toBe("1");
+        // Still waits the heartbeat rather than answering immediately.
+        expect(Date.now() - start).toBeGreaterThanOrEqual(900);
     });
 
-    it("Still returns a successful response when the post-wait Redis cleanup (unsubscribe/disconnect) itself fails.", async () => {
-        const command = await createCommand({
-            "datastores:events": { url: "redis://fake" },
-            "mail:eas:ping_min_heartbeat_seconds": 1,
-            "mail:eas:ping_max_heartbeat_seconds": 5,
-        });
+    it("Still returns a successful response when the post-wait unsubscribe itself fails.", async () => {
+        const command = await createCommand(REDIS_CONFIG);
 
-        nextUnsubscribeShouldFail = true;
-        nextDisconnectShouldFail = true;
-        const response = await command.handle(makeContext(pingRequest(1, ["folder-1"])));
-        expect(childText(response!, "Status")).toBe("1");
+        fake.nextUnsubscribeShouldFail = true;
+        const responsePromise = command.handle(makeContext(pingRequest(1, ["folder-1"])));
+        await tick();
+        fakeRedisServer.publish("folder-1", "{}");
+        expect(childText((await responsePromise)!, "Status")).toBe("2");
+        await tick();
+        expect(fake.nextUnsubscribeShouldFail).toBe(false);
+    });
+
+    it("Swallows error events emitted by the shared Redis client.", async () => {
+        const command = await createCommand(REDIS_CONFIG);
+        const res = makeRes();
+        const responsePromise = command.handle(makeContext(pingRequest(5, ["folder-1"]), { res }));
+        await tick();
+        expect(() => fake.lastClient!.emit("error", new Error("socket closed"))).not.toThrow();
+        res.finish();
+        expect(childText((await responsePromise)!, "Status")).toBe("1");
     });
 
     it("Clamps a HeartbeatInterval outside the configured min/max range.", async () => {

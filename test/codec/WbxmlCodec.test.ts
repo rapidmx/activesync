@@ -5,8 +5,20 @@
 // The WBXML codec is pure binary-format logic with no DI/DB dependency, so it's tested directly here rather
 // than only indirectly through a real-server HTTP round trip (which BaseEasRoute's own tests will still do,
 // once that lands, using this exact codec to build/parse the request/response bytes).
-import { WbxmlDecoder } from "../../src/codec/WbxmlDecoder.js";
-import { WbxmlEncoder } from "../../src/codec/WbxmlEncoder.js";
+import {
+    WbxmlDecoder,
+    WbxmlDecodeError,
+    WbxmlLimitError,
+    WBXML_DEFAULT_MAX_CHILDREN_PER_ELEMENT,
+    WBXML_DEFAULT_MAX_DEPTH,
+    WBXML_DEFAULT_MAX_ELEMENTS,
+} from "../../src/codec/WbxmlDecoder.js";
+import {
+    WbxmlEncoder,
+    WbxmlSizeLimitError,
+    WBXML_ENCODER_SCRATCH_SIZE,
+    wbxmlOpaqueSize,
+} from "../../src/codec/WbxmlEncoder.js";
 import { codeForTagName, tagNameForCode, WbxmlCodePage } from "../../src/codec/WbxmlCodePages.js";
 import {
     element,
@@ -17,6 +29,66 @@ import {
     childText,
     type WbxmlElement,
 } from "../../src/codec/WbxmlElement.js";
+
+/** The fixed EAS WBXML header: version 1.3, publicid 1, charset UTF-8, empty string table. */
+const HEADER = [0x03, 0x01, 0x6a, 0x00];
+
+/** `depth` content-flagged page-0 Sync tags nested inside one another, each closed by END. */
+function nested(depth: number): Buffer {
+    return Buffer.concat([Buffer.from(HEADER), Buffer.alloc(depth, 0x05 | 0x40), Buffer.alloc(depth, 0x01)]);
+}
+
+/** A page-0 Sync root carrying `count` empty (no-content) Sync children. */
+function flat(count: number): Buffer {
+    return Buffer.concat([Buffer.from([...HEADER, 0x05 | 0x40]), Buffer.alloc(count, 0x05), Buffer.from([0x01])]);
+}
+
+/** The original byte-at-a-time `number[]` encoder, kept as an independent reference for byte-identity checks. */
+function referenceEncode(root: WbxmlElement): Buffer {
+    const bytes: number[] = [0x03, 0x01, 0x6a, 0x00];
+    let currentPage = 0;
+    const writeMbUint = (value: number): void => {
+        const groups: number[] = [value & 0x7f];
+        value = Math.floor(value / 128);
+        while (value > 0) {
+            groups.unshift((value & 0x7f) | 0x80);
+            value = Math.floor(value / 128);
+        }
+        for (const group of groups) {
+            bytes.push(group);
+        }
+    };
+    const writeElement = (el: WbxmlElement): void => {
+        if (el.page !== currentPage) {
+            bytes.push(0x00, el.page);
+            currentPage = el.page;
+        }
+        const code = codeForTagName(el.page, el.tag);
+        const hasContent = el.children.length > 0 || el.text !== undefined || el.opaque !== undefined;
+        bytes.push(hasContent ? code | 0x40 : code);
+        if (!hasContent) {
+            return;
+        }
+        if (el.text !== undefined) {
+            bytes.push(0x03);
+            for (const byte of Buffer.from(el.text.split(String.fromCharCode(0)).join(""), "utf-8")) {
+                bytes.push(byte);
+            }
+            bytes.push(0x00);
+        } else if (el.opaque !== undefined) {
+            bytes.push(0xc3);
+            writeMbUint(el.opaque.length);
+            for (const byte of el.opaque) {
+                bytes.push(byte);
+            }
+        } else {
+            el.children.forEach(writeElement);
+        }
+        bytes.push(0x01);
+    };
+    writeElement(root);
+    return Buffer.from(bytes);
+}
 
 describe("WBXML codec Tests", () => {
     describe("Real captured ActiveSync traffic (Microsoft's own published worked example)", () => {
@@ -270,13 +342,258 @@ describe("WBXML codec Tests", () => {
             // header + 250 content-flagged Sync tag bytes (each ~2 bytes of wire format), then 250 matching
             // ENDs to close them all - a crafted request could reach this depth in well under a kilobyte,
             // exercising the exact DoS surface the depth cap exists to close off.
-            const depth = 250;
-            const header = Buffer.from([0x03, 0x01, 0x6a, 0x00]);
-            const opens = Buffer.alloc(depth, 0x05 | 0x40);
-            const closes = Buffer.alloc(depth, 0x01);
-            const bytes = Buffer.concat([header, opens, closes]);
+            const bytes = nested(250);
 
-            expect(() => new WbxmlDecoder().decode(bytes)).toThrow(/exceeded maximum nesting depth/);
+            expect(WBXML_DEFAULT_MAX_DEPTH).toBe(64);
+            expect(() => new WbxmlDecoder().decode(bytes)).toThrow(WbxmlLimitError);
+            expect(() => new WbxmlDecoder().decode(bytes)).toThrow(/exceeded maximum nesting depth of 64/);
+            // Exactly at the default limit decodes fine; one more level fails.
+            expect(() => new WbxmlDecoder().decode(nested(64))).not.toThrow();
+            expect(() => new WbxmlDecoder().decode(nested(65))).toThrow(WbxmlLimitError);
+        });
+
+        it("Malformed-input errors are WbxmlDecodeError instances (and not WbxmlLimitError).", () => {
+            let caught: unknown;
+            try {
+                new WbxmlDecoder().decode(Buffer.from([0x03]));
+            } catch (err) {
+                caught = err;
+            }
+            expect(caught).toBeInstanceOf(WbxmlDecodeError);
+            expect(caught).not.toBeInstanceOf(WbxmlLimitError);
+            expect((caught as Error).name).toBe("WbxmlDecodeError");
+        });
+
+        it("Throws when an OPAQUE length runs past the end of the buffer instead of silently truncating.", () => {
+            // header + Sync(content) + OPAQUE, length 10, but only 2 payload bytes follow.
+            const bytes = Buffer.from([...HEADER, 0x45, 0xc3, 0x0a, 0xaa, 0xbb]);
+            expect(() => new WbxmlDecoder().decode(bytes)).toThrow(WbxmlDecodeError);
+            expect(() => new WbxmlDecoder().decode(bytes)).toThrow(/OPAQUE length 10 runs past the end of the buffer/);
+        });
+
+        it("Accepts an OPAQUE payload that ends exactly at the END token.", () => {
+            const bytes = Buffer.from([...HEADER, 0x45, 0xc3, 0x02, 0xaa, 0xbb, 0x01]);
+            expect(new WbxmlDecoder().decode(bytes).opaque?.equals(Buffer.from([0xaa, 0xbb]))).toBe(true);
+        });
+
+        it("Throws when the string table length runs past the end of the buffer.", () => {
+            const bytes = Buffer.from([0x03, 0x01, 0x6a, 0x05, 0x05, 0x05]);
+            expect(() => new WbxmlDecoder().decode(bytes)).toThrow(WbxmlDecodeError);
+            expect(() => new WbxmlDecoder().decode(bytes)).toThrow(/string table length 5 runs past the end/);
+        });
+
+        it("Skips a non-empty string table that fits within the buffer.", () => {
+            const bytes = Buffer.from([0x03, 0x01, 0x6a, 0x02, 0x41, 0x42, 0x05]);
+            expect(new WbxmlDecoder().decode(bytes)).toEqual(element(WbxmlCodePage.AirSync, "Sync"));
+        });
+    });
+
+    describe("Decoder resource limits", () => {
+        it("Exposes the documented default limits.", () => {
+            expect(WBXML_DEFAULT_MAX_ELEMENTS).toBe(50_000);
+            expect(WBXML_DEFAULT_MAX_CHILDREN_PER_ELEMENT).toBe(10_000);
+            expect(WBXML_DEFAULT_MAX_DEPTH).toBe(64);
+        });
+
+        it("Throws WbxmlLimitError when a custom maxElements is exceeded (root counts as one element).", () => {
+            // Root + 4 empty children = 5 elements.
+            const bytes = flat(4);
+            expect(new WbxmlDecoder({ maxElements: 5 }).decode(bytes).children).toHaveLength(4);
+            expect(() => new WbxmlDecoder({ maxElements: 4 }).decode(bytes)).toThrow(WbxmlLimitError);
+            expect(() => new WbxmlDecoder({ maxElements: 4 }).decode(bytes)).toThrow(
+                /exceeded maximum element count of 4/,
+            );
+        });
+
+        it("Counts elements across the whole document, not per parent.", () => {
+            // Root > 2 containers > 3 empty children each = 1 + 2 + 6 = 9 elements.
+            const container = [0x45, 0x05, 0x05, 0x05, 0x01];
+            const bytes = Buffer.from([...HEADER, 0x45, ...container, ...container, 0x01]);
+            expect(() => new WbxmlDecoder({ maxElements: 9 }).decode(bytes)).not.toThrow();
+            expect(() => new WbxmlDecoder({ maxElements: 8 }).decode(bytes)).toThrow(WbxmlLimitError);
+        });
+
+        it("Throws WbxmlLimitError past the default maxElements even when no single element has too many children.", () => {
+            // Root > 6 containers > 10,000 empty children each = 60,007 elements (~60 KB of wire bytes).
+            const perContainer = WBXML_DEFAULT_MAX_CHILDREN_PER_ELEMENT;
+            const container = Buffer.concat([Buffer.from([0x45]), Buffer.alloc(perContainer, 0x05), Buffer.from([0x01])]);
+            const bytes = Buffer.concat([
+                Buffer.from([...HEADER, 0x45]),
+                ...Array.from({ length: 6 }, () => container),
+                Buffer.from([0x01]),
+            ]);
+            expect(() => new WbxmlDecoder().decode(bytes)).toThrow(WbxmlLimitError);
+            expect(() => new WbxmlDecoder().decode(bytes)).toThrow(/exceeded maximum element count of 50000/);
+
+            // Four containers (40,005 elements) stays within the default.
+            const smaller = Buffer.concat([
+                Buffer.from([...HEADER, 0x45]),
+                ...Array.from({ length: 4 }, () => container),
+                Buffer.from([0x01]),
+            ]);
+            expect(new WbxmlDecoder().decode(smaller).children).toHaveLength(4);
+        });
+
+        it("Throws WbxmlLimitError when one element exceeds the default maxChildrenPerElement.", () => {
+            const bytes = flat(WBXML_DEFAULT_MAX_CHILDREN_PER_ELEMENT + 1);
+            expect(() => new WbxmlDecoder().decode(bytes)).toThrow(WbxmlLimitError);
+            expect(() => new WbxmlDecoder().decode(bytes)).toThrow(/exceeded maximum of 10000 children per element/);
+            expect(new WbxmlDecoder().decode(flat(WBXML_DEFAULT_MAX_CHILDREN_PER_ELEMENT)).children).toHaveLength(
+                WBXML_DEFAULT_MAX_CHILDREN_PER_ELEMENT,
+            );
+        });
+
+        it("Honors a custom maxChildrenPerElement.", () => {
+            expect(new WbxmlDecoder({ maxChildrenPerElement: 3 }).decode(flat(3)).children).toHaveLength(3);
+            expect(() => new WbxmlDecoder({ maxChildrenPerElement: 3 }).decode(flat(4))).toThrow(WbxmlLimitError);
+        });
+
+        it("Honors a custom maxDepth.", () => {
+            expect(() => new WbxmlDecoder({ maxDepth: 3 }).decode(nested(3))).not.toThrow();
+            expect(() => new WbxmlDecoder({ maxDepth: 3 }).decode(nested(4))).toThrow(
+                /exceeded maximum nesting depth of 3/,
+            );
+            // A raised limit allows deeper documents than the default.
+            expect(() => new WbxmlDecoder({ maxDepth: 100 }).decode(nested(100))).not.toThrow();
+        });
+
+        it("Resets counters between decode() calls on the same instance.", () => {
+            const decoder = new WbxmlDecoder({ maxElements: 5 });
+            expect(() => decoder.decode(flat(4))).not.toThrow();
+            expect(() => decoder.decode(flat(4))).not.toThrow();
+        });
+
+        it("Rejects non-positive or non-integer limit options with a RangeError.", () => {
+            expect(() => new WbxmlDecoder({ maxElements: 0 })).toThrow(RangeError);
+            expect(() => new WbxmlDecoder({ maxChildrenPerElement: 1.5 })).toThrow(/maxChildrenPerElement/);
+            expect(() => new WbxmlDecoder({ maxDepth: -1 })).toThrow(/maxDepth must be a positive integer/);
+            expect(() => new WbxmlDecoder({ maxElements: Number.NaN })).toThrow(RangeError);
+        });
+    });
+
+    describe("Encoder chunking and size limits", () => {
+        it("Produces byte-identical output to a naive reference encoder for a large opaque payload.", () => {
+            const payload = Buffer.alloc(3 * 1024 * 1024);
+            for (let i = 0; i < payload.length; i++) {
+                payload[i] = (i * 31) & 0xff;
+            }
+            const tree = element(WbxmlCodePage.ItemOperations, "ItemOperations", [
+                textElement(WbxmlCodePage.ItemOperations, "Status", "1"),
+                opaqueElement(WbxmlCodePage.ItemOperations, "Data", payload),
+                textElement(WbxmlCodePage.ItemOperations, "Status", "1"),
+            ]);
+            const encoded = new WbxmlEncoder().encode(tree);
+            expect(encoded.equals(referenceEncode(tree))).toBe(true);
+            expect(new WbxmlDecoder().decode(encoded).children[1].opaque?.equals(payload)).toBe(true);
+        });
+
+        it("Produces byte-identical output to a naive reference encoder for large text with NULs and multi-byte characters.", () => {
+            const nul = String.fromCharCode(0);
+            const text = `héllo${nul}日本😀 `.repeat(50_000);
+            const tree = element(WbxmlCodePage.AirSync, "Sync", [textElement(WbxmlCodePage.Email, "Subject", text)]);
+            const encoded = new WbxmlEncoder().encode(tree);
+            expect(encoded.equals(referenceEncode(tree))).toBe(true);
+            expect(new WbxmlDecoder().decode(encoded).children[0].text).toBe(text.split(nul).join(""));
+        });
+
+        it("Concatenates many token-only chunks correctly (output spans several scratch flushes).", () => {
+            const children = Array.from({ length: WBXML_ENCODER_SCRATCH_SIZE * 2 }, (_, i) =>
+                i % 3 === 0
+                    ? element(WbxmlCodePage.Email, "Read")
+                    : i % 3 === 1
+                      ? textElement(WbxmlCodePage.AirSync, "SyncKey", String(i))
+                      : opaqueElement(WbxmlCodePage.ItemOperations, "Data", Buffer.from([i & 0xff, 0x00])),
+            );
+            const tree = element(WbxmlCodePage.AirSync, "Sync", children);
+            const encoded = new WbxmlEncoder().encode(tree);
+            expect(encoded.length).toBeGreaterThan(WBXML_ENCODER_SCRATCH_SIZE * 3);
+            expect(encoded.equals(referenceEncode(tree))).toBe(true);
+            expect(new WbxmlDecoder({ maxChildrenPerElement: children.length }).decode(encoded)).toEqual(tree);
+        });
+
+        it("Concatenates token-only output that fills the scratch buffer several times, including an exact boundary.", () => {
+            // header(4) + root tag(1) + N empty children + END(1): N = SCRATCH - 6 ends exactly on a flush boundary.
+            for (const count of [WBXML_ENCODER_SCRATCH_SIZE - 6, WBXML_ENCODER_SCRATCH_SIZE * 3 + 17]) {
+                const tree = element(
+                    WbxmlCodePage.AirSync,
+                    "Sync",
+                    Array.from({ length: count }, () => element(WbxmlCodePage.AirSync, "Sync")),
+                );
+                const encoded = new WbxmlEncoder().encode(tree);
+                expect(encoded.length).toBe(count + 6);
+                expect(encoded.equals(flat(count))).toBe(true);
+                expect(encoded.equals(referenceEncode(tree))).toBe(true);
+            }
+        });
+
+        it("Encodes an empty opaque payload and empty text identically to the reference.", () => {
+            const tree = element(WbxmlCodePage.AirSync, "Sync", [
+                opaqueElement(WbxmlCodePage.ItemOperations, "Data", Buffer.alloc(0)),
+                textElement(WbxmlCodePage.AirSync, "SyncKey", ""),
+            ]);
+            expect(new WbxmlEncoder().encode(tree).equals(referenceEncode(tree))).toBe(true);
+        });
+
+        it("Succeeds at exactly maxBytes and throws WbxmlSizeLimitError one byte below (text path).", () => {
+            const tree = textElement(WbxmlCodePage.AirSync, "SyncKey", "x".repeat(1000));
+            const exact = new WbxmlEncoder().encode(tree).length;
+            expect(new WbxmlEncoder({ maxBytes: exact }).encode(tree).equals(referenceEncode(tree))).toBe(true);
+
+            let caught: unknown;
+            try {
+                new WbxmlEncoder({ maxBytes: exact - 1 }).encode(tree);
+            } catch (err) {
+                caught = err;
+            }
+            expect(caught).toBeInstanceOf(WbxmlSizeLimitError);
+            expect((caught as WbxmlSizeLimitError).name).toBe("WbxmlSizeLimitError");
+            expect((caught as WbxmlSizeLimitError).maxBytes).toBe(exact - 1);
+            expect((caught as Error).message).toMatch(new RegExp(`maximum size of ${exact - 1} bytes`));
+        });
+
+        it("Throws WbxmlSizeLimitError before appending an oversized opaque payload, and succeeds at exactly the limit.", () => {
+            const payload = Buffer.alloc(200_000, 0x42);
+            const tree = opaqueElement(WbxmlCodePage.ItemOperations, "Data", payload);
+            // header(4) + SWITCH_PAGE(2) + tag(1) + OPAQUE token/length/payload + END(1)
+            const exact = 4 + 2 + 1 + wbxmlOpaqueSize(payload.length) + 1;
+            expect(new WbxmlEncoder().encode(tree).length).toBe(exact);
+            expect(new WbxmlEncoder({ maxBytes: exact }).encode(tree).length).toBe(exact);
+            expect(() => new WbxmlEncoder({ maxBytes: exact - 1 }).encode(tree)).toThrow(WbxmlSizeLimitError);
+            expect(() => new WbxmlEncoder({ maxBytes: 1000 }).encode(tree)).toThrow(/maximum size of 1000 bytes/);
+        });
+
+        it("Throws WbxmlSizeLimitError on token bytes alone (header larger than the limit).", () => {
+            expect(() => new WbxmlEncoder({ maxBytes: 3 }).encode(element(WbxmlCodePage.AirSync, "Sync"))).toThrow(
+                WbxmlSizeLimitError,
+            );
+        });
+
+        it("Reuses an encoder instance cleanly after a size-limit failure.", () => {
+            const encoder = new WbxmlEncoder({ maxBytes: 20 });
+            expect(() => encoder.encode(textElement(WbxmlCodePage.AirSync, "SyncKey", "x".repeat(100)))).toThrow(
+                WbxmlSizeLimitError,
+            );
+            const small = textElement(WbxmlCodePage.AirSync, "SyncKey", "1");
+            expect(encoder.encode(small).equals(referenceEncode(small))).toBe(true);
+        });
+
+        it("wbxmlOpaqueSize() accounts for the mb_u_int32 length width.", () => {
+            expect(wbxmlOpaqueSize(0)).toBe(2);
+            expect(wbxmlOpaqueSize(127)).toBe(1 + 1 + 127);
+            expect(wbxmlOpaqueSize(128)).toBe(1 + 2 + 128);
+            expect(wbxmlOpaqueSize(16_384)).toBe(1 + 3 + 16_384);
+            for (const length of [0, 127, 128, 16_383, 16_384]) {
+                const tree = opaqueElement(WbxmlCodePage.AirSync, "SyncKey", Buffer.alloc(length));
+                // header(4) + tag(1) + opaque + END(1)
+                expect(new WbxmlEncoder().encode(tree).length).toBe(4 + 1 + wbxmlOpaqueSize(length) + 1);
+            }
+        });
+
+        it("Rejects an invalid maxBytes option with a RangeError, and accepts Infinity.", () => {
+            expect(() => new WbxmlEncoder({ maxBytes: 0 })).toThrow(RangeError);
+            expect(() => new WbxmlEncoder({ maxBytes: 1.5 })).toThrow(/maxBytes must be a positive integer or Infinity/);
+            expect(() => new WbxmlEncoder({ maxBytes: Number.NaN })).toThrow(RangeError);
+            expect(() => new WbxmlEncoder({ maxBytes: Infinity })).not.toThrow();
         });
     });
 

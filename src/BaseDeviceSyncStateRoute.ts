@@ -75,6 +75,8 @@ export abstract class BaseDeviceSyncStateRoute<D extends DeviceSyncState> {
             remoteWipeRequested: true,
             remoteWipeAccountOnly: accountOnly,
             provisioned: false,
+            // The old key must stop working immediately, not just once the device next provisions.
+            policyKey: null,
         });
         return deviceSyncState;
     }

@@ -14,6 +14,7 @@ import * as uuid from "uuid";
 import config from "../../config.js";
 import { EasDeviceStateCleanupJobMongo } from "../../../src/jobs/mongo/EasDeviceStateCleanupJobMongo.js";
 import { DeviceSyncStateMongo } from "../../../src/models/mongo/DeviceSyncStateMongo.js";
+import { EasCollectionStateMongo } from "../../../src/models/mongo/EasCollectionStateMongo.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: { port: 9999, dbName: "rrst-test" },
@@ -27,6 +28,7 @@ describe("EasDeviceStateCleanupJobMongo Tests (real DB + DI)", () => {
     let objectFactory: ObjectFactory;
     let connectionManager: ConnectionManager;
     let job: EasDeviceStateCleanupJobMongo;
+    let collectionStateRepo: MongoRepository<EasCollectionStateMongo>;
     let deviceSyncStateRepo: MongoRepository<DeviceSyncStateMongo>;
 
     const createDevice = async (data?: Partial<DeviceSyncStateMongo>): Promise<DeviceSyncStateMongo> => {
@@ -51,6 +53,7 @@ describe("EasDeviceStateCleanupJobMongo Tests (real DB + DI)", () => {
         connectionManager = await objectFactory.newInstance(ConnectionManager, { name: "default" });
         const models = new Map<string, any>();
         models.set("DeviceSyncStateMongo", DeviceSyncStateMongo);
+        models.set("EasCollectionStateMongo", EasCollectionStateMongo);
         await connectionManager.connect(config.get("datastores"), models);
 
         const conn: any = connectionManager.connections.get("mongo");
@@ -58,6 +61,7 @@ describe("EasDeviceStateCleanupJobMongo Tests (real DB + DI)", () => {
             throw new Error("Could not find mongo connection");
         }
         deviceSyncStateRepo = conn.getMongoRepository("DeviceSyncStateMongo");
+        collectionStateRepo = conn.getMongoRepository("EasCollectionStateMongo");
 
         // Constructed once via real ObjectFactory DI: `@Init` builds its one real `RepoUtils` against the live
         // connection above.
@@ -72,6 +76,13 @@ describe("EasDeviceStateCleanupJobMongo Tests (real DB + DI)", () => {
     beforeEach(async () => {
         try {
             await deviceSyncStateRepo.clear();
+        } catch (err: any) {
+            if (err.message !== "ns not found") {
+                throw err;
+            }
+        }
+        try {
+            await collectionStateRepo.clear();
         } catch (err: any) {
             if (err.message !== "ns not found") {
                 throw err;
@@ -192,5 +203,32 @@ describe("EasDeviceStateCleanupJobMongo Tests (real DB + DI)", () => {
         const goodFound = await deviceSyncStateRepo.findOne({ uid: goodDevice.uid } as any);
         expect(badFound).not.toBeNull();
         expect(goodFound).toBeNull();
+    });
+    it("Purges a forgotten device's per-collection Sync state (in batches), leaving other devices' state alone.", async () => {
+        (job as any).batchSize = 2;
+        const stale = await createDevice({ lastSyncAt: new Date(Date.now() - (DEVICE_TTL_DAYS + 5) * DAY_MS) });
+        const recent = await createDevice({ lastSyncAt: new Date() });
+        const collection = (device: DeviceSyncStateMongo, folderUid: string) =>
+            collectionStateRepo.save(
+                new EasCollectionStateMongo({ mailboxUid: device.mailboxUid, deviceId: device.deviceId, folderUid, collectionClass: "Email", syncKey: "1:x" }),
+            );
+        for (const folderUid of ["f1", "f2", "f3"]) {
+            await collection(stale, folderUid);
+        }
+        await collection(recent, "f1");
+
+        await job.run();
+
+        expect((await collectionStateRepo.find({ deviceId: stale.deviceId }).toArray()).length).toBe(0);
+        expect((await collectionStateRepo.find({ deviceId: recent.deviceId }).toArray()).length).toBe(1);
+    });
+
+    it("Logs a warning and keeps a device whose collection state couldn't be purged, so the next run retries it.", async () => {
+        const stale = await createDevice({ lastSyncAt: new Date(Date.now() - (DEVICE_TTL_DAYS + 5) * DAY_MS) });
+        vi.spyOn((job as any).collectionStateRepo, "find").mockRejectedValueOnce(new Error("simulated collection state failure"));
+
+        await expect(job.run()).resolves.toBeUndefined();
+
+        expect(await deviceSyncStateRepo.findOne({ uid: stale.uid } as any)).not.toBeNull();
     });
 });

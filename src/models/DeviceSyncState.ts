@@ -19,12 +19,15 @@ export interface DeviceSyncState extends BaseEntity {
     /** The EAS provisioning policy key most recently acknowledged by the device. */
     policyKey?: string;
 
-    /** The per-folder EAS `SyncKey` cursor, keyed by `Folder.uid`. */
+    /** EAS `SyncKey` cursors kept on the device row - today only the folder hierarchy's (`FolderSync`, under the
+     * `"$foldersync"` key). `Sync` collections keep theirs in `EasCollectionState`; entries keyed by a `Folder.uid`
+     * are left over from before that and are no longer read. */
     folderSyncKeys: Record<string, string>;
 
     /** The EAS `Class` (`"Email"`, `"Contacts"`, ...) most recently synced for a folder, keyed by `Folder.uid` -
      * lets a `Sync` request omit `Class` after its first request for a collection, per [MS-ASCMD], without the
-     * server losing track of which entity type that collection holds. */
+     * server losing track of which entity type that collection holds. No longer read or written: superseded by
+     * `EasCollectionState.collectionClass`; kept so existing rows still load. */
     folderCollectionClasses: Record<string, string>;
 
     lastSyncAt?: Date;

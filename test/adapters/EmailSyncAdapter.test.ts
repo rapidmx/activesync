@@ -204,9 +204,24 @@ describe("EmailSyncAdapter Tests", () => {
         it("Builds flags from class defaults when Read/Flag are set on a fresh item (no existing).", async () => {
             const { adapter } = buildAdapter();
             const partial = await adapter.fromApplicationData(
-                appData([textElement(WbxmlCodePage.Email, "Read", "1"), textElement(WbxmlCodePage.Email, "Flag", "1")]),
+                appData([
+                    textElement(WbxmlCodePage.Email, "Read", "1"),
+                    element(WbxmlCodePage.Email, "Flag", [textElement(WbxmlCodePage.Email, "FlagStatus", "2")]),
+                ]),
             );
             expect(partial.flags).toEqual({ read: true, flagged: true, answered: false, forwarded: false });
+        });
+
+        it("Reads Flag as a container: an empty Flag or a completed Status clears the flag.", async () => {
+            const { adapter } = buildAdapter();
+            const flagged: Message = { ...baseMessage, flags: { ...baseMessage.flags, flagged: true } };
+            const cleared = await adapter.fromApplicationData(appData([element(WbxmlCodePage.Email, "Flag", [])]), flagged);
+            expect(cleared.flags?.flagged).toBe(false);
+            const completed = await adapter.fromApplicationData(
+                appData([element(WbxmlCodePage.Email, "Flag", [textElement(WbxmlCodePage.Email, "FlagStatus", "1")])]),
+                flagged,
+            );
+            expect(completed.flags?.flagged).toBe(false);
         });
 
         it("Merges only the touched flag onto existing's other flags when only one of Read/Flag is present.", async () => {
@@ -360,7 +375,7 @@ describe("EmailSyncAdapter Tests", () => {
 
         it("Leaves the body untouched when no Body element is present.", async () => {
             const { adapter, put } = buildAdapter();
-            const partial = await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "Subject", "No body")]));
+            const partial = await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "Subject", "No body")]), baseMessage);
             expect("bodyBlobKey" in partial).toBe(false);
             expect("bodyPreview" in partial).toBe(false);
             expect(put).not.toHaveBeenCalled();
@@ -368,7 +383,18 @@ describe("EmailSyncAdapter Tests", () => {
 
         it("Returns an empty partial for an ApplicationData element with no recognized children.", async () => {
             const { adapter } = buildAdapter();
-            expect(await adapter.fromApplicationData(appData([]))).toEqual({});
+            expect(await adapter.fromApplicationData(appData([]), baseMessage)).toEqual({});
+        });
+
+        it("Always writes a body blob for a new Draft, empty when no Body was sent, From the caller's mailbox.", async () => {
+            const { adapter, put } = buildAdapter();
+            const mailbox = { primarySmtpAddress: "me@example.com", displayName: "Me" } as Mailbox;
+            const partial = await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "Subject", "Draft")]), undefined, mailbox);
+            expect(partial.bodyBlobKey).toMatch(/^bodies\//);
+            expect(partial.bodyPreview).toBe("");
+            const mime = (put.mock.calls[0][1] as Buffer).toString("utf-8");
+            expect(mime).toContain("From: Me <me@example.com>");
+            expect(mime.endsWith("\r\n\r\n")).toBe(true);
         });
     });
 

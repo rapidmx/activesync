@@ -17,6 +17,18 @@ const { Config, Init, Inject } = ObjectDecorators;
  * emptied via repeated batches rather than one unbounded query. */
 const DEFAULT_BATCH_SIZE = 500;
 
+/** Default cap on the combined size of the bodies/attachments one `ItemOperations` response embeds. */
+const DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+
+/** [MS-ASCMD] ItemOperations Status 11: the requested data size is too large. */
+const STATUS_TOO_LARGE = "11";
+
+/** One `Fetch` response element and the content bytes it embeds (counted against the response cap). */
+interface FetchResult {
+    element: WbxmlElement;
+    bytes: number;
+}
+
 /** Truncates UTF-8 text to at most `maxBytes` bytes without splitting a multi-byte character in half - backs
  * off past any trailing UTF-8 continuation byte (`10xxxxxx`) before decoding back to a string. Only ever
  * called once the caller has already confirmed the text exceeds `maxBytes` - trusts that rather than
@@ -58,8 +70,10 @@ function truncateUtf8(text: string, maxBytes: number): string {
  * command's original single-`Fetch` design, not a new gap introduced by adding multi-`Fetch` support.
  * - Only the "inline" delivery method is used (content embedded directly in the WBXML response) - the real
  * spec's "multipart" alternative (WBXML as one part, binary content as a separate part) is not implemented;
- * every attachment this library's own `ScanPipeline` already accepts is assumed to fit comfortably in memory
- * for one response, the same assumption `BaseAttachmentRoute.download()` already makes.
+ * the combined size of the bodies/attachments embedded in one response is capped at
+ * `mail:eas:itemoperations_max_response_bytes` (default 64 MB) - a Fetch that would exceed it gets Status 11
+ * ("data too large") instead of content. Attachment access is checked against the owning message's *current*
+ * folder (`Attachment.folderUid` is not updated when a message moves).
  * - `Options/BodyPreference`'s `Type`/`TruncationSize` are honored for a `Message` body fetch (plain text,
  * HTML, or - `Type 4` - the raw MIME source verbatim); byte-range fetching (`Range`) is not implemented.
  * - `EmptyFolderContents`'s `DeleteSubFolders` option is rejected outright rather than silently ignored -
@@ -92,6 +106,9 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
 
     @Config("mail:eas:itemoperations_max_fetch", 25)
     private maxFetchesPerRequest: number = 25;
+
+    @Config("mail:eas:itemoperations_max_response_bytes", DEFAULT_MAX_RESPONSE_BYTES)
+    private maxResponseBytes: number = DEFAULT_MAX_RESPONSE_BYTES;
 
     @Config("mail:eas:itemoperations_batch_size", DEFAULT_BATCH_SIZE)
     private batchSize: number = DEFAULT_BATCH_SIZE;
@@ -133,6 +150,9 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         }
 
         const responseChildren: WbxmlElement[] = [];
+        // Every fetched body/attachment is embedded inline, so their combined size bounds the response. A Fetch
+        // that would push it past `maxResponseBytes` is answered with Status 11 ("data too large") instead of content.
+        let remainingBytes: number = this.maxResponseBytes;
         for (const fetchEl of fetchEls) {
             const store = childText(fetchEl, "Store");
             if (store === "DocumentLibrary") {
@@ -141,11 +161,11 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
             const fileReference: string | undefined = childText(fetchEl, "FileReference");
             const serverId: string | undefined = childText(fetchEl, "ServerId");
             const optionsEl = findChild(fetchEl, "Options");
-            responseChildren.push(
-                fileReference
-                    ? await this.fetchAttachment(ctx, fileReference)
-                    : await this.fetchMessage(ctx, serverId, optionsEl),
-            );
+            const fetched = fileReference
+                ? await this.fetchAttachment(ctx, fileReference, remainingBytes)
+                : await this.fetchMessage(ctx, serverId, optionsEl, remainingBytes);
+            remainingBytes -= fetched.bytes;
+            responseChildren.push(fetched.element);
         }
         if (emptyEl) {
             responseChildren.push(await this.emptyFolderContents(ctx, emptyEl));
@@ -164,7 +184,8 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         ctx: EasCommandContext,
         serverId: string | undefined,
         optionsEl: WbxmlElement | undefined,
-    ): Promise<WbxmlElement> {
+        remainingBytes: number,
+    ): Promise<FetchResult> {
         if (!serverId) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Fetch requires either a ServerId or a FileReference.");
         }
@@ -210,20 +231,34 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
             truncated = true;
         }
 
-        return element(WbxmlCodePage.ItemOperations, "Fetch", [
-            textElement(WbxmlCodePage.ItemOperations, "Status", "1"),
-            textElement(WbxmlCodePage.AirSync, "Class", "Email"),
-            textElement(WbxmlCodePage.AirSync, "CollectionId", message.folderUid),
-            textElement(WbxmlCodePage.AirSync, "ServerId", serverId),
-            element(WbxmlCodePage.ItemOperations, "Properties", [
-                element(WbxmlCodePage.AirSyncBase, "Body", [
-                    textElement(WbxmlCodePage.AirSyncBase, "Type", bodyType),
-                    textElement(WbxmlCodePage.AirSyncBase, "EstimatedDataSize", String(estimatedDataSize)),
-                    textElement(WbxmlCodePage.AirSyncBase, "Truncated", truncated ? "1" : "0"),
-                    textElement(WbxmlCodePage.AirSyncBase, "Data", bodyText),
+        const bytes = Buffer.byteLength(bodyText, "utf8");
+        if (bytes > remainingBytes) {
+            return {
+                element: element(WbxmlCodePage.ItemOperations, "Fetch", [
+                    textElement(WbxmlCodePage.ItemOperations, "Status", STATUS_TOO_LARGE),
+                    textElement(WbxmlCodePage.AirSync, "ServerId", serverId),
+                ]),
+                bytes: 0,
+            };
+        }
+
+        return {
+            element: element(WbxmlCodePage.ItemOperations, "Fetch", [
+                textElement(WbxmlCodePage.ItemOperations, "Status", "1"),
+                textElement(WbxmlCodePage.AirSync, "Class", "Email"),
+                textElement(WbxmlCodePage.AirSync, "CollectionId", message.folderUid),
+                textElement(WbxmlCodePage.AirSync, "ServerId", serverId),
+                element(WbxmlCodePage.ItemOperations, "Properties", [
+                    element(WbxmlCodePage.AirSyncBase, "Body", [
+                        textElement(WbxmlCodePage.AirSyncBase, "Type", bodyType),
+                        textElement(WbxmlCodePage.AirSyncBase, "EstimatedDataSize", String(estimatedDataSize)),
+                        textElement(WbxmlCodePage.AirSyncBase, "Truncated", truncated ? "1" : "0"),
+                        textElement(WbxmlCodePage.AirSyncBase, "Data", bodyText),
+                    ]),
                 ]),
             ]),
-        ]);
+            bytes,
+        };
     }
 
     private async emptyFolderContents(ctx: EasCommandContext, emptyEl: WbxmlElement): Promise<WbxmlElement> {
@@ -339,26 +374,49 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         return element(WbxmlCodePage.ItemOperations, "Move", [textElement(WbxmlCodePage.ItemOperations, "Status", status)]);
     }
 
-    private async fetchAttachment(ctx: EasCommandContext, fileReference: string): Promise<WbxmlElement> {
+    private async fetchAttachment(ctx: EasCommandContext, fileReference: string, remainingBytes: number): Promise<FetchResult> {
         const attachment: Attachment | undefined = await this.attachmentRepo!.findOne(fileReference, { ignoreACL: true });
         if (!attachment) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
         }
-        if (!(await this.aclUtils!.hasPermission(ctx.user, attachment.folderUid, ACLAction.READ))) {
+        // Access follows the message as it is filed *now*: `Attachment.folderUid` is denormalized and is not
+        // updated when the message is moved, so it can point at a folder the message has since left.
+        const message: Message | undefined = await this.messageRepo!.findOne(attachment.messageUid, { ignoreACL: true });
+        if (!message) {
+            throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
+        }
+        if (!(await this.aclUtils!.hasPermission(ctx.user, message.folderUid, ACLAction.READ))) {
             throw new ApiError(ApiErrors.AUTH_PERMISSION_FAILURE, 403, ApiErrorMessages.AUTH_PERMISSION_FAILURE);
         }
 
-        const content = await this.blobStore!.get(attachment.blobKey);
-
-        return element(WbxmlCodePage.ItemOperations, "Fetch", [
-            textElement(WbxmlCodePage.ItemOperations, "Status", "1"),
-            textElement(WbxmlCodePage.AirSyncBase, "FileReference", fileReference),
-            element(WbxmlCodePage.ItemOperations, "Properties", [
-                textElement(WbxmlCodePage.AirSyncBase, "ContentType", attachment.mimeType),
-                // "Inline" delivery per MS-ASCMD: binary content is base64-encoded and embedded directly in the
-                // WBXML, rather than this library's own opaque/binary element type.
-                textElement(WbxmlCodePage.ItemOperations, "Data", content.toString("base64")),
+        const tooLarge = (): FetchResult => ({
+            element: element(WbxmlCodePage.ItemOperations, "Fetch", [
+                textElement(WbxmlCodePage.ItemOperations, "Status", STATUS_TOO_LARGE),
+                textElement(WbxmlCodePage.AirSyncBase, "FileReference", fileReference),
             ]),
-        ]);
+            bytes: 0,
+        });
+        // Checked against the recorded size first, so an oversized attachment is never even loaded.
+        if (Math.ceil(attachment.sizeBytes / 3) * 4 > remainingBytes) {
+            return tooLarge();
+        }
+        const data = (await this.blobStore!.get(attachment.blobKey)).toString("base64");
+        if (data.length > remainingBytes) {
+            return tooLarge();
+        }
+
+        return {
+            element: element(WbxmlCodePage.ItemOperations, "Fetch", [
+                textElement(WbxmlCodePage.ItemOperations, "Status", "1"),
+                textElement(WbxmlCodePage.AirSyncBase, "FileReference", fileReference),
+                element(WbxmlCodePage.ItemOperations, "Properties", [
+                    textElement(WbxmlCodePage.AirSyncBase, "ContentType", attachment.mimeType),
+                    // "Inline" delivery per MS-ASCMD: binary content is base64-encoded and embedded directly in the
+                    // WBXML, rather than this library's own opaque/binary element type.
+                    textElement(WbxmlCodePage.ItemOperations, "Data", data),
+                ]),
+            ]),
+            bytes: data.length,
+        };
     }
 }

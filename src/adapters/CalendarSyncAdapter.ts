@@ -16,6 +16,7 @@ import {
     RecurrenceFrequency,
     RecipientType,
     type Attendee,
+    type Mailbox,
 } from "@rapidmx/restapi";
 
 /** Builds the reverse of a forward code-table once at module load, rather than re-deriving it per call. */
@@ -83,9 +84,8 @@ const RECURRENCE_FREQUENCY_FROM_CODE = invert(RECURRENCE_TYPE_CODES);
  * its own to source a real value from.
  * - Recurrence patterns keyed by an ordinal weekday (MS-ASCAL `Type` 3/6, e.g. "the 2nd Tuesday of the month")
  * are not emitted - see `RECURRENCE_TYPE_CODES`'s own doc comment.
- * - Recurrence exceptions (individually modified/cancelled occurrences of a recurring series) are not synced -
- * deferred, matching this library's "pragmatic subset" precedent elsewhere (e.g. `FolderSyncCommand`'s SyncKey
- * replay-protection gap).
+ * - Recurrence exceptions (individually modified/cancelled occurrences of a recurring series) are not synced to the
+ * device; a device `Change` of the recurrence keeps the series' existing exceptions rather than wiping them.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -134,12 +134,15 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
             ...(event.reminderMinutesBeforeStart != null
                 ? [textElement(WbxmlCodePage.Calendar, "Reminder", String(event.reminderMinutesBeforeStart))]
                 : []),
-            ...(event.recurrenceRule ? [this.recurrenceElement(event.recurrenceRule, event.startDate)] : []),
+            ...(event.recurrenceRule ? [this.recurrenceElement(event.recurrenceRule, event.startDate, event.timezone)] : []),
         ]);
     }
 
-    private recurrenceElement(rule: RecurrenceRule, startDate: Date): WbxmlElement {
+    private recurrenceElement(rule: RecurrenceRule, startDate: Date, timezone: string): WbxmlElement {
         const dayOfWeekBits = (rule.byDay ?? []).reduce((sum, day) => sum + (DAY_OF_WEEK_BITS[day] ?? 0), 0);
+        // A rule without an explicit day/month recurs on the start date's day/month *as the event's own timezone
+        // sees it* - an evening event east of UTC falls on the previous UTC day.
+        const local = localDayAndMonth(startDate, timezone);
 
         return element(WbxmlCodePage.Calendar, "Recurrence", [
             textElement(WbxmlCodePage.Calendar, "Type", RECURRENCE_TYPE_CODES[rule.freq]),
@@ -148,10 +151,10 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
                 ? [textElement(WbxmlCodePage.Calendar, "DayOfWeek", String(dayOfWeekBits))]
                 : []),
             ...(rule.freq === RecurrenceFrequency.MONTHLY || rule.freq === RecurrenceFrequency.YEARLY
-                ? [textElement(WbxmlCodePage.Calendar, "DayOfMonth", String(rule.byMonthDay?.[0] ?? startDate.getUTCDate()))]
+                ? [textElement(WbxmlCodePage.Calendar, "DayOfMonth", String(rule.byMonthDay?.[0] ?? local.day))]
                 : []),
             ...(rule.freq === RecurrenceFrequency.YEARLY
-                ? [textElement(WbxmlCodePage.Calendar, "MonthOfYear", String(rule.byMonth?.[0] ?? startDate.getUTCMonth() + 1))]
+                ? [textElement(WbxmlCodePage.Calendar, "MonthOfYear", String(rule.byMonth?.[0] ?? local.month))]
                 : []),
             ...(rule.until ? [textElement(WbxmlCodePage.Calendar, "Until", toCompactDateTime(rule.until))] : []),
             // See the identical `!= null` reasoning on `reminderMinutesBeforeStart` above.
@@ -160,23 +163,24 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
     }
 
     /**
-     * Reverse of `toApplicationData`. `timezone`/`status`/`sequence`/`icalUid` have no wire representation at
-     * all (see this class's own "pragmatic subset" doc comment for `timezone`; the other three are purely
-     * server-managed identifiers/state a client was never sent in the first place) and are never included in
-     * the returned partial - `newEntityDefaults()` below supplies `icalUid`/`sequence` for a brand new event
-     * (`status`/`timezone` are left at the model's own constructor defaults), and `applyChange` leaves all four
-     * untouched by construction (merging onto `existing`).
+     * Reverse of `toApplicationData`. `timezone`/`status`/`icalUid` have no wire representation at all and are
+     * never included in the returned partial - `newEntityDefaults()` supplies `icalUid`/`sequence` for a brand new
+     * event, and a `Change` merges onto `existing`.
      *
-     * `OrganizerEmail` is required for a new event (there is nowhere else to default it from - this adapter
-     * has no mailbox context of its own) - a real calendar client always sends it regardless, since it already
-     * knows its own account's address. Omitting it on an `Add` throws, which `SyncCommand.applyAdd` turns into
-     * Status `6` ("client has sent a malformed or invalid item"), the spec's own designated code for exactly
-     * this case.
+     * **Organizer** (`mailbox` = the caller's own mailbox, supplied by `SyncCommand`): a device can only create an
+     * event organized by itself - on an `Add`, an `OrganizerEmail` that isn't one of the mailbox's own addresses (or
+     * a missing one) is replaced by the mailbox's primary address, since the organizer is who iTIP invitations are
+     * sent as. On a `Change` the organizer is never reassigned (an attendee's copy of someone else's meeting keeps
+     * its real organizer). Without a `mailbox` (direct use), `OrganizerEmail` is taken as sent.
      *
-     * `Attendees`/`Recurrence` are ghosted as a whole element, like `ContactsSyncAdapter`'s arrays: present at
-     * all -> rebuilt entirely from what's there; absent -> left untouched on a `Change`.
+     * **Change merging** (`existing` given): `Attendees`/`Recurrence` are ghosted as a whole element - present ->
+     * rebuilt from what's there, absent -> untouched - but a rebuilt attendee the event already had keeps the fields
+     * the device didn't send (`AttendeeStatus`/`AttendeeType`/`Name`, and `isOrganizer`), and a rebuilt recurrence
+     * keeps the series' existing exceptions (cancelled occurrences have no wire representation here). A change to the
+     * time, location, attendees or recurrence bumps `sequence`, as `BaseCalendarEventRoute.update` does, so updated
+     * invitations go out.
      */
-    public fromApplicationData(el: WbxmlElement): Partial<CalendarEvent> {
+    public fromApplicationData(el: WbxmlElement, existing?: CalendarEvent, mailbox?: Mailbox): Partial<CalendarEvent> {
         const partial: Partial<CalendarEvent> = {};
 
         const subject = childText(el, "Subject");
@@ -199,7 +203,13 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
         }
 
         const organizerEmail = childText(el, "OrganizerEmail");
-        if (organizerEmail !== undefined) {
+        if (!existing && mailbox) {
+            const own = new Set([mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].map((a) => a.toLowerCase()));
+            partial.organizer =
+                organizerEmail !== undefined && own.has(organizerEmail.toLowerCase())
+                    ? { address: organizerEmail, displayName: childText(el, "OrganizerName") ?? mailbox.displayName, type: RecipientType.TO }
+                    : { address: mailbox.primarySmtpAddress, displayName: mailbox.displayName, type: RecipientType.TO };
+        } else if (!existing && organizerEmail !== undefined) {
             partial.organizer = {
                 address: organizerEmail,
                 displayName: childText(el, "OrganizerName"),
@@ -214,12 +224,19 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
         if (attendeesEl) {
             partial.attendees = attendeesEl.children
                 .filter((child) => child.tag === "Attendee")
-                .map((attendeeEl) => this.attendeeFromElement(attendeeEl));
+                .map((attendeeEl) => this.attendeeFromElement(attendeeEl, existing?.attendees));
         }
 
         const recurrenceEl = findChild(el, "Recurrence");
         if (recurrenceEl) {
-            partial.recurrenceRule = this.recurrenceRuleFromElement(recurrenceEl);
+            partial.recurrenceRule = {
+                ...this.recurrenceRuleFromElement(recurrenceEl),
+                exceptions: existing?.recurrenceRule?.exceptions ?? [],
+            };
+        }
+
+        if (existing && isSchedulingRelevantChange(existing, partial)) {
+            partial.sequence = (existing.sequence ?? 0) + 1;
         }
 
         return partial;
@@ -234,19 +251,21 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
         return { icalUid: `${crypto.randomUUID()}@eas`, sequence: 0 };
     }
 
-    private attendeeFromElement(el: WbxmlElement): Attendee {
+    private attendeeFromElement(el: WbxmlElement, existingAttendees: Attendee[] = []): Attendee {
         const address = childText(el, "Email");
         if (!address) {
             throw new Error("Attendee element is missing its required Email child.");
         }
+        const known = existingAttendees.find((attendee) => attendee.address.toLowerCase() === address.toLowerCase());
         const attendeeType = childText(el, "AttendeeType");
         const attendeeStatus = childText(el, "AttendeeStatus");
         return {
             address,
-            displayName: childText(el, "Name"),
-            role: (attendeeType && ATTENDEE_TYPE_FROM_CODE[attendeeType]) || AttendeeRole.REQUIRED,
-            responseStatus: (attendeeStatus && ATTENDEE_STATUS_FROM_CODE[attendeeStatus]) || AttendeeResponseStatus.NEEDS_ACTION,
-            isOrganizer: false,
+            displayName: childText(el, "Name") ?? known?.displayName,
+            role: (attendeeType && ATTENDEE_TYPE_FROM_CODE[attendeeType]) || known?.role || AttendeeRole.REQUIRED,
+            responseStatus:
+                (attendeeStatus && ATTENDEE_STATUS_FROM_CODE[attendeeStatus]) || known?.responseStatus || AttendeeResponseStatus.NEEDS_ACTION,
+            isOrganizer: known?.isOrganizer ?? false,
         };
     }
 
@@ -282,4 +301,39 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
             exceptions: [],
         };
     }
+}
+
+/** The calendar day (1-31) and month (1-12) `date` falls on in IANA `timezone`, falling back to UTC for a zone
+ * `Intl` doesn't recognize. */
+export function localDayAndMonth(date: Date, timezone: string): { day: number; month: number } {
+    try {
+        const parts = new Intl.DateTimeFormat("en-US", { timeZone: timezone, day: "numeric", month: "numeric" }).formatToParts(date);
+        return {
+            day: Number(parts.find((part) => part.type === "day")!.value),
+            month: Number(parts.find((part) => part.type === "month")!.value),
+        };
+    } catch {
+        return { day: date.getUTCDate(), month: date.getUTCMonth() + 1 };
+    }
+}
+
+/** Normalizes a value for comparison - `null` (SQL) and `undefined` (Mongo) mean the same "unset". */
+function comparable(value: unknown): string {
+    return JSON.stringify(value ?? null);
+}
+
+/** `true` when `partial` changes anything invitations carry: time, location, attendees or recurrence. */
+function isSchedulingRelevantChange(existing: CalendarEvent, partial: Partial<CalendarEvent>): boolean {
+    const time = (value: Date | undefined) => (value ? new Date(value).getTime() : null);
+    if (partial.startDate !== undefined && time(partial.startDate) !== time(existing.startDate)) return true;
+    if (partial.endDate !== undefined && time(partial.endDate) !== time(existing.endDate)) return true;
+    if (partial.location !== undefined && partial.location !== (existing.location ?? "")) return true;
+    const attendeeKey = (attendees: Attendee[] | undefined) =>
+        comparable((attendees ?? []).map((a) => [a.address.toLowerCase(), a.role, a.responseStatus]));
+    if (partial.attendees !== undefined && attendeeKey(partial.attendees) !== attendeeKey(existing.attendees)) return true;
+    const ruleKey = (rule: RecurrenceRule | undefined) =>
+        rule
+            ? comparable([rule.freq, rule.interval, rule.byDay ?? null, rule.byMonthDay ?? null, rule.byMonth ?? null, rule.count ?? null, time(rule.until)])
+            : comparable(null);
+    return partial.recurrenceRule !== undefined && ruleKey(partial.recurrenceRule) !== ruleKey(existing.recurrenceRule);
 }

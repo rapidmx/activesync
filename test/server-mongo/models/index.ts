@@ -16,3 +16,4 @@ export {
 } from "@rapidmx/restapi/mongo";
 // This plugin's own model.
 export { DeviceSyncStateMongo } from "../../../src/models/mongo/DeviceSyncStateMongo.js";
+export { EasCollectionStateMongo } from "../../../src/models/mongo/EasCollectionStateMongo.js";
