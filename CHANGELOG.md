@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.2] - 2026-09-14
+
+### Added
+- Added DeviceSyncState, its Mongo/SQL models and EasDeviceStateCleanupJob, moved here from @rapidmx/restapi with unchanged entity names and config keys so existing device state carries over
+- Added a test that each entry point exports only mounted routes, models and concrete jobs, and that the manifest is valid
+
+### Changed
+- Convert this library into a RapidMX server plugin: package.json carries a rapidmx.plugin manifest, and the ./mongo and ./sql entry points export only the ready-to-mount classes a server host loads
+- Mount EasRouteMongo/EasRouteSQL at /Microsoft-Server-ActiveSync and DeviceSyncStateRouteMongo/DeviceSyncStateRouteSQL at /api/mail/devices directly, so a server needs no wrapper classes
+- Mark the device state models @MailboxScopedData() so restapi's ErasureExecutionJob still purges them with an erased mailbox
+- Declare the mail:eas:* sync, ping, search, recipient-lookup and provisioning settings plus the idle-device cleanup age as plugin settings an administrator can edit in the admin console
+- Patch @rapidmx/restapi 0.8.0 with its unreleased plugin contract until the next restapi release
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Upgraded deps
+- Changing package name to @rapidmx/activesync-plugin
+
+### Fixed
+- Fixed peer dep range for restapi
+
 ## [1.0.0-beta.1] - 2026-09-13
 
 ### Added
@@ -156,6 +175,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Removed unused files
 
-[Unreleased]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.1...HEAD
+[Unreleased]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.2...HEAD
+[1.0.0-beta.2]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.1...v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.0...v1.0.0-beta.1
 [1.0.0-beta.0]: https://github.com/RapidMX/activesync/releases/tag/v1.0.0-beta.0
