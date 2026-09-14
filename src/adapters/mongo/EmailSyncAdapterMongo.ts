@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { LabelMongo } from "@rapidmx/restapi/mongo";
+import { FolderMongo, LabelMongo } from "@rapidmx/restapi/mongo";
 import { EmailSyncAdapter } from "../EmailSyncAdapter.js";
 
 /**
@@ -10,4 +10,5 @@ import { EmailSyncAdapter } from "../EmailSyncAdapter.js";
  */
 export class EmailSyncAdapterMongo extends EmailSyncAdapter {
     protected labelClass: any = LabelMongo;
+    protected folderClass: any = FolderMongo;
 }

@@ -126,6 +126,21 @@ describe("EasDeviceStateCleanupJobMongo Tests (real DB + DI)", () => {
         expect(found).not.toBeNull();
     });
 
+    it("Never purges a stale or never-synced device with a pending remote wipe, but still purges wiped/unset ones.", async () => {
+        const staleDate = new Date(Date.now() - (DEVICE_TTL_DAYS + 5) * DAY_MS);
+        const pendingStale = await createDevice({ lastSyncAt: staleDate, remoteWipeRequested: true });
+        const pendingNeverSynced = await createDevice({ lastSyncAt: undefined, remoteWipeRequested: true });
+        const acknowledged = await createDevice({ lastSyncAt: staleDate, remoteWipeRequested: false });
+        const unset = await createDevice({ lastSyncAt: staleDate, remoteWipeRequested: undefined });
+
+        await job.run();
+
+        expect(await deviceSyncStateRepo.findOne({ uid: pendingStale.uid } as any)).not.toBeNull();
+        expect(await deviceSyncStateRepo.findOne({ uid: pendingNeverSynced.uid } as any)).not.toBeNull();
+        expect(await deviceSyncStateRepo.findOne({ uid: acknowledged.uid } as any)).toBeNull();
+        expect(await deviceSyncStateRepo.findOne({ uid: unset.uid } as any)).toBeNull();
+    });
+
     it("Purges a device that has never successfully synced, regardless of age.", async () => {
         const neverSynced = await createDevice({ lastSyncAt: undefined });
 

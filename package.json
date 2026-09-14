@@ -96,6 +96,7 @@
             "apiVersion": 1,
             "displayName": "Exchange ActiveSync",
             "description": "Lets phones and mail apps sync mail, contacts, calendars and tasks over Exchange ActiveSync (served at /Microsoft-Server-ActiveSync).",
+            "mailboxScopedData": true,
             "settings": [
                 {
                     "key": "mail:eas:sync_window_size",

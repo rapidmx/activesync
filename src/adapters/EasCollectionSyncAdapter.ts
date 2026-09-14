@@ -49,7 +49,7 @@ export interface EasCollectionSyncAdapter<T extends RecoverableBaseEntity> {
      * @param el The command's `<ApplicationData>` element.
      * @param existing The item being changed, for a `Change` command; `undefined` for `Add`. Adapters that
      * need to know the item's current field values to correctly interpret a partial update - `EmailSyncAdapter`
-     * uses this to reuse an existing Draft's `bodyBlobKey` on `Change` rather than minting a new one.
+     * uses this to refuse a `Body` change on anything but a Draft, and to carry over unchanged MIME headers.
      */
     fromApplicationData?(el: WbxmlElement, existing?: T): Partial<T> | Promise<Partial<T>>;
 

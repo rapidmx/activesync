@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { ObjectDecorators } from "@rapidrest/core";
+import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import type { Contact } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
@@ -22,6 +22,15 @@ const LOOKS_LIKE_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
  * defines, matching `ProvisionCommand`'s own identical precedent for the same reasoning. */
 const STATUS_SUCCESS = "1";
 const STATUS_NOT_FOUND = "4";
+
+/** [MS-ASCMD] top-level `ResolveRecipients` `Status` codes: `5` protocol error (the request violates the command's
+ * schema, e.g. more `To` elements than allowed), `6` server error (the lookup itself failed, e.g. a database
+ * outage - reported for the whole command rather than masquerading as every recipient simply not matching). */
+const STATUS_PROTOCOL_ERROR = "5";
+const STATUS_SERVER_ERROR = "6";
+
+/** [MS-ASCMD]: a `ResolveRecipients` request MUST NOT contain more than 100 `To` elements. */
+export const MAX_RESOLVE_RECIPIENTS_TO = 100;
 
 /**
  * Handles EAS `ResolveRecipients`: resolves each `<To>` value (a display name, partial name, or address) the
@@ -71,24 +80,43 @@ export abstract class ResolveRecipientsCommand implements EasCommandHandler {
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
         const toEls = ctx.request ? findChildren(ctx.request, "To") : [];
+        if (toEls.length > MAX_RESOLVE_RECIPIENTS_TO) {
+            // Each `To` costs up to three regex scans, so an unbounded count is a cheap way to load the database.
+            return this.statusOnly(STATUS_PROTOCOL_ERROR);
+        }
         const responses: WbxmlElement[] = [];
         for (const toEl of toEls) {
             const value = toEl.text ?? "";
             try {
                 responses.push(await this.resolveOne(ctx, value));
             } catch (err) {
-                // One unresolvable `To` must not fail every other recipient in the same request.
+                if (!(err instanceof ApiError) || err.status !== 400) {
+                    // A real lookup failure (e.g. the database is down) is a server error, not "no match".
+                    this.logger?.error(`ResolveRecipients lookup failed: ${String(err)}`);
+                    return this.statusOnly(STATUS_SERVER_ERROR);
+                }
+                // One unresolvable `To` (e.g. a pattern service-core rejects) must not fail every other recipient.
                 this.logger?.warn(`ResolveRecipients lookup failed for one recipient: ${String(err)}`);
                 responses.push(this.responseElement(value, STATUS_NOT_FOUND, []));
             }
         }
         return element(WbxmlCodePage.ResolveRecipients, "ResolveRecipients", [
-            textElement(WbxmlCodePage.ResolveRecipients, "Status", "1"),
+            textElement(WbxmlCodePage.ResolveRecipients, "Status", STATUS_SUCCESS),
             ...responses,
         ]);
     }
 
+    private statusOnly(status: string): WbxmlElement {
+        return element(WbxmlCodePage.ResolveRecipients, "ResolveRecipients", [
+            textElement(WbxmlCodePage.ResolveRecipients, "Status", status),
+        ]);
+    }
+
     private async resolveOne(ctx: EasCommandContext, value: string): Promise<WbxmlElement> {
+        if (!value.trim()) {
+            // An empty term would compile to `regex()`, matching every contact - there's nothing to resolve.
+            return this.responseElement(value, STATUS_NOT_FOUND, []);
+        }
         if (LOOKS_LIKE_EMAIL.test(value)) {
             return this.responseElement(value, STATUS_SUCCESS, [this.recipientElement(value, undefined)]);
         }

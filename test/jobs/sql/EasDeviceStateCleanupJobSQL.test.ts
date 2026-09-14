@@ -117,6 +117,23 @@ describe("EasDeviceStateCleanupJobSQL Tests (real DB + DI)", () => {
         expect(found).not.toBeNull();
     });
 
+    it("Never purges a stale or never-synced device with a pending remote wipe, but still purges wiped/unset ones.", async () => {
+        const staleDate = new Date(Date.now() - (DEVICE_TTL_DAYS + 5) * DAY_MS);
+        const pendingStale = await createDevice({ lastSyncAt: staleDate, remoteWipeRequested: true });
+        const pendingNeverSynced = await createDevice({ lastSyncAt: undefined, remoteWipeRequested: true });
+        const acknowledged = await createDevice({ lastSyncAt: staleDate, remoteWipeRequested: false });
+        const unset = await createDevice({ lastSyncAt: staleDate, remoteWipeRequested: undefined });
+        const unsetNeverSynced = await createDevice({ lastSyncAt: undefined, remoteWipeRequested: undefined });
+
+        await job.run();
+
+        expect(await deviceSyncStateRepo.findOne({ where: { uid: pendingStale.uid } })).not.toBeNull();
+        expect(await deviceSyncStateRepo.findOne({ where: { uid: pendingNeverSynced.uid } })).not.toBeNull();
+        expect(await deviceSyncStateRepo.findOne({ where: { uid: acknowledged.uid } })).toBeNull();
+        expect(await deviceSyncStateRepo.findOne({ where: { uid: unset.uid } })).toBeNull();
+        expect(await deviceSyncStateRepo.findOne({ where: { uid: unsetNeverSynced.uid } })).toBeNull();
+    });
+
     it("Purges a device that has never successfully synced, regardless of age.", async () => {
         const neverSynced = await createDevice({ lastSyncAt: undefined });
 

@@ -43,5 +43,7 @@ describe("plugin entry points", () => {
         const manifest = parsePluginManifest(pkg);
         expect(typeof manifest).toBe("object");
         expect(manifest).toEqual(expect.objectContaining({ displayName: "Exchange ActiveSync" }));
+        // DeviceSyncState is `@MailboxScopedData`, so the host must know this plugin stores per-mailbox data.
+        expect(pkg.rapidmx.plugin.mailboxScopedData).toBe(true);
     });
 });

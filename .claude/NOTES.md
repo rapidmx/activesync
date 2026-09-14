@@ -49,6 +49,56 @@ Keep entries terse — this is a reference, not a transcript.
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
 
+### 2026-09-14 (2) — Round-2 review fixes (remote-wipe purge, ResolveRecipients DoS/status, labelUids, Draft-only body)
+
+Each finding was confirmed in code first. Not committed; no version or peerDependency changes.
+
+- **Cleanup job purged pending remote wipes.** `EasDeviceStateCleanupJob` deleted stale and never-synced rows
+  even with `remoteWipeRequested: true`, so a lost device that reconnected later re-paired without being
+  wiped. Both queries now also filter on `remoteWipeRequested` via a protected
+  `noPendingWipeQueryValue()`. Mongo uses `ne(true)`, which matches `false`, `null` and a missing field.
+  `EasDeviceStateCleanupJobSQL` overrides it with
+  `Raw("(col IS NULL OR col = :noPendingWipe)", false)`, because SQL `!=`/`NOT IN` never match `NULL`
+  (`ne(true)` there would have made unset rows unpurgeable). Both backends' job tests cover this.
+- **ResolveRecipients DoS.** The number of `<To>` elements was unbounded, and each one cost 3 regex queries.
+  More than `MAX_RESOLVE_RECIPIENTS_TO` (100, per [MS-ASCMD]'s "MUST NOT contain more than 100 To elements")
+  now gets top-level Status `5` (protocol error) with no queries. That code comes from the spec as recalled;
+  the repo holds no copy of it to check against. An empty or whitespace-only `To` would have compiled to
+  `regex()`, matching every contact. It now gets that recipient's Status `4` without a query.
+- **ResolveRecipients error mapping.** Every exception used to become a per-recipient Status `4`, including DB
+  outages. Now only an `ApiError` with status 400 (e.g. a pattern service-core rejects) does. Anything else
+  fails the whole command with top-level Status `6` (server error) and is logged at error level.
+- **`labelUids` spliced into `in(...)`.** `resolveLabelNames()` now skips any entry that isn't a lowercase
+  UUID. `me` would have become the caller's uid (or a 403), and a comma would have split one value into several.
+- **Manifest.** Added `"mailboxScopedData": true` to `rapidmx.plugin`, since `DeviceSyncState` is
+  `@MailboxScopedData`. `test/plugin.test.ts` asserts it; the installed `parsePluginManifest` ignores the
+  unknown field.
+- **Sync `Change` could overwrite a received message's original MIME (outside-diff check: real).** Evidence:
+  - `SyncCommand.applyChange` accepts `Email` Changes for any folder the caller can UPDATE, not just Drafts.
+  - `EmailSyncAdapter.fromApplicationData` reused `existing.bodyBlobKey` and `put()` over it.
+  - Body blobs are shared: restapi's `ScanQueueJob` gives an inbox-rule copy the same `entry.rawBlobKey` as
+    the delivered message, so one overwrite rewrote both.
+  - Retention and erasure jobs and `DataExportJob`/mbox read that blob as the original RFC 5322 source.
+  - [MS-ASCMD]/[MS-ASEMAIL] only allow `Add`/`Change` of the body for Drafts.
+
+  Fix: `EmailSyncAdapter` gained an abstract `folderClass` (`FolderMongo`/`FolderSQL` in the concrete
+  adapters). A `Change` carrying `Body` for a message whose folder isn't `FolderType.DRAFTS` (or no longer
+  exists) throws `ApiError` 400, which `applyChange` reports as Status `6`. Nothing is written. Body writes
+  (Draft Add or Change) now always mint a fresh `bodies/<uuid>` key, never overwriting. Non-body Changes
+  (Read/Flag) on non-drafts are unaffected and do no folder lookup.
+  - Follow-up (not done): a Draft's superseded blob is now orphaned, and so is one whose `update()` then fails
+    its version check. Deleting the old blob inline was avoided because it could be shared.
+  - Still open: Subject/To/Cc/Bcc/Importance Changes on non-drafts still update DB fields. The blob stays
+    intact, but the spec disallows these too.
+- Tests:
+  - `test/commands/ResolveRecipientsCommand.test.ts`: Status 5 at 101 `To` elements, 100 still OK, empty `To`
+    gets 4 with no query, non-400 errors give Status 6.
+  - `test/adapters/EmailSyncAdapter.test.ts`: non-UUID labelUids, fresh blob key, non-draft body refused,
+    non-body Change still applied.
+  - `test/routes/{mongo,sql}/EasRoute.test.ts`: Draft Change writes a new key, and an Inbox body Change gets
+    Status 6 with the original MIME byte-identical.
+  - Both cleanup-job tests; `test/plugin.test.ts`.
+
 ### 2026-09-14 — Review-finding fix pass (perf batching, WBXML NUL injection, regex length, GAL guard)
 
 Each finding was confirmed in code before fixing (the reviewer's line numbers were stale, the code shapes matched).

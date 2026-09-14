@@ -57,6 +57,15 @@ export abstract class EasDeviceStateCleanupJob<D extends DeviceSyncState> extend
         // Do nothing
     }
 
+    /**
+     * The `remoteWipeRequested` query value matching rows with no pending wipe (`false`, `null` or unset). MongoDB's
+     * `$ne: true` already matches a missing/`null` field; `EasDeviceStateCleanupJobSQL` overrides this, since SQL's
+     * `!=` never matches `NULL`.
+     */
+    protected noPendingWipeQueryValue(): any {
+        return "ne(true)";
+    }
+
     public async run(): Promise<void> {
         if (!this.deviceSyncStateRepo) {
             return;
@@ -75,13 +84,17 @@ export abstract class EasDeviceStateCleanupJob<D extends DeviceSyncState> extend
         // `options.limit` entirely and falls back to its own default of 100 otherwise). Confirmed by
         // real-database testing: on the SQL backend, `options.limit` alone silently caps at 100 regardless of
         // the configured batch size.
+        //
+        // A row with a pending remote wipe is never purged: deleting it would lose the wipe directive, so a lost or
+        // stolen device that reconnects later would simply re-pair and sync without ever being wiped.
+        const remoteWipeRequested: any = this.noPendingWipeQueryValue();
         const [stale, neverSynced]: [D[], D[]] = await Promise.all([
             this.deviceSyncStateRepo.find(
-                { lastSyncAt: `lt(${cutoff.toISOString()})`, limit: this.batchSize } as any,
+                { lastSyncAt: `lt(${cutoff.toISOString()})`, remoteWipeRequested, limit: this.batchSize } as any,
                 { ignoreACL: true, limit: this.batchSize },
             ),
             this.deviceSyncStateRepo.find(
-                { lastSyncAt: null, limit: this.batchSize } as any,
+                { lastSyncAt: null, remoteWipeRequested, limit: this.batchSize } as any,
                 { ignoreACL: true, limit: this.batchSize },
             ),
         ]);

@@ -58,4 +58,48 @@ describe("ResolveRecipientsCommand Tests", () => {
             expect(pattern).toBe("\\(".repeat(50));
         }
     });
+
+    it("Fails the whole command with top-level Status 6 when a lookup fails for a non-request reason.", async () => {
+        for (const failure of [new Error("connection refused"), new ApiError(ApiErrors.INTERNAL_ERROR, 500, "db down")]) {
+            const find = vi.fn().mockRejectedValue(failure);
+            const command = buildCommand(find);
+
+            const response = await command.handle({ mailboxUid: "mbx-1", request: resolveRequest(["Jane", "John"]) } as EasCommandContext);
+
+            expect(childText(response!, "Status")).toBe("6");
+            expect(findChildren(response!, "Response")).toEqual([]);
+            expect(find).toHaveBeenCalledTimes(3); // Stopped at the first recipient.
+        }
+    });
+
+    it("Rejects more than 100 To elements with top-level Status 5 without querying.", async () => {
+        const find = vi.fn().mockResolvedValue([]);
+        const command = buildCommand(find);
+
+        const response = await command.handle({
+            mailboxUid: "mbx-1",
+            request: resolveRequest(Array.from({ length: 101 }, (_, i) => `Name${i}`)),
+        } as EasCommandContext);
+
+        expect(childText(response!, "Status")).toBe("5");
+        expect(findChildren(response!, "Response")).toEqual([]);
+        expect(find).not.toHaveBeenCalled();
+
+        const atLimit = await command.handle({
+            mailboxUid: "mbx-1",
+            request: resolveRequest(Array.from({ length: 100 }, (_, i) => `Name${i}`)),
+        } as EasCommandContext);
+        expect(childText(atLimit!, "Status")).toBe("1");
+        expect(findChildren(atLimit!, "Response")).toHaveLength(100);
+    });
+
+    it("Reports an empty or whitespace-only To as Status 4 without a match-everything query.", async () => {
+        const find = vi.fn().mockResolvedValue([{ uid: "c1", displayName: "Jane Doe", emails: [{ address: "jane@example.com" }] }]);
+        const command = buildCommand(find);
+
+        const response = await command.handle({ mailboxUid: "mbx-1", request: resolveRequest(["", "   "]) } as EasCommandContext);
+
+        expect(findChildren(response!, "Response").map((r) => childText(r, "Status"))).toEqual(["4", "4"]);
+        expect(find).not.toHaveBeenCalled();
+    });
 });

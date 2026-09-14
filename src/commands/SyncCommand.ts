@@ -74,7 +74,9 @@ export interface SyncCollectionBinding<T extends RecoverableBaseEntity> {
  * `applyDelete`). `[MS-ASCMD]` itself disallows `Add`/`Change` for any *non-draft* `Email` item - this library
  * doesn't verify a Sync `Email` Add/Change actually targets the caller's own Drafts folder *specifically*
  * (only that it's a folder the caller actually owns/can write to - see above), matching how Contacts/Calendar/
- * Tasks folder targeting is equally unchecked beyond ownership elsewhere. A collection whose adapter has no
+ * Tasks folder targeting is equally unchecked beyond ownership elsewhere. The one exception is a `Body` change:
+ * `EmailSyncAdapter` refuses it (Status `6`) for any message outside the Drafts folder, since that would rewrite
+ * a received/sent message's original MIME blob. A collection whose adapter has no
  * `fromApplicationData` at all would get Status `6` for `Add`/`Change` instead, but every adapter today
  * implements it. Per `[MS-ASCMD]`'s own "Add (Sync)"/"Status (Sync)" pages: `Add` always gets a `Responses`
  * entry (it must report the assigned `ServerId`); `Change`/`Delete` only get one on **failure** - a silent

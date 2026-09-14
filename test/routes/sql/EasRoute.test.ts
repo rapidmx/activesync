@@ -1743,7 +1743,7 @@ describe("Route:EasRouteSQL Tests", () => {
                 expect(mime).toContain("Draft body text.");
             });
 
-            it("Updates a Draft via a client-originated Email Change silently, overwriting its MIME body.", async () => {
+            it("Updates a Draft via a client-originated Email Change silently, writing its new MIME body to a fresh blob.", async () => {
                 const mailbox = await createMailbox(owner.uid);
                 await provisionDevice("dev1");
                 const folder = await createFolderWithAcl(mailbox.uid, { name: "Drafts", type: FolderType.DRAFTS });
@@ -1771,9 +1771,43 @@ describe("Route:EasRouteSQL Tests", () => {
                 const updated = await messageRepo.findOne({ where: { uid: message.uid } });
                 expect(updated?.subject).toBe("Original Subject");
                 expect(updated?.bodyPreview).toBe("Updated body text.");
-                expect(updated?.bodyBlobKey).toBe(originalBlobKey);
+                expect(updated?.bodyBlobKey).not.toBe(originalBlobKey);
                 const mime = (await blobStore().get(updated!.bodyBlobKey)).toString("utf-8");
                 expect(mime).toContain("Updated body text.");
+            });
+
+            it("Refuses an Email Change carrying a Body for a non-Draft message (Status 6), leaving its original MIME intact.", async () => {
+                const mailbox = await createMailbox(owner.uid);
+                await provisionDevice("dev1");
+                const folder = await createFolderWithAcl(mailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+                const message = await createMessage(mailbox.uid, folder.uid, { subject: "Received" });
+                const originalMime = "Subject: Received\r\n\r\nOriginal delivered body.";
+                await blobStore().put(message.bodyBlobKey, Buffer.from(originalMime), { contentType: "message/rfc822" });
+                const syncKey = await initialSyncKey("Email", folder.uid);
+
+                const response = await postWbxml(
+                    "Sync",
+                    "dev1",
+                    syncRequestWithCommands(syncKey, "Email", folder.uid, [
+                        element(WbxmlCodePage.AirSync, "Change", [
+                            textElement(WbxmlCodePage.AirSync, "ServerId", message.uid),
+                            element(WbxmlCodePage.AirSync, "ApplicationData", [
+                                element(WbxmlCodePage.AirSyncBase, "Body", [
+                                    textElement(WbxmlCodePage.AirSyncBase, "Type", "1"),
+                                    textElement(WbxmlCodePage.AirSyncBase, "Data", "Tampered body."),
+                                ]),
+                            ]),
+                        ]),
+                    ]),
+                );
+
+                const change = findChild(findChild(collectionOf(response), "Responses")!, "Change")!;
+                expect(childText(change, "ServerId")).toBe(message.uid);
+                expect(childText(change, "Status")).toBe("6");
+                const unchanged = await messageRepo.findOne({ where: { uid: message.uid } });
+                expect(unchanged?.bodyBlobKey).toBe(message.bodyBlobKey);
+                expect(unchanged?.bodyPreview).toBe(message.bodyPreview);
+                expect((await blobStore().get(message.bodyBlobKey)).toString("utf-8")).toBe(originalMime);
             });
 
             it("Updates a contact via a client-originated Change silently (no Responses entry), and persists it.", async () => {

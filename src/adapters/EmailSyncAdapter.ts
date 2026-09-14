@@ -3,12 +3,22 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
-import { ObjectDecorators } from "@rapidrest/core";
-import { ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { ApiError, ObjectDecorators } from "@rapidrest/core";
+import { ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, opaqueElement, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCollectionSyncAdapter } from "./EasCollectionSyncAdapter.js";
-import { type BlobStore, type Label, type Mailbox, type Message, type Recipient, MessageImportance, RecipientType } from "@rapidmx/restapi";
+import {
+    type BlobStore,
+    type Folder,
+    type Label,
+    type Mailbox,
+    type Message,
+    type Recipient,
+    FolderType,
+    MessageImportance,
+    RecipientType,
+} from "@rapidmx/restapi";
 const { Init, Inject } = ObjectDecorators;
 
 /** MS-ASEMAIL `Importance`: 0=Low, 1=Normal, 2=High. */
@@ -29,6 +39,11 @@ const BODY_TYPE_PLAIN_TEXT = "1";
 
 /** Max label uids per `in(...)` lookup - well under `RepoUtils.find()`'s 1000-row page cap. */
 const LABEL_LOOKUP_CHUNK = 500;
+
+/** The shape of a real entity uid (a lowercase UUID). Anything else in `Message.labelUids` can't be a real label
+ * and must never be spliced into an `in(...)` operand, where `me` would resolve to the caller's uid and a comma
+ * would split one value into several. */
+const UID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function labelKey(mailboxUid: string, labelUid: string): string {
     return `${mailboxUid}/${labelUid}`;
@@ -64,7 +79,7 @@ function labelKey(mailboxUid: string, labelUid: string): string {
  * rendering a whole Sync page/search result set use `toApplicationDataBatch()`, which resolves every referenced
  * label with one `in(...)` query per mailbox rather than one per labelled message.
  *
- * `labelClass` is supplied by the Mongo/SQL concrete subclasses.
+ * `labelClass`/`folderClass` are supplied by the Mongo/SQL concrete subclasses.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -73,10 +88,14 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
 
     protected abstract labelClass: any;
 
+    protected abstract folderClass: any;
+
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
     private labelRepo?: RepoUtils<any>;
+
+    private folderRepo?: RepoUtils<any>;
 
     @Inject("BlobStore")
     private blobStore?: BlobStore;
@@ -86,6 +105,10 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
         this.labelRepo = await this._objectFactory!.newInstance(RepoUtils, {
             name: this.labelClass.name,
             args: [this.labelClass],
+        });
+        this.folderRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.folderClass.name,
+            args: [this.folderClass],
         });
     }
 
@@ -150,6 +173,9 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
         const uidsByMailbox = new Map<string, Set<string>>();
         for (const message of messages) {
             for (const uid of message.labelUids ?? []) {
+                if (!UID_PATTERN.test(uid)) {
+                    continue;
+                }
                 let uids = uidsByMailbox.get(message.mailboxUid);
                 if (!uids) {
                     uids = new Set<string>();
@@ -234,11 +260,17 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
 
         const bodyEl = findChild(el, "Body");
         if (bodyEl) {
+            // [MS-ASCMD]/[MS-ASEMAIL] only let a client change the body of a Draft. Any other message's blob is its
+            // original MIME - evidence a retention/legal hold may depend on, and possibly shared with other rows
+            // (an inbox-rule copy reuses the delivered message's `bodyBlobKey`) - so a Change is refused (the
+            // caller reports Status 6) rather than applied.
+            if (existing && !(await this.isDraft(existing))) {
+                throw new ApiError(ApiErrors.INVALID_REQUEST, 400, "Only a Draft's body can be changed.");
+            }
             const text = childText(bodyEl, "Data") ?? "";
-            // Reuse the existing blob key on a Change (overwriting its content) rather than minting a new one
-            // - a fresh key is only needed the first time a body is set (a bare `existing.bodyBlobKey` of ""
-            // means an earlier Add never included a Body element at all).
-            const bodyBlobKey = existing?.bodyBlobKey || `bodies/${crypto.randomUUID()}`;
+            // Always a fresh key, never an overwrite of `existing.bodyBlobKey`: an existing blob may be shared, and
+            // leaving it intact means a Change that then fails its version check can't corrupt the stored body.
+            const bodyBlobKey = `bodies/${crypto.randomUUID()}`;
             const mime = buildPlainTextMime({
                 subject: partial.subject ?? existing?.subject ?? "",
                 from: existing?.from,
@@ -252,6 +284,12 @@ export abstract class EmailSyncAdapter implements EasCollectionSyncAdapter<Messa
         }
 
         return partial;
+    }
+
+    /** Whether `message` currently lives in its mailbox's Drafts folder. */
+    private async isDraft(message: Message): Promise<boolean> {
+        const folder: Folder | undefined = await this.folderRepo!.findOne(message.folderUid, { ignoreACL: true });
+        return folder?.type === FolderType.DRAFTS;
     }
 
     /** Defaults for a brand-new Draft created via a client-originated `Add` - `from` is the caller's own

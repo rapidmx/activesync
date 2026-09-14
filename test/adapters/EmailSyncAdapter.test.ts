@@ -10,7 +10,7 @@
 import { WbxmlCodePage } from "../../src/codec/WbxmlCodePages.js";
 import { element, textElement, type WbxmlElement } from "../../src/codec/WbxmlElement.js";
 import { EmailSyncAdapter } from "../../src/adapters/EmailSyncAdapter.js";
-import { MessageImportance, RecipientType, type Mailbox, type Message } from "@rapidmx/restapi";
+import { FolderType, MessageImportance, RecipientType, type Mailbox, type Message } from "@rapidmx/restapi";
 
 /** `EmailSyncAdapter` is abstract (it needs a backend-specific `labelClass`, supplied by
  * `EmailSyncAdapterMongo`/`SQL` in real use) - this minimal concrete subclass is all a backend-agnostic unit
@@ -18,19 +18,27 @@ import { MessageImportance, RecipientType, type Mailbox, type Message } from "@r
  * directly instead, the same bypass-DI convention `blobStore` below already uses). */
 class TestEmailSyncAdapter extends EmailSyncAdapter {
     protected labelClass: any = {};
+    protected folderClass: any = {};
 }
 
 function appData(children: WbxmlElement[]): WbxmlElement {
     return element(WbxmlCodePage.AirSync, "ApplicationData", children);
 }
 
-function buildAdapter(): { adapter: EmailSyncAdapter; put: ReturnType<typeof vi.fn>; labelFind: ReturnType<typeof vi.fn> } {
+function buildAdapter(folderType: FolderType = FolderType.DRAFTS): {
+    adapter: EmailSyncAdapter;
+    put: ReturnType<typeof vi.fn>;
+    labelFind: ReturnType<typeof vi.fn>;
+    folderFindOne: ReturnType<typeof vi.fn>;
+} {
     const adapter = new TestEmailSyncAdapter();
     const put = vi.fn().mockResolvedValue(undefined);
     (adapter as any).blobStore = { put, get: vi.fn(), getStream: vi.fn(), delete: vi.fn(), exists: vi.fn(), size: vi.fn() };
     const labelFind = vi.fn().mockResolvedValue([]);
     (adapter as any).labelRepo = { find: labelFind };
-    return { adapter, put, labelFind };
+    const folderFindOne = vi.fn().mockResolvedValue({ uid: "folder-1", type: folderType });
+    (adapter as any).folderRepo = { findOne: folderFindOne };
+    return { adapter, put, labelFind, folderFindOne };
 }
 
 const baseMessage: Message = {
@@ -280,8 +288,8 @@ describe("EmailSyncAdapter Tests", () => {
             expect(partial.recipients).toEqual([{ address: "cc-only@example.com", type: RecipientType.CC }]);
         });
 
-        it("Reuses existing.bodyBlobKey on a Change rather than minting a new one.", async () => {
-            const { adapter, put } = buildAdapter();
+        it("Writes a Draft's changed body to a fresh blob key, never overwriting existing.bodyBlobKey.", async () => {
+            const { adapter, put, folderFindOne } = buildAdapter();
             const partial = await adapter.fromApplicationData(
                 appData([
                     element(WbxmlCodePage.AirSyncBase, "Body", [
@@ -292,9 +300,12 @@ describe("EmailSyncAdapter Tests", () => {
                 baseMessage,
             );
 
-            expect(partial.bodyBlobKey).toBe(baseMessage.bodyBlobKey);
+            expect(folderFindOne).toHaveBeenCalledWith(baseMessage.folderUid, { ignoreACL: true });
+            expect(partial.bodyBlobKey).toMatch(/^bodies\//);
+            expect(partial.bodyBlobKey).not.toBe(baseMessage.bodyBlobKey);
             expect(partial.bodyPreview).toBe("Updated text");
-            expect(put).toHaveBeenCalledWith(baseMessage.bodyBlobKey, expect.any(Buffer), { contentType: "message/rfc822" });
+            expect(put).toHaveBeenCalledTimes(1);
+            expect(put).toHaveBeenCalledWith(partial.bodyBlobKey, expect.any(Buffer), { contentType: "message/rfc822" });
             const mime = (put.mock.calls[0][1] as Buffer).toString("utf-8");
             // Falls back to existing's own Subject/From/recipients when the Change doesn't touch them.
             expect(mime).toContain(`Subject: ${baseMessage.subject}`);
@@ -316,6 +327,35 @@ describe("EmailSyncAdapter Tests", () => {
             expect(partial.bodyBlobKey).toMatch(/^bodies\//);
             expect(partial.bodyBlobKey).not.toBe("");
             expect(put).toHaveBeenCalledTimes(1);
+        });
+
+        it("Refuses a Body change on a message outside the Drafts folder (or whose folder is gone) without writing a blob.", async () => {
+            for (const folderType of [FolderType.INBOX, FolderType.SENT_ITEMS, undefined]) {
+                const { adapter, put, folderFindOne } = buildAdapter(folderType);
+                if (folderType === undefined) {
+                    folderFindOne.mockResolvedValue(undefined);
+                }
+                await expect(
+                    adapter.fromApplicationData(
+                        appData([
+                            element(WbxmlCodePage.AirSyncBase, "Body", [
+                                textElement(WbxmlCodePage.AirSyncBase, "Type", "1"),
+                                textElement(WbxmlCodePage.AirSyncBase, "Data", "Tampered"),
+                            ]),
+                        ]),
+                        baseMessage,
+                    ),
+                ).rejects.toMatchObject({ status: 400 });
+                expect(put).not.toHaveBeenCalled();
+            }
+        });
+
+        it("Still applies a non-body Change (Read) to a message outside the Drafts folder.", async () => {
+            const { adapter, put, folderFindOne } = buildAdapter(FolderType.INBOX);
+            const partial = await adapter.fromApplicationData(appData([textElement(WbxmlCodePage.Email, "Read", "1")]), baseMessage);
+            expect(partial.flags?.read).toBe(true);
+            expect(folderFindOne).not.toHaveBeenCalled();
+            expect(put).not.toHaveBeenCalled();
         });
 
         it("Leaves the body untouched when no Body element is present.", async () => {
@@ -357,6 +397,9 @@ describe("EmailSyncAdapter Tests", () => {
     });
 
     describe("toApplicationDataBatch", () => {
+        const L1 = "11111111-1111-4111-8111-111111111111";
+        const L2 = "22222222-2222-4222-8222-222222222222";
+        const STALE = "33333333-3333-4333-8333-333333333333";
         const categoriesOf = (el: WbxmlElement): string[] | undefined =>
             el.children.find((child) => child.tag === "Categories")?.children.map((child) => child.text!);
 
@@ -364,18 +407,18 @@ describe("EmailSyncAdapter Tests", () => {
             const { adapter, labelFind } = buildAdapter();
             labelFind.mockImplementation(async (query: any) => {
                 const all = [
-                    { uid: "l1", mailboxUid: "mbx-1", name: "Important" },
-                    { uid: "l2", mailboxUid: "mbx-1", name: "Follow Up" },
-                    { uid: "l1", mailboxUid: "mbx-2", name: "Other Mailbox" },
+                    { uid: L1, mailboxUid: "mbx-1", name: "Important" },
+                    { uid: L2, mailboxUid: "mbx-1", name: "Follow Up" },
+                    { uid: L1, mailboxUid: "mbx-2", name: "Other Mailbox" },
                 ];
                 const uids: string[] = /^in\((.*)\)$/.exec(query.uid)![1].split(",");
                 return all.filter((label) => label.mailboxUid === query.mailboxUid && uids.includes(label.uid));
             });
             const messages: Message[] = [
-                { ...baseMessage, uid: "m1", labelUids: ["l2", "l1", "stale"] },
-                { ...baseMessage, uid: "m2", labelUids: ["l1", "l1"] },
+                { ...baseMessage, uid: "m1", labelUids: [L2, L1, STALE] },
+                { ...baseMessage, uid: "m2", labelUids: [L1, L1] },
                 { ...baseMessage, uid: "m3" },
-                { ...baseMessage, uid: "m4", mailboxUid: "mbx-2", labelUids: ["l1"] },
+                { ...baseMessage, uid: "m4", mailboxUid: "mbx-2", labelUids: [L1] },
             ];
 
             const rendered = await adapter.toApplicationDataBatch(messages);
@@ -384,6 +427,23 @@ describe("EmailSyncAdapter Tests", () => {
             const mbx1Query = labelFind.mock.calls.find(([query]) => query.mailboxUid === "mbx-1")![0];
             expect(mbx1Query.uid.split(",").length).toBe(3);
             expect(rendered.map(categoriesOf)).toEqual([["Follow Up", "Important"], ["Important"], undefined, ["Other Mailbox"]]);
+        });
+
+        it("Never splices a non-UUID labelUids entry (me, commas, operators, uppercase) into the in(...) lookup.", async () => {
+            const { adapter, labelFind } = buildAdapter();
+            labelFind.mockResolvedValue([{ uid: L1, mailboxUid: "mbx-1", name: "Important" }]);
+
+            const [rendered] = await adapter.toApplicationDataBatch([
+                { ...baseMessage, labelUids: ["me", `${L1},${L2}`, "like(*)", L1.toUpperCase(), "", L1] },
+            ]);
+
+            expect(labelFind).toHaveBeenCalledTimes(1);
+            expect(labelFind.mock.calls[0][0].uid).toBe(`in(${L1})`);
+            expect(categoriesOf(rendered)).toEqual(["Important"]);
+
+            labelFind.mockClear();
+            await adapter.toApplicationDataBatch([{ ...baseMessage, labelUids: ["me", "a,b"] }]);
+            expect(labelFind).not.toHaveBeenCalled();
         });
 
         it("Never queries the Label repo when no message has labels, and toApplicationData() matches the batch form.", async () => {
