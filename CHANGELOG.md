@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.3] - 2026-09-15
+
+### Added
+- Added GAL Search without a SearchProvider
+- Added a display name that shows only the mailbox's own address, run Ping fallback scans 25 at a time, and reject DeviceId values me and null
+
+### Changed
+- Resolve Categories for a page of messages with one label query per mailbox instead of one per message
+- Load Mailbox Search hits with one query and check READ once per folder instead of per hit
+- Strip NUL characters from WBXML inline strings, which ended the string early and let the rest be read as tokens
+- Shorten GAL Search and ResolveRecipients queries so the escaped pattern fits the regex length limit, and report a failed recipient lookup as that recipient's Status 4 instead of failing the command
+- Update the README to the @rapidmx/activesync-plugin package name
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Keep device sync state with a pending remote wipe when cleaning up stale devices, so a lost device that reconnects is still wiped
+- Limit ResolveRecipients to 100 To elements, skip empty ones, and report unexpected lookup failures as Status 6 instead of recipients not found
+- Only resolve UUID-shaped label uids
+- Refuse Sync body changes outside Drafts and write draft bodies to a new blob instead of overwriting the message's original MIME, which inbox rule copies can share
+- Declare mailboxScopedData in the plugin manifest
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Track per device and folder which items the device holds, so moved and deleted items become Deletes, unseen items become Adds, and the sync position only advances past rows actually sent
+- Accept a retried previous SyncKey, deduplicate Adds by ClientId, and return the full folder tree on FolderSync SyncKey 0
+- Cap WBXML decoding by elements, children and depth, reject oversized requests with 413, and build responses from Buffer chunks with an ItemOperations size cap
+- Require From and Sender to be the mailbox's own addresses, cap recipients, strip Bcc from relayed mail, and keep calendar organizers to the mailbox itself
+- Share one Redis subscriber for Ping, allow one active Ping per device, end waits when the request closes, and cap folders
+- Retry device state writes on version conflicts instead of failing after side effects
+- Clear the policy key on remote wipe, send the wipe to every pending Provision, and require a matching policy key on other commands
+- Keep attendee fields and recurrence exceptions on calendar changes and bump the sequence, use the Flag container, honour DeletesAsMoves, FilterType and WindowSize
+- Refuse cross-mailbox moves, limit Email Adds to Drafts, fall back to folder class in GetItemEstimate, and handle every MeetingResponse request with iTIP replies
+- Page changes by timestamp and uid, cap Sync collections, commands and moves, and check attachment access against the message's current folder
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Stop attendee calendar copies from sending organizer invites or cancellations, stamping the cancel notice before deleting an attendee's copy
+- Reject messages with duplicate From or Sender headers before parsing
+- Re-read a short overlap behind each sync cursor so out-of-order commits aren't missed, deduplicating against recently sent rows
+- Lease each mailbox/device/folder collection during Sync, answering Status 16 when busy and Status 3 when state can't be saved
+- Store large held-id sets in EasCollectionChunk rows and reconcile hard-purged items into Deletes
+- Block remotely wiped devices until an admin unblocks them, and accept the previous FolderSync key on retry
+- Cap GetItemEstimate collections, gate Settings before provisioning to device information only, and bound bulk deletes and moves with partial statuses
+- Correct inverted MoveItems status codes and fail MeetingResponse when the reply is rejected by the transport
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Check composed From and Sender headers with restapi's originator rules on the raw MIME, including look-alike @ display names, empty groups and bare CR, strip Bcc with the same lexer, and refuse messages without recipients with Status 119
+- Refuse moves into Outbox and into Drafts from other folders, allow body changes only on genuine drafts, clear scheduled send state when leaving Outbox, and refuse moving a message whose send is in flight
+- Look meetings and conversations up by bounded, exact-matched ids, validate DeviceId, and check operator-shaped uids one at a time
+- Version-check every update of plain rows, and judge organizer copies against the event owner's mailbox
+- Fail open quickly when Redis is unreachable and renew Sync leases, always clear collection chunks on SyncKey 0 and cleanup, and blank SyncKeys before chunk writes
+- Store the relayed Message-ID, conversation id and Bcc on the Sent Items copy, and batch Ping's pending-change checks
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Updated @rapidrest/service-core to ^2.1.0 as both the dev dependency and the peer range
+- Use ModelUtils.literal() for the sender-controlled conversation id and iCalendar UID lookups instead of bounded query strings
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Use the mailbox's safe display name as calendar organizer, validate attendees as plain addresses and refuse more than 500, matching restapi
+- Record audit log entries for non-owner EAS access: Fetch bodies and attachments, Sync rounds, Search pages, Sync deletes and EmptyFolderContents
+- Release Sync leases locally even when Redis hangs and give the first Redis SET its full timeout
+- Refuse deleting messages with a live send lease, moving delivered mail from Outbox to Drafts, and body edits on messages carrying server-set delivery markers
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+### Fixed
+- Fixed the FilterType reset loop on SyncKey 0, and answer Ping immediately when a folder already changed before subscribing
+
 ## [1.0.0-beta.2] - 2026-09-14
 
 ### Added
@@ -175,7 +233,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Removed unused files
 
-[Unreleased]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.2...HEAD
+[Unreleased]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.3...HEAD
+[1.0.0-beta.3]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.2...v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.1...v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.0...v1.0.0-beta.1
 [1.0.0-beta.0]: https://github.com/RapidMX/activesync/releases/tag/v1.0.0-beta.0
