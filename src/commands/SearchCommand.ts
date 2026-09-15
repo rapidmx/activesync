@@ -8,10 +8,11 @@ import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 import type { EmailSyncAdapter } from "../adapters/EmailSyncAdapter.js";
-import type { Contact, Message } from "@rapidmx/restapi";
+import { AuditAction, type Contact, type Message } from "@rapidmx/restapi";
 import type { SearchProvider } from "@rapidmx/restapi/search";
 import { boundedEscapedPattern } from "../RegexPatternUtils.js";
-const { Config, Init, Inject } = ObjectDecorators;
+import { EasAuditLog } from "../EasAuditLog.js";
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** Max message uids per `in(...)` lookup - well under `RepoUtils.find()`'s 1000-row page cap. */
 const SEARCH_LOOKUP_CHUNK = 500;
@@ -79,7 +80,12 @@ function paginate<T>(matches: T[], start: number, end: number): { page: T[]; ran
  * request's own capped fetch actually returned" - a client requesting a `Range` past that cap sees fewer
  * results than may really exist, a documented approximation rather than exact server-side paging.
  *
- * `contactClass`/`messageClass`/`emailAdapterClass` are supplied by the Mongo/SQL concrete subclasses.
+ * **Audit**: the index is the caller's own mailbox's, but a hit is rendered from the stored message, wherever it is
+ * filed now. Results from a mailbox the caller doesn't own (restapi's `isNonOwnerAccess()`) are recorded as one
+ * `MESSAGE_CONTENT_ACCESSED` entry per such mailbox per request, listing the returned message uids (`EasAuditLog`).
+ *
+ * `contactClass`/`messageClass`/`emailAdapterClass`/`mailboxClass`/`auditLogClass` are supplied by the Mongo/SQL
+ * concrete subclasses.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -89,9 +95,19 @@ export abstract class SearchCommand implements EasCommandHandler {
     protected abstract contactClass: any;
     protected abstract messageClass: any;
     protected abstract emailAdapterClass: any;
+    protected abstract mailboxClass: any;
+    protected abstract auditLogClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
+
+    @Config()
+    private config?: any;
+
+    @Logger
+    private logger: any;
+
+    private mailboxRepo?: RepoUtils<any>;
 
     private contactRepo?: RepoUtils<any>;
     private messageRepo?: RepoUtils<any>;
@@ -120,12 +136,16 @@ export abstract class SearchCommand implements EasCommandHandler {
             args: [this.messageClass],
         });
         this.emailAdapter = await this._objectFactory!.newInstance(this.emailAdapterClass);
+        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.mailboxClass.name,
+            args: [this.mailboxClass],
+        });
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
         // `searchProvider` is only needed by the Mailbox store - checked in `handleMailbox()` so a deployment
         // without one can still answer GAL searches.
-        if (!this.contactRepo || !this.messageRepo || !this.emailAdapter) {
+        if (!this.contactRepo || !this.messageRepo || !this.emailAdapter || !this.mailboxRepo) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         const storeEl = ctx.request ? findChild(ctx.request, "Store") : undefined;
@@ -255,6 +275,7 @@ export abstract class SearchCommand implements EasCommandHandler {
         const { page, rangeStart, rangeEnd } = paginate(matches, start, end);
         const applicationData: WbxmlElement[] = await this.emailAdapter!.toApplicationDataBatch(page);
         const results = page.map((message, i) => this.messageToResult(message, applicationData[i]));
+        await this.auditResults(ctx, page);
 
         return element(WbxmlCodePage.Search, "Store", [
             textElement(WbxmlCodePage.Search, "Status", "1"),
@@ -262,6 +283,33 @@ export abstract class SearchCommand implements EasCommandHandler {
             textElement(WbxmlCodePage.Search, "Range", `${rangeStart}-${rangeEnd}`),
             textElement(WbxmlCodePage.Search, "Total", String(matches.length)),
         ]);
+    }
+
+    /** One `MESSAGE_CONTENT_ACCESSED` entry per non-owner mailbox among `page`'s messages (see this class's doc comment). */
+    private async auditResults(ctx: EasCommandContext, page: Message[]): Promise<void> {
+        const byMailbox = new Map<string, string[]>();
+        for (const message of page) {
+            if (message.mailboxUid !== ctx.mailboxUid) {
+                byMailbox.set(message.mailboxUid, [...(byMailbox.get(message.mailboxUid) ?? []), (message as any).uid]);
+            }
+        }
+        if (byMailbox.size === 0) {
+            return;
+        }
+        const audit = new EasAuditLog(
+            { objectFactory: this._objectFactory!, auditLogClass: this.auditLogClass, mailboxRepo: this.mailboxRepo!, config: this.config, logger: this.logger },
+            ctx,
+            this.command,
+        );
+        for (const [mailboxUid, messageUids] of byMailbox) {
+            await audit.record({
+                action: AuditAction.MESSAGE_CONTENT_ACCESSED,
+                mailboxUid,
+                targetType: "Mailbox",
+                targetUid: mailboxUid,
+                details: { operation: "Search", count: messageUids.length, messageUids },
+            });
+        }
     }
 
     private contactToResult(contact: Contact): WbxmlElement {

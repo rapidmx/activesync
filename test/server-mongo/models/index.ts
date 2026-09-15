@@ -6,6 +6,7 @@
 // restapi defines - none of which this EAS-only test harness configures dependencies for.
 export {
     AttachmentMongo,
+    AuditLogEntryMongo,
     CalendarEventMongo,
     ContactMongo,
     FolderMongo,

@@ -49,6 +49,89 @@ Keep entries terse — this is a reference, not a transcript.
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
 
+### 2026-09-14 (7) — Round-6 review fixes (invite spoofing, non-owner audit, lease hangs, drafts, DeviceId)
+
+All 8 findings re-checked against the code and fixed; nothing skipped. Also aligned with restapi's round-6 "part A"
+contract changes, which landed mid-task. Uncommitted, no version bump. Still builds against `@rapidmx/restapi` 0.9.0.
+0.9.0 already exports `recordAuditLog`, `isNonOwnerAccess`, `AuditAction` and `AuditLogEntry{Mongo,SQL}`, so no copy
+was needed for those. `isPlainAddress`/`safeDisplayName` (with the private `hasControlCharacter`, `PLAIN_ADDRESS_PATTERN`
+and `MAX_PLAIN_ADDRESS_LENGTH`) are new **exact inline copies** in the restapi section of `src/MimeHeaderUtils.ts`.
+
+- **1 Calendar invite spoofing** (`CalendarSyncAdapter`), using restapi's semantics exactly:
+  - **Organizer on Add with a mailbox:** the display name is always `safeDisplayName(mailbox.displayName)`. The device's
+    `OrganizerName` is ignored.
+  - **Organizer in direct use (no mailbox):** a non-empty `OrganizerEmail` must be `isPlainAddress`, and
+    `OrganizerName` must pass `safeDisplayName`.
+  - **Attendees**, like restapi's `BaseCalendarEventRoute.assertParticipants()`: every `Email` must be `isPlainAddress`,
+    and more than `MAX_CALENDAR_ATTENDEES` (500) is refused, never truncated. On a Change this only applies when the
+    address list actually changed, so an attendee copy filed with an odd list still round-trips.
+  - Attendee `Name` goes through `safeDisplayName`. Any refusal throws, which is Sync Status 6.
+  - A Change still never touches the organizer. restapi's `MeetingSchedulingJob` now ignores `organizer.displayName`
+    anyway.
+- **2 Non-owner audit** (new `src/EasAuditLog.ts`, one instance per request):
+  - The caller's own `ctx.mailboxUid` needs no lookup. Any other mailbox is loaded once and judged with
+    `isNonOwnerAccess()`. A mailbox that's missing or can't be read counts as non-owner.
+  - Failures are logged and never thrown. `details` always carries `protocol: "ActiveSync"`, `command` and `deviceId`.
+  - **Granularity chosen:**
+    - ItemOperations Fetch: one `MESSAGE_CONTENT_ACCESSED` per body (`Message`) or attachment (`Attachment`). Nothing
+      for a Status 11 fetch.
+    - EmptyFolderContents: one `MESSAGE_DELETE` per batch (`Folder` target, uid list of at most `batchSize`), so at
+      most 20 rows.
+    - Sync: one `MESSAGE_CONTENT_ACCESSED` per Email collection round that sends Add/Change items (`Folder` target,
+      at most one window of uids), plus one `MESSAGE_DELETE` per successful Email Delete, per item like REST. The
+      delete entry sets `movedToDeletedItems` for a delete-as-move.
+    - Search (Mailbox store): one entry per non-owner mailbox in the returned page (`Mailbox` target). The index is
+      the caller's own, so this only fires for stale or moved hits.
+  - restapi's `AuditLogEntry` accepts any `targetType`/`targetUid`/`details`, so batch entries are schema-valid.
+  - Contacts/Calendar/Tasks rounds aren't audited, since `MESSAGE_CONTENT_ACCESSED` is message-specific.
+  - `ItemOperationsCommand`, `SyncCommand` and `SearchCommand` gained an abstract `auditLogClass` (plus `mailboxClass`
+    where it was missing). The Mongo/SQL subclasses set them, and the test server model lists now include
+    `AuditLogEntry*`.
+- **3 Lease release hang**: the release races the token-checked `EVAL` against `redisTimeoutMs`, and the in-process
+  lease is freed in `finally`.
+- **4 Redis lease skipped after a long local wait**:
+  - The connect and the first `SET` always get the full `redisTimeoutMs`.
+  - Only polling `SET`s, after Redis has answered, are capped by the deadline. A timeout there means busy
+    (`undefined`).
+  - One acquire can now overrun `waitMs` by at most one `redisTimeoutMs`.
+- **5 Drafts** (`MessageMoveRules`):
+  - `sentDate` can't be the marker: every message has one, and EAS drafts get `new Date()`.
+  - `isGenuineDraft` now also needs none of these server-managed marks: `scanResultUid`, `scheduledSendRelayedAt`,
+    `sanitizedHtmlBlobKey` (a draft is never scanned; the Sent copy keeps it), `encrypted: true`,
+    `recallRequestedAt`, or a non-empty `receiptStatus`. A non-trusted client can't set any of them, and EAS, REST
+    and compose drafts carry none.
+  - Side effect: an imported message sitting in Drafts with sanitized HTML is no longer body-editable over EAS.
+  - Residual: a plain-text, unencrypted Sent copy with no receipt request has no mark. restapi now keeps it out of
+    Drafts: `send()` needs Drafts for non-trusted callers.
+  - Part A: `planMessageMove` refuses Outbox -> Drafts for a delivered message (`scanResultUid`), as restapi's 403
+    does.
+- **Part A, deletes during a send**:
+  - New `hasLiveSendLease()` (also used by `planMessageMove`).
+  - Sync Delete answers Status 6 for a live lease, both hard delete and delete-as-move, with nothing written.
+  - EmptyFolderContents skips such a message as failed (Status 17, or 3 if nothing was deleted). This mirrors
+    restapi's new 409.
+- **6 Own address as display name**: `checkComposedOriginators` runs restapi's check without
+  `rejectAddressLikeDisplayNames`, then applies its own rule. An address-like display name, group name or comment
+  passes only when:
+  - every addr-spec token in it passes `isAllowed` (read as UTF-8 and as latin1, encoded words decoded);
+  - it has no look-alike `@`;
+  - no stray `@` is left over.
+
+  So `"me@x" <me@x>` passes, while any other address still gets 403.
+- **7 Ping fallback**: undecided folders run `scanAfter` 25 at a time (`FALLBACK_SCAN_CHUNK_SIZE`), in order.
+- **8 DeviceId**: the exported `isValidDeviceId()` also refuses exactly `me` and `null`, which service-core's
+  `coerceOperand` special-cases (case-sensitive, so `Me`/`NULL` still pass). `ModelUtils.literal` wasn't added to
+  device lookups: `DeviceId` only enters through `BaseEasRoute`, so validation covers it.
+- **Test pollution found**: "Gives up when another copy's Redis key outlives waitMs" never released its last lease.
+  Its 333 ms renewal timer then fired into the "Renews" test once the new lease tests shifted timings. The test now
+  releases it.
+- **Tooling gotchas (Windows)**:
+  - Python writes: use `newline=''`. A bytes literal needs `rb''`, or `\x00` becomes a real control byte.
+  - The Edit tool turns a typed ` ` escape into the literal character, which is a line terminator inside a JS
+    regex literal.
+- Checks: `yarn lint` clean. `npx tsc --noEmit -p .` clean. `tsc -p tsconfig.test.json` still shows the pre-existing
+  17 errors. Full run: 35 files / 805 tests, coverage 100 / 97.76 / 100 / 100.
+
 ### 2026-09-14 (6) — Migrated to `@rapidrest/service-core` 2.1.0
 
 Uncommitted, no version bump. `@rapidmx/restapi` stays at 0.9.0.

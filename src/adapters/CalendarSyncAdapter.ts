@@ -8,6 +8,7 @@ import { childText, element, findChild, textElement, type WbxmlElement } from ".
 import { fromCompactDateTime, toCompactDateTime } from "../CompactDateTime.js";
 import type { EasCollectionSyncAdapter } from "./EasCollectionSyncAdapter.js";
 import { boundIndexedValue } from "../RestapiCompat.js";
+import { isPlainAddress, safeDisplayName } from "../MimeHeaderUtils.js";
 import {
     AttendeeResponseStatus,
     AttendeeRole,
@@ -19,6 +20,11 @@ import {
     type Attendee,
     type Mailbox,
 } from "@rapidmx/restapi";
+
+/** Most attendees one event may carry from a device - restapi's `MAX_EVENT_ATTENDEES` (REST calendar writes) and
+ * `MeetingSchedulingJob`'s default `max_attendees`, and the MAPI plugin's cap. The job mails every attendee, so an
+ * unbounded list would make one Sync item a bulk mailing. */
+export const MAX_CALENDAR_ATTENDEES = 500;
 
 /** Builds the reverse of a forward code-table once at module load, rather than re-deriving it per call. */
 function invert<K extends string>(table: Record<K, string>): Record<string, K> {
@@ -171,8 +177,19 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
      * **Organizer** (`mailbox` = the caller's own mailbox, supplied by `SyncCommand`): a device can only create an
      * event organized by itself - on an `Add`, an `OrganizerEmail` that isn't one of the mailbox's own addresses (or
      * a missing one) is replaced by the mailbox's primary address, since the organizer is who iTIP invitations are
-     * sent as. On a `Change` the organizer is never reassigned (an attendee's copy of someone else's meeting keeps
-     * its real organizer). Without a `mailbox` (direct use), `OrganizerEmail` is taken as sent.
+     * sent as. The organizer's display name is always the mailbox's own (`MimeHeaderUtils.safeDisplayName()`: omitted
+     * when it looks like an address or has a line break) - never the device's `OrganizerName`, which invitations would
+     * otherwise show as the sender's name (e.g. `payroll@corp.com`). On a `Change` the organizer is never reassigned (an
+     * attendee's copy of someone else's meeting keeps its real organizer). Without a `mailbox` (direct use),
+     * `OrganizerEmail` must be one plain address (`isPlainAddress()`) and `OrganizerName` is kept only when it passes the
+     * same rule.
+     *
+     * **Attendees** match restapi's REST calendar validation (`BaseCalendarEventRoute.assertParticipants()`, 400 there):
+     * each `Email` must be one plain address (`MimeHeaderUtils.isPlainAddress()`, so not a list like `a@x, b@y`), and at
+     * most `MAX_CALENDAR_ATTENDEES` are accepted - refused, never truncated. As in restapi, on a `Change` only a changed
+     * list is checked: a device re-sending exactly the addresses the event already has (e.g. an attendee copy filed with
+     * a larger or odder list) still saves. A `Name` is kept only when `safeDisplayName()` allows it. A refusal throws,
+     * which `SyncCommand` reports as Status 6.
      *
      * **Change merging** (`existing` given): `Attendees`/`Recurrence` are ghosted as a whole element - present ->
      * rebuilt from what's there, absent -> untouched - but a rebuilt attendee the event already had keeps the fields
@@ -208,14 +225,18 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
         const organizerEmail = childText(el, "OrganizerEmail");
         if (!existing && mailbox) {
             const own = new Set([mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].map((a) => a.toLowerCase()));
-            partial.organizer =
-                organizerEmail !== undefined && own.has(organizerEmail.toLowerCase())
-                    ? { address: organizerEmail, displayName: childText(el, "OrganizerName") ?? mailbox.displayName, type: RecipientType.TO }
-                    : { address: mailbox.primarySmtpAddress, displayName: mailbox.displayName, type: RecipientType.TO };
+            partial.organizer = {
+                address: organizerEmail !== undefined && own.has(organizerEmail.toLowerCase()) ? organizerEmail : mailbox.primarySmtpAddress,
+                displayName: safeDisplayName(mailbox.displayName),
+                type: RecipientType.TO,
+            };
         } else if (!existing && organizerEmail !== undefined) {
+            if (organizerEmail !== "" && !isPlainAddress(organizerEmail)) {
+                throw new Error("OrganizerEmail must be a single plain email address.");
+            }
             partial.organizer = {
                 address: organizerEmail,
-                displayName: childText(el, "OrganizerName"),
+                displayName: safeDisplayName(childText(el, "OrganizerName")),
                 type: RecipientType.TO,
             };
         }
@@ -225,9 +246,18 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
 
         const attendeesEl = findChild(el, "Attendees");
         if (attendeesEl) {
-            partial.attendees = attendeesEl.children
-                .filter((child) => child.tag === "Attendee")
-                .map((attendeeEl) => this.attendeeFromElement(attendeeEl, existing?.attendees));
+            const attendeeEls: WbxmlElement[] = attendeesEl.children.filter((child) => child.tag === "Attendee");
+            const attendees: Attendee[] = attendeeEls.map((attendeeEl) => this.attendeeFromElement(attendeeEl, existing?.attendees));
+            const addresses = (list: Attendee[] | undefined): string => JSON.stringify((list ?? []).map((attendee) => attendee.address));
+            if (!existing || addresses(attendees) !== addresses(existing.attendees)) {
+                if (attendees.length > MAX_CALENDAR_ATTENDEES) {
+                    throw new Error(`An event may have at most ${MAX_CALENDAR_ATTENDEES} attendees.`);
+                }
+                if (!attendees.every((attendee) => isPlainAddress(attendee.address))) {
+                    throw new Error("Attendee Email must be a single plain email address.");
+                }
+            }
+            partial.attendees = attendees;
         }
 
         const recurrenceEl = findChild(el, "Recurrence");
@@ -280,7 +310,7 @@ export class CalendarSyncAdapter implements EasCollectionSyncAdapter<CalendarEve
         const attendeeStatus = childText(el, "AttendeeStatus");
         return {
             address,
-            displayName: childText(el, "Name") ?? known?.displayName,
+            displayName: safeDisplayName(childText(el, "Name") ?? known?.displayName),
             role: (attendeeType && ATTENDEE_TYPE_FROM_CODE[attendeeType]) || known?.role || AttendeeRole.REQUIRED,
             responseStatus:
                 (attendeeStatus && ATTENDEE_STATUS_FROM_CODE[attendeeStatus]) || known?.responseStatus || AttendeeResponseStatus.NEEDS_ACTION,

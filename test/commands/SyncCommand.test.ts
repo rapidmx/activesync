@@ -1027,4 +1027,133 @@ describe("SyncCommand Tests (isolated)", () => {
             expect(stateRepo.update.mock.calls[0][1]).toBeInstanceOf(FakeEntity);
         });
     });
+
+    describe("Round 6: deletes during a send", () => {
+        it("Refuses (Status 6) to delete, or delete-as-move, a message whose send lease is live, and deletes it once it lapsed.", async () => {
+            const live = { uid: "msg-1", version: 3, folderUid: FOLDER_UID, mailboxUid: "mbx-1", scheduledSendLeaseExpiresAt: new Date(Date.now() + 60_000) };
+            const request = (extra: WbxmlElement[] = []) =>
+                syncRequest("Email", [element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", "msg-1")])], extra);
+            for (const extra of [[], [textElement(WbxmlCodePage.AirSync, "DeletesAsMoves", "0")]]) {
+                const repo = fakeRepo({ findOne: vi.fn().mockResolvedValue(live), update: vi.fn(), delete: vi.fn() });
+                const { command } = await buildCommand("Email", fakeAdapter(), repo, { state: storedState({ collectionClass: "Email" }), folder: { uid: FOLDER_UID, mailboxUid: "mbx-1", type: FolderType.OUTBOX } });
+                expect(responseStatus(await command.handle(buildContext(request(extra)).ctx), "Delete")).toBe("6");
+                expect(repo.update).not.toHaveBeenCalled();
+                expect(repo.delete).not.toHaveBeenCalled();
+            }
+
+            const lapsedRepo = fakeRepo({ findOne: vi.fn().mockResolvedValue({ ...live, scheduledSendLeaseExpiresAt: new Date(Date.now() - 1000) }), delete: vi.fn() });
+            const { command: lapsed } = await buildCommand("Email", fakeAdapter(), lapsedRepo, { state: storedState({ collectionClass: "Email" }), folder: { uid: FOLDER_UID, mailboxUid: "mbx-1", type: FolderType.DELETED_ITEMS } });
+            await lapsed.handle(buildContext(request()).ctx);
+            expect(lapsedRepo.delete).toHaveBeenCalledWith("msg-1", { ignoreACL: true });
+        });
+    });
+
+    describe("Round 6: audit of non-owner access", () => {
+        const mailboxes: Record<string, any> = {
+            "mbx-1": { uid: "mbx-1", ownerUserUid: "user-1", primarySmtpAddress: "owner@example.com", displayName: "Owner" },
+            "mbx-2": { uid: "mbx-2", ownerUserUid: "user-2", primarySmtpAddress: "boss@example.com", displayName: "Boss" },
+        };
+        const shared = { uid: FOLDER_UID, mailboxUid: "mbx-2", type: FolderType.INBOX };
+
+        /** Gives `command` a real restapi `recordAuditLog()` path over a fake audit repository; returns the rows written. */
+        function withAudit(command: SyncCommandMongo): any[] {
+            class FakeAuditLogEntry {
+                constructor(values: any) {
+                    Object.assign(this, values);
+                }
+            }
+            const written: any[] = [];
+            vi.spyOn((command as any)._objectFactory, "newInstance").mockResolvedValue({ create: vi.fn(async (entry: any) => written.push(entry)) });
+            (command as any).auditLogClass = FakeAuditLogEntry;
+            (command as any).config = config;
+            (command as any).mailboxRepo = { findOne: vi.fn(async (uid: string) => mailboxes[uid]) };
+            return written;
+        }
+        const rows = [
+            { uid: "m1", folderUid: FOLDER_UID, mailboxUid: "mbx-2", dateModified: new Date(Date.UTC(2026, 1, 1, 0, 1)) },
+            { uid: "m2", folderUid: FOLDER_UID, mailboxUid: "mbx-2", dateModified: new Date(Date.UTC(2026, 1, 1, 0, 2)) },
+        ];
+        const enumerating = () =>
+            fakeRepo({
+                find: vi.fn().mockImplementation(async (query: any) => (query.deleted || String(query.dateModified).startsWith("range") || query.folderUid !== FOLDER_UID ? [] : rows)),
+            });
+
+        it("Records one MESSAGE_CONTENT_ACCESSED entry per Email round sent from another owner's mailbox, listing the items.", async () => {
+            const { command } = await buildCommand("Email", fakeAdapter(), enumerating(), { state: storedState({ collectionClass: "Email" }), folder: shared });
+            const written = withAudit(command);
+
+            const response = await command.handle(buildContext(syncRequest("Email", [])).ctx);
+
+            expect(findChildren(findChild(collection(response!), "Commands")!, "Add")).toHaveLength(2);
+            expect(written).toHaveLength(1);
+            expect(written[0]).toMatchObject({
+                action: "message.content_accessed",
+                targetType: "Folder",
+                targetUid: FOLDER_UID,
+                mailboxUid: "mbx-2",
+                actorUserUid: "user-1",
+                details: { protocol: "ActiveSync", command: "Sync", deviceId: "dev-1", operation: "Sync", count: 2, messageUids: ["m1", "m2"] },
+            });
+        });
+
+        it("Records nothing for the caller's own mailbox, for a round with no items, or for other collection classes.", async () => {
+            const own = await buildCommand("Email", fakeAdapter(), enumerating(), {
+                state: storedState({ collectionClass: "Email" }),
+                folder: { ...shared, mailboxUid: "mbx-1" },
+            });
+            const ownWritten = withAudit(own.command);
+            await own.command.handle(buildContext(syncRequest("Email", [])).ctx);
+            expect(ownWritten).toEqual([]);
+            expect((own.command as any).mailboxRepo.findOne).not.toHaveBeenCalledWith("mbx-1", expect.anything());
+
+            const quiet = await buildCommand("Email", fakeAdapter(), fakeRepo(), { state: storedState({ collectionClass: "Email" }), folder: shared });
+            const quietWritten = withAudit(quiet.command);
+            await quiet.command.handle(buildContext(syncRequest("Email", [])).ctx);
+            expect(quietWritten).toEqual([]);
+
+            const contacts = await buildCommand("Contacts", fakeAdapter(), enumerating(), { state: storedState({ collectionClass: "Contacts" }), folder: shared });
+            const contactsWritten = withAudit(contacts.command);
+            await contacts.command.handle(buildContext(syncRequest("Contacts", [])).ctx);
+            expect(contactsWritten).toEqual([]);
+        });
+
+        it("Records a MESSAGE_DELETE entry per Email Delete in another owner's mailbox, whether moved to Deleted Items or deleted.", async () => {
+            const message = { uid: "msg-1", version: 3, folderUid: FOLDER_UID, mailboxUid: "mbx-2", subject: "Payroll" };
+            const request = (extra: WbxmlElement[] = []) =>
+                syncRequest("Email", [element(WbxmlCodePage.AirSync, "Delete", [textElement(WbxmlCodePage.AirSync, "ServerId", "msg-1")])], extra);
+
+            const moving = await buildCommand("Email", fakeAdapter(), fakeRepo({ findOne: vi.fn().mockResolvedValue(message), update: vi.fn().mockResolvedValue({}) }), {
+                state: storedState({ collectionClass: "Email" }),
+                folder: shared,
+            });
+            const movedWritten = withAudit(moving.command);
+            await moving.command.handle(buildContext(request()).ctx);
+            expect(movedWritten).toEqual([
+                expect.objectContaining({
+                    action: "message.delete",
+                    targetType: "Message",
+                    targetUid: "msg-1",
+                    mailboxUid: "mbx-2",
+                    details: expect.objectContaining({ subject: "Payroll", folderUid: FOLDER_UID, movedToDeletedItems: true, command: "Sync" }),
+                }),
+            ]);
+
+            const hard = await buildCommand("Email", fakeAdapter(), fakeRepo({ findOne: vi.fn().mockResolvedValue(message), delete: vi.fn().mockResolvedValue(undefined) }), {
+                state: storedState({ collectionClass: "Email" }),
+                folder: shared,
+            });
+            const hardWritten = withAudit(hard.command);
+            await hard.command.handle(buildContext(request([textElement(WbxmlCodePage.AirSync, "DeletesAsMoves", "0")])).ctx);
+            expect(hardWritten.map((entry) => [entry.action, entry.details.movedToDeletedItems])).toEqual([["message.delete", false]]);
+
+            // A failed delete records nothing.
+            const failing = await buildCommand("Email", fakeAdapter(), fakeRepo({ findOne: vi.fn().mockResolvedValue(message), delete: vi.fn().mockRejectedValue(new Error("x")) }), {
+                state: storedState({ collectionClass: "Email" }),
+                folder: shared,
+            });
+            const failedWritten = withAudit(failing.command);
+            await failing.command.handle(buildContext(request([textElement(WbxmlCodePage.AirSync, "DeletesAsMoves", "0")])).ctx);
+            expect(failedWritten).toEqual([]);
+        });
+    });
 });

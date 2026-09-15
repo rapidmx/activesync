@@ -58,6 +58,15 @@ function firstQueryValue(value: string | string[] | undefined): string | undefin
  * `op(value)` and `in(a,b)` syntax - `DeviceId` goes straight into `find()` criteria for the device's own rows. */
 const DEVICE_ID_PATTERN = /^[\x21-\x27\x2a\x2b\x2d-\x7e]{1,128}$/;
 
+/** `DeviceId` values the query parser gives a meaning of its own even without an operator: `me` becomes the caller's
+ * uid (or a 403 without one) and `null` becomes an IS NULL match. Both are refused like any other malformed id. */
+const RESERVED_DEVICE_IDS: ReadonlySet<string> = new Set(["me", "null"]);
+
+/** Whether `deviceId` is an acceptable `DeviceId` (`DEVICE_ID_PATTERN`, and not one of `RESERVED_DEVICE_IDS`). */
+export function isValidDeviceId(deviceId: string | undefined): deviceId is string {
+    return deviceId !== undefined && DEVICE_ID_PATTERN.test(deviceId) && !RESERVED_DEVICE_IDS.has(deviceId);
+}
+
 /**
  * Abstract base for the single fixed EAS endpoint (`POST /Microsoft-Server-ActiveSync` by MS-ASHTTP
  * convention, though the concrete path is left to the consuming application to mount via `@Route(...)` — see
@@ -166,7 +175,7 @@ export abstract class BaseEasRoute<D extends DeviceSyncState, M extends Mailbox 
         const deviceId: string | undefined = firstQueryValue(req.query["DeviceId"]);
         const deviceType: string = firstQueryValue(req.query["DeviceType"]) ?? "Unknown";
         const policyKey: string | undefined = firstQueryValue(req.query["PolicyKey"]);
-        if (!cmd || !deviceId || !DEVICE_ID_PATTERN.test(deviceId)) {
+        if (!cmd || !isValidDeviceId(deviceId)) {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
         }
 

@@ -738,6 +738,34 @@ describe("PingCommand Tests", () => {
             expect(itemRepo.find.mock.calls.some(([query]: any[]) => String(query.folderUid).startsWith("in(") && String(query.folderUid).includes("odd"))).toBe(false);
         });
 
+        it("Runs the per-folder fallback scans 25 at a time rather than one after another.", async () => {
+            const command = await createCommand({});
+            // Uids that can't be listed in in(...) are always scanned on their own.
+            const folderUids = Array.from({ length: 60 }, (_, i) => `odd,${i}`);
+            const { itemRepo } = withPendingCheck(
+                command,
+                Object.fromEntries(folderUids.map((uid) => [uid, state()])),
+                folderUids.filter((_uid, i) => i % 20 === 0).map((uid) => item(`row-${uid}`, uid)),
+            );
+            const find = itemRepo.find.getMockImplementation();
+            let inFlight = 0;
+            let maxInFlight = 0;
+            itemRepo.find.mockImplementation(async (query: any) => {
+                inFlight++;
+                maxInFlight = Math.max(maxInFlight, inFlight);
+                await tick(5);
+                inFlight--;
+                return await find(query);
+            });
+
+            const response = await command.handle(makeContext(pingRequest(60, folderUids)));
+
+            expect(findChild(response!, "Folders")!.children.map((f) => f.text)).toEqual(["odd,0", "odd,20", "odd,40"]);
+            // Each scan is a live + deleted pair: 25 scans at once is 50 queries, never more.
+            expect(maxInFlight).toBe(50);
+            expect(itemRepo.find).toHaveBeenCalledTimes(120);
+        });
+
         it("Checks once subscribed to Redis, releasing the subscription, and also when the Redis connect fails.", async () => {
             const command = await createCommand(REDIS_CONFIG);
             withPendingCheck(command, { "folder-1": state() }, [item("m1", "folder-1")]);

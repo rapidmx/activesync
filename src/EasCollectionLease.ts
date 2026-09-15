@@ -18,7 +18,9 @@ export interface LeaseOptions {
     waitMs: number;
     /** Delay between Redis acquisition attempts. */
     pollMs?: number;
-    /** Longest a single Redis connect or command may take before the lease fails open (capped by `waitMs`'s deadline). */
+    /** Longest a single Redis connect, `SET` or release may take before the lease fails open. The connect and the first
+     * `SET` always get all of it, however long the in-process wait took; a later `SET` while polling for another
+     * copy's key is also capped by `waitMs`'s deadline. */
     redisTimeoutMs?: number;
 }
 
@@ -62,9 +64,14 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | type
  * **Redis being unreachable fails open** to the in-process lease alone rather than refusing - or hanging - every
  * `Sync`: the client is created with `disableOfflineQueue` (a command fails at once while disconnected instead of
  * waiting in a queue) and a bounded `reconnectStrategy` (so `connect()` rejects instead of retrying forever), and
- * every connect/`SET` is additionally raced against `redisTimeoutMs`, capped by the `waitMs` deadline. A `SET` that
- * times out but lands later is released again straight away. A client whose reconnects gave up is replaced on the
- * next lease.
+ * every connect/`SET` is additionally raced against `redisTimeoutMs`. The connect and the first `SET` get the whole
+ * `redisTimeoutMs` even when the in-process wait already used up `waitMs` - otherwise a healthy Redis would get no time
+ * at all and the lease would fail open for nothing; only the polling `SET`s after Redis has answered are cut short by
+ * the deadline, which then means another copy still holds the key (`undefined`). A `SET` that times out but lands later
+ * is released again straight away. A client whose reconnects gave up is replaced on the next lease.
+ *
+ * **Release never hangs**: the token-checked release is raced against `redisTimeoutMs` too (the key expires on its
+ * own), and the in-process lease is freed whatever happens to it.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -153,8 +160,8 @@ export class EasCollectionLease {
 
         const url: string = options.redisUrl;
         const redisTimeoutMs: number = options.redisTimeoutMs ?? DEFAULT_REDIS_TIMEOUT_MS;
-        // Never waits past the deadline for Redis; with no time left at all, a call still gets the current tick.
-        const callTimeout = (): number => Math.min(redisTimeoutMs, Math.max(0, deadline - Date.now()));
+        // A polling SET never waits past the deadline for Redis; with no time left at all, it still gets the current tick.
+        const pollTimeout = (): number => Math.min(redisTimeoutMs, Math.max(0, deadline - Date.now()));
         const redisKey = `eas:lease:${key}`;
         const token: string = crypto.randomUUID();
         const releaseRedis = async (client: RedisClientType): Promise<void> => {
@@ -168,7 +175,7 @@ export class EasCollectionLease {
         let client: RedisClientType;
         try {
             const pending: Promise<RedisClientType> = EasCollectionLease.getClient(url, redisTimeoutMs);
-            const connected = await withTimeout(pending, callTimeout());
+            const connected = await withTimeout(pending, redisTimeoutMs);
             if (connected === TIMED_OUT) {
                 return failOpen;
             }
@@ -181,7 +188,7 @@ export class EasCollectionLease {
             let answered = false;
             for (;;) {
                 const setting = client.set(redisKey, token, { condition: "NX", expiration: { type: "PX", value: options.ttlMs } });
-                const reply = await withTimeout(setting, callTimeout());
+                const reply = await withTimeout(setting, answered ? pollTimeout() : redisTimeoutMs);
                 if (reply === TIMED_OUT) {
                     // Give back the key should the SET still land.
                     setting.then((late) => (late === "OK" ? releaseRedis(client) : undefined)).catch(() => undefined);
@@ -217,8 +224,12 @@ export class EasCollectionLease {
 
         return async () => {
             clearInterval(renewal);
-            await releaseRedis(client);
-            releaseLocal();
+            try {
+                // An unresponsive (but connected) Redis must not hold this collection on this server copy.
+                await withTimeout(releaseRedis(client), redisTimeoutMs);
+            } finally {
+                releaseLocal();
+            }
         };
     }
 }

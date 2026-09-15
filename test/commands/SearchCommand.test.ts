@@ -43,6 +43,7 @@ function buildCommand(deps: Record<string, any> = {}): SearchCommandMongo {
     Object.assign(command as any, {
         contactRepo: { find: vi.fn().mockResolvedValue([]) },
         messageRepo: { find: vi.fn().mockResolvedValue([]) },
+        mailboxRepo: { findOne: vi.fn().mockResolvedValue(undefined) },
         emailAdapter: {
             toApplicationDataBatch: vi.fn(async (messages: any[]) =>
                 messages.map(() => element(WbxmlCodePage.AirSync, "ApplicationData", [])),
@@ -90,10 +91,10 @@ describe("SearchCommand Tests", () => {
 
     it("Mailbox: fetches every hit in one query and checks READ once per folder, preserving relevance order.", async () => {
         const messages = [
-            { uid: "m1", folderUid: "f1" },
-            { uid: "m2", folderUid: "f2" },
-            { uid: "m3", folderUid: "f1" },
-            { uid: "m4", folderUid: "f3" },
+            { uid: "m1", folderUid: "f1", mailboxUid: "mbx-1" },
+            { uid: "m2", folderUid: "f2", mailboxUid: "mbx-1" },
+            { uid: "m3", folderUid: "f1", mailboxUid: "mbx-1" },
+            { uid: "m4", folderUid: "f3", mailboxUid: "mbx-1" },
         ];
         const messageFind = vi.fn(async (query: any) => {
             const uids: string[] = /^in\((.*)\)$/.exec(query.uid)![1].split(",");
@@ -114,5 +115,50 @@ describe("SearchCommand Tests", () => {
         const store = findChild(findChild(response!, "Response")!, "Store")!;
         expect(childText(store, "Total")).toBe("3");
         expect(findChildren(store, "Result").map((result) => childText(result, "ServerId"))).toEqual(["m3", "m1", "m4"]);
+    });
+
+    it("Mailbox: records one MESSAGE_CONTENT_ACCESSED entry per other owner's mailbox among the returned results.", async () => {
+        const messages = [
+            { uid: "own", folderUid: "f1", mailboxUid: "mbx-1" },
+            { uid: "a", folderUid: "f2", mailboxUid: "mbx-2" },
+            { uid: "b", folderUid: "f2", mailboxUid: "mbx-2" },
+            { uid: "second-own", folderUid: "f3", mailboxUid: "mbx-3" },
+        ];
+        const mailboxes: Record<string, any> = { "mbx-2": { uid: "mbx-2", ownerUserUid: "boss" }, "mbx-3": { uid: "mbx-3", ownerUserUid: "user-1" } };
+        class FakeAuditLogEntry {
+            constructor(values: any) {
+                Object.assign(this, values);
+            }
+        }
+        const command = buildCommand({
+            messageRepo: { find: vi.fn().mockResolvedValue(messages) },
+            mailboxRepo: { findOne: vi.fn(async (uid: string) => mailboxes[uid]) },
+            searchProvider: { search: vi.fn().mockResolvedValue({ results: messages.map((message) => ({ entityType: "message", entityUid: message.uid, score: 1 })) }) },
+            auditLogClass: FakeAuditLogEntry,
+            config,
+        });
+        const written: any[] = [];
+        vi.spyOn((command as any)._objectFactory, "newInstance").mockResolvedValue({ create: vi.fn(async (entry: any) => written.push(entry)) });
+
+        await command.handle({ user: { uid: "user-1" }, mailboxUid: "mbx-1", deviceId: "dev-1", request: mailboxRequest("x") } as unknown as EasCommandContext);
+
+        // A second mailbox the caller owns is not a non-owner access.
+        expect(written).toEqual([
+            expect.objectContaining({
+                action: "message.content_accessed",
+                targetType: "Mailbox",
+                targetUid: "mbx-2",
+                mailboxUid: "mbx-2",
+                details: expect.objectContaining({ command: "Search", count: 2, messageUids: ["a", "b"] }),
+            }),
+        ]);
+
+        // Only the caller's own results: no mailbox lookup, no entry.
+        const ownOnly = buildCommand({
+            messageRepo: { find: vi.fn().mockResolvedValue([messages[0]]) },
+            searchProvider: { search: vi.fn().mockResolvedValue({ results: [{ entityType: "message", entityUid: "own", score: 1 }] }) },
+        });
+        await ownOnly.handle({ user: { uid: "user-1" }, mailboxUid: "mbx-1", request: mailboxRequest("x") } as unknown as EasCommandContext);
+        expect((ownOnly as any).mailboxRepo.findOne).not.toHaveBeenCalled();
     });
 });

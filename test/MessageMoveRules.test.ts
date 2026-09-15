@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { FolderType } from "@rapidmx/restapi";
-import { isGenuineDraft, planMessageMove } from "../src/MessageMoveRules.js";
+import { hasLiveSendLease, isGenuineDraft, planMessageMove } from "../src/MessageMoveRules.js";
 
 const message = (overrides: Record<string, any> = {}): any => ({ uid: "m1", folderUid: "f", ...overrides });
 
@@ -20,6 +20,17 @@ describe("MessageMoveRules Tests", () => {
         }
         expect(planMessageMove(message(), FolderType.DRAFTS, FolderType.DRAFTS)).toEqual({ allowed: true, patch: {} });
         expect(planMessageMove(message(), FolderType.INBOX, FolderType.ARCHIVE)).toEqual({ allowed: true, patch: {} });
+        // A delivered message a mail filter filed into Outbox never reaches Drafts; it can still leave Outbox elsewhere.
+        expect(planMessageMove(message({ scanResultUid: "scan" }), FolderType.OUTBOX, FolderType.DRAFTS)).toEqual({ allowed: false, reason: "destination" });
+        expect(planMessageMove(message({ scanResultUid: "scan" }), FolderType.OUTBOX, FolderType.INBOX)).toEqual({ allowed: true, patch: { scheduledSendTime: null } });
+    });
+
+    it("hasLiveSendLease is true only for a lease still in the future.", () => {
+        expect(hasLiveSendLease(message({ scheduledSendLeaseExpiresAt: new Date(Date.now() + 60_000) }))).toBe(true);
+        expect(hasLiveSendLease(message({ scheduledSendLeaseExpiresAt: new Date(Date.now() + 60_000).toISOString() }))).toBe(true);
+        for (const lease of [undefined, null, "not a date", new Date(Date.now() - 1000)]) {
+            expect(hasLiveSendLease(message({ scheduledSendLeaseExpiresAt: lease }))).toBe(false);
+        }
     });
 
     it("Cancels the scheduled send of a message leaving Outbox, clearing only the retry fields the row has, and refuses a relayed one.", () => {
@@ -53,5 +64,27 @@ describe("MessageMoveRules Tests", () => {
         expect(isGenuineDraft(message({ scanResultUid: "scan" }), FolderType.DRAFTS)).toBe(false);
         expect(isGenuineDraft(message(), FolderType.INBOX)).toBe(false);
         expect(isGenuineDraft(message(), undefined)).toBe(false);
+        // Nothing a draft carries by itself - dates, a Message-ID, unset or empty server-managed fields - disqualifies it.
+        const draftLike = message({
+            sentDate: new Date(),
+            receivedDate: new Date(),
+            messageId: "<x@eas>",
+            sanitizedHtmlBlobKey: null,
+            encrypted: false,
+            scheduledSendRelayedAt: null,
+            recallRequestedAt: undefined,
+            receiptStatus: [],
+        });
+        expect(isGenuineDraft(draftLike, FolderType.DRAFTS)).toBe(true);
+        // A sent or relayed message routed back into Drafts is not a draft.
+        for (const marks of [
+            { scheduledSendRelayedAt: new Date() },
+            { sanitizedHtmlBlobKey: "sanitized/x" },
+            { encrypted: true },
+            { recallRequestedAt: new Date() },
+            { receiptStatus: [{ recipientAddress: "a@example.com" }] },
+        ]) {
+            expect(isGenuineDraft({ ...draftLike, ...marks }, FolderType.DRAFTS)).toBe(false);
+        }
     });
 });

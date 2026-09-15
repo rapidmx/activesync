@@ -12,7 +12,7 @@ import {
     RepoUtils,
     type RecoverableBaseEntity,
 } from "@rapidrest/service-core";
-import { findOrCreateWellKnownFolder, type Folder, FolderType, RecoverableRepoUtils, type Mailbox } from "@rapidmx/restapi";
+import { AuditAction, findOrCreateWellKnownFolder, type Folder, FolderType, RecoverableRepoUtils, type Mailbox } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import { formatSyncKey } from "../EasSyncKeyUtils.js";
@@ -27,9 +27,10 @@ import {
     workingStateFromRow,
 } from "../EasCollectionSync.js";
 import { type ChunkStore, clearHeldSet, type HeldSet, INLINE_HELD_LIMIT, loadHeldSet, saveHeldSet } from "../EasCollectionStore.js";
-import { type MessageMovePlan, planMessageMove } from "../MessageMoveRules.js";
+import { hasLiveSendLease, type MessageMovePlan, planMessageMove } from "../MessageMoveRules.js";
 import { asEntity } from "../RestapiCompat.js";
 import { EasCollectionLease, type LeaseRelease } from "../EasCollectionLease.js";
+import { EasAuditLog } from "../EasAuditLog.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
 import type { EasCollectionSyncAdapter } from "../adapters/EasCollectionSyncAdapter.js";
 import type { EasCollectionState } from "../models/EasCollectionState.js";
@@ -91,6 +92,7 @@ interface CollectionRound {
     getMailbox: () => Promise<Mailbox>;
     /** The mailbox that owns the synced folder (the caller's own, unless the folder is shared). */
     getFolderMailbox: () => Promise<Mailbox>;
+    audit: EasAuditLog;
 }
 
 /**
@@ -142,8 +144,14 @@ interface CollectionRound {
  * a Drafts folder ([MS-ASCMD]: no non-draft email may be added by a client), and a new item's `mailboxUid` is the
  * folder's own mailbox, so an item added to a shared folder belongs to that folder's mailbox. An `Email` body can only
  * be changed on a genuine draft (`EmailSyncAdapter`), and a delete-as-move out of Outbox cancels the scheduled send
- * (`MessageMoveRules.planMessageMove`; Status 6 once the message was relayed). Every update is version-checked on both
+ * (`MessageMoveRules.planMessageMove`; Status 6 once the message was relayed), and no delete at all happens while a send of
+ * the message is in flight (`hasLiveSendLease`, Status 6). Every update is version-checked on both
  * backends (`asEntity`).
+ *
+ * **Audit** (`EasAuditLog`), only in a mailbox the caller doesn't own (restapi's `isNonOwnerAccess()` - an administrator
+ * or a delegate syncing a shared folder), and only for `Email`: a round that sends `Add`/`Change` items records one
+ * `MESSAGE_CONTENT_ACCESSED` entry for the collection listing the sent message uids (at most a window's worth), rather
+ * than one per row; each successful client `Delete` records one `MESSAGE_DELETE` entry, as restapi's REST delete does.
  *
  * Per `[MS-ASCMD]`, `Add` always gets a `Responses` entry; `Change`/`Delete` only on failure.
  *
@@ -159,6 +167,7 @@ export abstract class SyncCommand implements EasCommandHandler {
     protected abstract folderClass: any;
     protected abstract collectionStateClass: any;
     protected abstract collectionChunkClass: any;
+    protected abstract auditLogClass: any;
 
     @Config("mail:eas:sync_window_size", DEFAULT_WINDOW_SIZE)
     private windowSize: number = DEFAULT_WINDOW_SIZE;
@@ -167,6 +176,9 @@ export abstract class SyncCommand implements EasCommandHandler {
     // legitimate (leases are then in-process only).
     @Config("datastores:cache", null)
     private cacheConfig: any;
+
+    @Config()
+    private config?: any;
 
     protected moveScanLimit: number = DEFAULT_MOVE_SCAN_LIMIT;
     protected reconcileLimit: number = DEFAULT_RECONCILE_LIMIT;
@@ -253,9 +265,14 @@ export abstract class SyncCommand implements EasCommandHandler {
 
         const requestWindowSize: string | undefined = childText(ctx.request!, "WindowSize");
         const getMailbox = this.mailboxLoader(ctx.mailboxUid);
+        const audit = new EasAuditLog(
+            { objectFactory: this._objectFactory!, auditLogClass: this.auditLogClass, mailboxRepo: this.mailboxRepo!, config: this.config, logger: this.logger },
+            ctx,
+            this.command,
+        );
         const collectionElements: WbxmlElement[] = [];
         for (const collectionEl of collectionEls) {
-            collectionElements.push(await this.processCollection(ctx, collectionEl, getMailbox, requestWindowSize));
+            collectionElements.push(await this.processCollection(ctx, collectionEl, getMailbox, requestWindowSize, audit));
         }
 
         return element(WbxmlCodePage.AirSync, "Sync", [element(WbxmlCodePage.AirSync, "Collections", collectionElements)]);
@@ -272,6 +289,7 @@ export abstract class SyncCommand implements EasCommandHandler {
         collectionEl: WbxmlElement,
         getMailbox: () => Promise<Mailbox>,
         requestWindowSize: string | undefined,
+        audit: EasAuditLog,
     ): Promise<WbxmlElement> {
         const requestedClass: string | undefined = childText(collectionEl, "Class");
         const folderUid: string | undefined = childText(collectionEl, "CollectionId");
@@ -296,7 +314,7 @@ export abstract class SyncCommand implements EasCommandHandler {
             return this.collectionResponse(requestedClass, folderUid, STATUS_RETRY, clientSyncKey);
         }
         try {
-            return await this.processLocked(ctx, collectionEl, folder, getMailbox, requestWindowSize);
+            return await this.processLocked(ctx, collectionEl, folder, getMailbox, requestWindowSize, audit);
         } finally {
             await release();
         }
@@ -309,6 +327,7 @@ export abstract class SyncCommand implements EasCommandHandler {
         folder: Folder & { uid: string },
         getMailbox: () => Promise<Mailbox>,
         requestWindowSize: string | undefined,
+        audit: EasAuditLog,
     ): Promise<WbxmlElement> {
         const folderUid: string = folder.uid;
         const requestedClass: string | undefined = childText(collectionEl, "Class");
@@ -379,6 +398,7 @@ export abstract class SyncCommand implements EasCommandHandler {
             deletesAsMoves: childText(collectionEl, "DeletesAsMoves") !== "0",
             getMailbox,
             getFolderMailbox: folder.mailboxUid === ctx.mailboxUid ? getMailbox : this.mailboxLoader(folder.mailboxUid),
+            audit,
         };
 
         const responseEntries: WbxmlElement[] = [];
@@ -447,6 +467,17 @@ export abstract class SyncCommand implements EasCommandHandler {
                       applicationData[upserts.indexOf(c)],
                   ]),
         );
+
+        if (collectionClass === "Email" && upserts.length > 0) {
+            const messageUids: string[] = upserts.map((c) => c.item.uid);
+            await audit.record({
+                action: AuditAction.MESSAGE_CONTENT_ACCESSED,
+                mailboxUid: folder.mailboxUid,
+                targetType: "Folder",
+                targetUid: folderUid,
+                details: { operation: "Sync", count: messageUids.length, messageUids },
+            });
+        }
 
         return this.collectionResponse(collectionClass, folderUid, "1", newKey, [
             ...(moreAvailable ? [element(WbxmlCodePage.AirSync, "MoreAvailable", [])] : []),
@@ -678,6 +709,11 @@ export abstract class SyncCommand implements EasCommandHandler {
         if (!(await this.aclUtils!.hasPermission(ctx.user, folder.uid, ACLAction.DELETE))) {
             return this.statusResponseElement("Delete", serverId, "6");
         }
+        // Like restapi's delete (409), never while a send of the message is in flight - a moved or deleted message could
+        // miss its relay marker and be sent again.
+        if (hasLiveSendLease(existing)) {
+            return this.statusResponseElement("Delete", serverId, "6");
+        }
         try {
             if (round.collectionClass === "Email" && round.deletesAsMoves && folder.type !== FolderType.DELETED_ITEMS) {
                 const deletedItems: Folder & { uid: string } = await findOrCreateWellKnownFolder(
@@ -702,6 +738,19 @@ export abstract class SyncCommand implements EasCommandHandler {
                     await repo.update({ uid: existing.uid, version: existing.version, ...stamp }, asEntity(repo, existing), { ignoreACL: true });
                 }
                 await repo.delete(existing.uid, { ignoreACL: true });
+            }
+            if (round.collectionClass === "Email") {
+                await round.audit.record({
+                    action: AuditAction.MESSAGE_DELETE,
+                    mailboxUid: existing.mailboxUid,
+                    targetType: "Message",
+                    targetUid: existing.uid,
+                    details: {
+                        subject: existing.subject,
+                        folderUid: existing.folderUid,
+                        movedToDeletedItems: round.deletesAsMoves && folder.type !== FolderType.DELETED_ITEMS,
+                    },
+                });
             }
             round.working.serverIds.delete(serverId);
             round.working.echoes.delete(serverId);

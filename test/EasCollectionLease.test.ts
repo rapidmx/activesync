@@ -14,6 +14,7 @@ const redis = {
     connectHangs: false,
     setFails: false,
     evalFails: false,
+    releaseHangs: false,
     isOpen: undefined as boolean | undefined,
     /** When set, `set` calls wait on it before answering. */
     setGate: undefined as Promise<void> | undefined,
@@ -29,6 +30,7 @@ const redis = {
         this.connectHangs = false;
         this.setFails = false;
         this.evalFails = false;
+        this.releaseHangs = false;
         this.isOpen = undefined;
         this.setGate = undefined;
         this.setCalls = 0;
@@ -75,6 +77,9 @@ vi.mock("redis", () => ({
             eval: async (script: string, options: { keys: string[]; arguments: string[] }) => {
                 if (redis.evalFails) {
                     throw new Error("connection lost");
+                }
+                if (redis.releaseHangs && !script.includes("pexpire")) {
+                    await never();
                 }
                 if (script.includes("pexpire")) {
                     redis.renewCalls.push(options.arguments);
@@ -154,7 +159,10 @@ describe("EasCollectionLease Tests", () => {
         expect(await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 30, pollMs: 100 })).toBeUndefined();
 
         redis.keys.clear();
-        expect(await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 0 })).toBeDefined();
+        const release = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 0 });
+        expect(release).toBeDefined();
+        // Released, so its renewal timer can't fire into a later test.
+        await release!();
     });
 
     it("Fails open to the in-process lease when Redis can't be reached, retrying the connection later.", async () => {
@@ -236,6 +244,37 @@ describe("EasCollectionLease Tests", () => {
         redis.setGate = never();
 
         expect(await acquiring).toBeUndefined();
+    });
+
+    it("Gives the first SET all of redisTimeoutMs even when the in-process wait used up waitMs, instead of failing open.", async () => {
+        const first = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 0 });
+        const second = EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 60, redisTimeoutMs: 2_000 });
+        await tick(30);
+        // Redis is healthy but slow to answer: the SET only lands after the wait's deadline has passed.
+        let open!: () => void;
+        redis.setGate = new Promise<void>((resolve) => (open = resolve));
+        await first!();
+        setTimeout(open, 60);
+
+        const release = await second;
+        expect(release).toBeDefined();
+        expect(redis.setCalls).toBe(2);
+        // The lease really is held in Redis, not an in-process fail-open.
+        expect(redis.keys.has("eas:lease:k")).toBe(true);
+        await release!();
+        expect(redis.keys.has("eas:lease:k")).toBe(false);
+    });
+
+    it("Releases the in-process lease without waiting on an unresponsive Redis release.", async () => {
+        const release = await EasCollectionLease.acquire("k", { redisUrl: "redis://fake", ttlMs: 1000, waitMs: 0, redisTimeoutMs: 30 });
+        redis.releaseHangs = true;
+        const started = Date.now();
+
+        await release!();
+
+        expect(Date.now() - started).toBeLessThan(1_000);
+        // The same key is free again on this server copy (Redis still holds it until it expires).
+        expect(await EasCollectionLease.acquire("k", { ttlMs: 1000, waitMs: 0 })).toBeDefined();
     });
 
     it("Renews a held Redis lease every third of its TTL with its own token, and stops once released.", async () => {

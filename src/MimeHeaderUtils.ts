@@ -8,8 +8,8 @@ import addressparser from "nodemailer/lib/addressparser";
  * Raw RFC 5322 header-block helpers for the MIME a device composes (`ComposeMailCommand`).
  *
  * **Inline copy of restapi** (`util/MimeHeaderUtils.ts` in restapi's source, not exported by the `@rapidmx/restapi`
- * 0.9.0 this plugin builds against): `extractOriginatorHeaders()`, `hasAddressLikeDisplayName()` and
- * `checkOriginatorHeaders()` with their private helpers, kept identical - replace them with restapi's exports once the
+ * 0.9.0 this plugin builds against): `extractOriginatorHeaders()`, `hasAddressLikeDisplayName()`,
+ * `checkOriginatorHeaders()`, `isPlainAddress()` and `safeDisplayName()` with their private helpers, kept identical - replace them with restapi's exports once the
  * dependency is bumped.
  *
  * **Plugin-side** (`checkComposedOriginators()`, `stripHeader()`): a second, byte-preserving lexer
@@ -278,6 +278,52 @@ export function checkOriginatorHeaders(
     return undefined;
 }
 
+/** One plain address: no display name, angle brackets, group, comment, list, quoting, control characters or whitespace. */
+const PLAIN_ADDRESS_PATTERN = /^[^\s()<>@,;:\\"[\]]+@[^\s()<>@,;:\\"[\]]+$/;
+
+/** RFC 5321's address length limit. */
+const MAX_PLAIN_ADDRESS_LENGTH = 320;
+
+/** Whether `value` holds a control character (C0 or DEL); a tab only counts when `tabCounts`. */
+function hasControlCharacter(value: string, tabCounts: boolean): boolean {
+    for (let i = 0; i < value.length; i++) {
+        const code: number = value.charCodeAt(i);
+        if ((code < 0x20 && (tabCounts || code !== 0x09)) || code === 0x7f) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** Whether `address` is exactly one plain address (`local@domain`, nothing around it), at most 320 characters - safe to
+ * hand to a composer as one recipient, e.g. a meeting attendee or organizer. */
+export function isPlainAddress(address: unknown): address is string {
+    return (
+        typeof address === "string" &&
+        address.length <= MAX_PLAIN_ADDRESS_LENGTH &&
+        !hasControlCharacter(address, true) &&
+        PLAIN_ADDRESS_PATTERN.test(address)
+    );
+}
+
+/**
+ * `name` as a display name that's safe to put in front of one of our own addresses in a `From` (or an iCalendar `CN`)
+ * this server composes: trimmed, or `undefined` - so the caller omits the name - when it isn't a string, is blank,
+ * contains a line break or other control character, or shows an address-like `@` (look-alikes and RFC 2047 encoded
+ * words included, the same rule as `hasAddressLikeDisplayName()`). A display name like `ceo@example.com` in front of a
+ * real address shows the reader an address the sender doesn't own.
+ */
+export function safeDisplayName(name: unknown): string | undefined {
+    if (typeof name !== "string" || hasControlCharacter(name, false)) {
+        return undefined;
+    }
+    const clean: string = name.trim();
+    if (clean.length === 0 || AT_SIGN_LIKE.test(clean) || AT_SIGN_LIKE.test(decodeEncodedWords(clean))) {
+        return undefined;
+    }
+    return clean;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Plugin-side additions
 // ---------------------------------------------------------------------------------------------------------------
@@ -318,20 +364,66 @@ function lexHeaderFields(raw: Buffer): { text: string; fields: HeaderField[] } {
     return { text, fields };
 }
 
+/** An addr-spec-looking run inside display text: no whitespace, brackets, quotes, separators or second `@`. */
+const DISPLAY_ADDRESS_TOKEN = /[^\s@<>()[\]",;:\\]+@[^\s@<>()[\]",;:\\]+/g;
+
+/**
+ * Whether every address shown in one `From`/`Sender` value's display names, group names and comments is one
+ * `isAllowed` accepts - the case `hasAddressLikeDisplayName()` would refuse although it names only the sender itself
+ * (`"me@example.com" <me@example.com>`, as clients do when the display name is the address, e.g. autodiscover's
+ * `DisplayName`). Each text is read the way `hasAddressLikeDisplayName()` reads it (as UTF-8 and as latin1, RFC 2047
+ * encoded words decoded). A look-alike `@` (fullwidth or small) is never accepted, and neither is an `@` left over once
+ * every allowed address is removed (`a@b@c`, a lone encoded `@`, an address split by a quote).
+ */
+function displayTextShowsOnlyAllowedAddresses(value: string, isAllowed: (address: string) => boolean): boolean {
+    const texts: string[] = [...quotedStringsAndComments(value)];
+    const visit = (entries: { name?: string; group?: any[] }[]): void => {
+        for (const entry of entries) {
+            if (typeof entry.name === "string") {
+                texts.push(entry.name);
+            }
+            if (Array.isArray(entry.group)) {
+                visit(entry.group);
+            }
+        }
+    };
+    visit(addressparser(value));
+    return texts.every((text) =>
+        [decodeEncodedWords(Buffer.from(text, "binary").toString("utf8")), decodeEncodedWords(text)].every((view) => {
+            if (/[＠﹫]/.test(view)) {
+                return false;
+            }
+            const remainder: string = view.replace(DISPLAY_ADDRESS_TOKEN, (token) => (isAllowed(token) ? " " : "@"));
+            return !remainder.includes("@");
+        }),
+    );
+}
+
 /**
  * The ActiveSync compose sender check: restapi's `checkOriginatorHeaders()` with `rejectAddressLikeDisplayNames`, plus
  * two plugin-side refusals restapi doesn't make. Returns a refusal reason, or `undefined` if the message passes.
+ * - **Relaxed for the sender's own address**: a display name or comment that shows an address is still accepted when
+ * every address it shows is one of the mailbox's own (`"me@example.com" <me@example.com>`) - see
+ * `displayTextShowsOnlyAllowedAddresses()`. Any other address, or a look-alike `@`, is refused as restapi refuses it.
  * - **A `From`/`Sender` field restapi's lexer can't see** - the tolerant `lexHeaderFields()` counts more of them (e.g.
  * a leading space on the first line, or a form feed before the colon, both of which mailsplit still reads as `From`).
  * - **An empty group** (`victims:;, me@example.com`) - it contributes no address, only text of the sender's choice
  * shown beside the real address, and RFC 5322 doesn't allow groups in `From`/`Sender` at all.
  */
 export function checkComposedOriginators(raw: Buffer, isAllowed: (address: string) => boolean): string | undefined {
-    const refusal: string | undefined = checkOriginatorHeaders(raw, isAllowed, { rejectAddressLikeDisplayNames: true });
+    const refusal: string | undefined = checkOriginatorHeaders(raw, isAllowed);
     if (refusal !== undefined) {
         return refusal;
     }
     const exact: OriginatorHeaders = extractOriginatorHeaders(raw);
+    for (const [name, values] of [
+        ["From", exact.from],
+        ["Sender", exact.sender],
+    ] as [string, string[]][]) {
+        if (values.some((value) => hasAddressLikeDisplayName(value) && !displayTextShowsOnlyAllowedAddresses(value, isAllowed))) {
+            return `The ${name} header's display name or comment contains an address.`;
+        }
+    }
     const fields: HeaderField[] = lexHeaderFields(raw).fields;
     const count = (name: string): number => fields.filter((field) => field.name === name).length;
     if (count("from") !== exact.from.length || count("sender") !== exact.sender.length) {

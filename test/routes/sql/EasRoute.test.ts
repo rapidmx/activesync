@@ -21,6 +21,7 @@ import * as uuid from "uuid";
 import { Repository } from "typeorm";
 import {
     AttachmentSQL,
+    AuditLogEntrySQL,
     CalendarEventSQL,
     ContactSQL,
     FolderSQL,
@@ -2378,6 +2379,53 @@ describe("Route:EasRouteSQL Tests", () => {
     });
 
     describe("ItemOperations command", () => {
+        it("Round 6: records MESSAGE_CONTENT_ACCESSED when a delegate fetches a body from another owner's mailbox, and nothing for their own.", async () => {
+            const ownMailbox = await createMailbox(owner.uid);
+            await provisionDevice("dev1");
+            const ownFolder = await createFolderWithAcl(ownMailbox.uid, { name: "Inbox", type: FolderType.INBOX });
+            const ownMessage = await createMessage(ownMailbox.uid, ownFolder.uid);
+            const bossMailbox = await createMailbox(otherUser.uid);
+            // A folder of someone else's mailbox, shared with the caller (READ only).
+            const shared = await folderRepo.save(new FolderSQL({ mailboxUid: bossMailbox.uid, name: "Boss Inbox", type: FolderType.INBOX, unreadCount: 0, totalCount: 0, syncKeyVersion: 0 } as any));
+            await aclRepo.save({
+                uid: shared.uid,
+                dateCreated: new Date(),
+                dateModified: new Date(),
+                version: 0,
+                records: [{ userOrRoleId: owner.uid, actions: [ACLAction.READ] }],
+                parentUid: bossMailbox.uid,
+            } as any);
+            const bossMessage = await createMessage(bossMailbox.uid, shared.uid, { subject: "Payroll" });
+            for (const message of [ownMessage, bossMessage]) {
+                await blobStore().put(message.bodyBlobKey, Buffer.from("From: a@example.com\r\nSubject: s\r\n\r\nBody"), { contentType: "message/rfc822" });
+            }
+            const fetch = (message: any) =>
+                element(WbxmlCodePage.ItemOperations, "Fetch", [
+                    textElement(WbxmlCodePage.ItemOperations, "Store", "Mailbox"),
+                    textElement(WbxmlCodePage.AirSync, "ServerId", message.uid),
+                    element(WbxmlCodePage.ItemOperations, "Options", [
+                        element(WbxmlCodePage.AirSyncBase, "BodyPreference", [textElement(WbxmlCodePage.AirSyncBase, "Type", "4")]),
+                    ]),
+                ]);
+
+            const response = await postWbxml("ItemOperations", "dev1", element(WbxmlCodePage.ItemOperations, "ItemOperations", [fetch(ownMessage), fetch(bossMessage)]));
+
+            expect(findChildren(findChild(response, "Response")!, "Fetch").map((f) => childText(f, "Status"))).toEqual(["1", "1"]);
+            const connections: Map<string, any> = (objectFactory.getInstance(ConnectionManager) as ConnectionManager).connections;
+            const auditRepo: any = connections.get("sql").getRepository(AuditLogEntrySQL);
+            const entries: any[] = await auditRepo.find();
+            expect(entries.filter((entry) => entry.targetUid === ownMessage.uid)).toEqual([]);
+            const bossEntries = entries.filter((entry) => entry.targetUid === bossMessage.uid);
+            expect(bossEntries).toHaveLength(1);
+            expect(bossEntries[0]).toMatchObject({
+                action: "message.content_accessed",
+                targetType: "Message",
+                mailboxUid: bossMailbox.uid,
+                actorUserUid: owner.uid,
+            });
+            expect(bossEntries[0].details).toMatchObject({ protocol: "ActiveSync", command: "ItemOperations", deviceId: "dev1", subject: "Payroll" });
+        });
+
         it("Fetches a message's plain-text body from raw MIME when no sanitized HTML is available.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await provisionDevice("dev1");

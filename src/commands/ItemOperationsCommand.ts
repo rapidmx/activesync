@@ -5,14 +5,15 @@
 import { simpleParser } from "mailparser";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
 import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ModelUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
-import { BlobStore, RecoverableRepoUtils, type Attachment, type Folder, type FolderType, type Message } from "@rapidmx/restapi";
+import { AuditAction, BlobStore, RecoverableRepoUtils, type Attachment, type Folder, type FolderType, type Message } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, opaqueElement, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import { decodeConversationId } from "../adapters/EmailSyncAdapter.js";
 import type { EasCommandContext, EasCommandHandler } from "../EasCommandHandler.js";
-import { type MessageMovePlan, planMessageMove } from "../MessageMoveRules.js";
+import { hasLiveSendLease, type MessageMovePlan, planMessageMove } from "../MessageMoveRules.js";
 import { asEntity, boundIndexedValue } from "../RestapiCompat.js";
-const { Config, Init, Inject } = ObjectDecorators;
+import { EasAuditLog } from "../EasAuditLog.js";
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 
 /** Caps how many messages `emptyFolderContents`/`moveConversation` process per backing `find()`/delete-batch
  * round - keeps memory bounded and, for `emptyFolderContents`, lets an arbitrarily large folder still be fully
@@ -98,8 +99,15 @@ function truncateUtf8(text: string, maxBytes: number): string {
  * batches per request, and `Move` at most one batch; a message that fails to delete or move (e.g. a concurrent
  * edit's version conflict) is skipped rather than failing the request, and the operation then reports Status 17
  * (partial success) - or Status 3 when nothing at all succeeded - so the client can retry for the rest.
+ * `EmptyFolderContents` skips (as failed) a message whose send is in flight (`MessageMoveRules.hasLiveSendLease`).
  *
- * `folderClass`/`messageClass`/`attachmentClass` are supplied by the Mongo/SQL concrete subclasses.
+ * **Audit**: in a mailbox the caller doesn't own (restapi's `isNonOwnerAccess()` - an administrator or a delegate), a
+ * `Fetch` that returns a body or an attachment records one `MESSAGE_CONTENT_ACCESSED` entry per item, and
+ * `EmptyFolderContents` records one `MESSAGE_DELETE` entry per delete batch, listing the deleted message uids
+ * (`EasAuditLog`).
+ *
+ * `folderClass`/`messageClass`/`attachmentClass`/`mailboxClass`/`auditLogClass` are supplied by the Mongo/SQL concrete
+ * subclasses.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -109,11 +117,20 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
     protected abstract folderClass: any;
     protected abstract messageClass: any;
     protected abstract attachmentClass: any;
+    protected abstract mailboxClass: any;
+    protected abstract auditLogClass: any;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
 
+    @Config()
+    private config?: any;
+
+    @Logger
+    private logger: any;
+
     private folderRepo?: RepoUtils<any>;
+    private mailboxRepo?: RepoUtils<any>;
     private messageRepo?: RecoverableRepoUtils<any>;
     private attachmentRepo?: RepoUtils<any>;
 
@@ -146,10 +163,14 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
             name: this.attachmentClass.name,
             args: [this.attachmentClass],
         });
+        this.mailboxRepo = await this._objectFactory!.newInstance(RepoUtils, {
+            name: this.mailboxClass.name,
+            args: [this.mailboxClass],
+        });
     }
 
     public async handle(ctx: EasCommandContext): Promise<WbxmlElement | undefined> {
-        if (!this.folderRepo || !this.messageRepo || !this.attachmentRepo || !this.blobStore) {
+        if (!this.folderRepo || !this.messageRepo || !this.attachmentRepo || !this.mailboxRepo || !this.blobStore) {
             throw new ApiError(ApiErrors.INTERNAL_ERROR, 500, ApiErrorMessages.INTERNAL_ERROR);
         }
         const fetchEls = ctx.request ? findChildren(ctx.request, "Fetch") : [];
@@ -168,6 +189,11 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
             throw new ApiError(ApiErrors.INVALID_REQUEST, 400, `ItemOperations supports at most ${this.maxFetchesPerRequest} Fetch elements per request.`);
         }
 
+        const audit = new EasAuditLog(
+            { objectFactory: this._objectFactory!, auditLogClass: this.auditLogClass, mailboxRepo: this.mailboxRepo, config: this.config, logger: this.logger },
+            ctx,
+            this.command,
+        );
         const responseChildren: WbxmlElement[] = [];
         // Every fetched body/attachment is embedded inline, so their combined size bounds the response. A Fetch
         // that would push it past `maxResponseBytes` is answered with Status 11 ("data too large") instead of content.
@@ -181,13 +207,13 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
             const serverId: string | undefined = childText(fetchEl, "ServerId");
             const optionsEl = findChild(fetchEl, "Options");
             const fetched = fileReference
-                ? await this.fetchAttachment(ctx, fileReference, remainingBytes)
-                : await this.fetchMessage(ctx, serverId, optionsEl, remainingBytes);
+                ? await this.fetchAttachment(ctx, audit, fileReference, remainingBytes)
+                : await this.fetchMessage(ctx, audit, serverId, optionsEl, remainingBytes);
             remainingBytes -= fetched.bytes;
             responseChildren.push(fetched.element);
         }
         if (emptyEl) {
-            responseChildren.push(await this.emptyFolderContents(ctx, emptyEl));
+            responseChildren.push(await this.emptyFolderContents(ctx, audit, emptyEl));
         }
         if (moveEl) {
             responseChildren.push(await this.moveConversation(ctx, moveEl));
@@ -201,6 +227,7 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
 
     private async fetchMessage(
         ctx: EasCommandContext,
+        audit: EasAuditLog,
         serverId: string | undefined,
         optionsEl: WbxmlElement | undefined,
         remainingBytes: number,
@@ -261,6 +288,14 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
             };
         }
 
+        await audit.record({
+            action: AuditAction.MESSAGE_CONTENT_ACCESSED,
+            mailboxUid: message.mailboxUid,
+            targetType: "Message",
+            targetUid: (message as any).uid,
+            details: { subject: message.subject, folderUid: message.folderUid, bodyType },
+        });
+
         return {
             element: element(WbxmlCodePage.ItemOperations, "Fetch", [
                 textElement(WbxmlCodePage.ItemOperations, "Status", "1"),
@@ -280,7 +315,7 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         };
     }
 
-    private async emptyFolderContents(ctx: EasCommandContext, emptyEl: WbxmlElement): Promise<WbxmlElement> {
+    private async emptyFolderContents(ctx: EasCommandContext, audit: EasAuditLog, emptyEl: WbxmlElement): Promise<WbxmlElement> {
         // Reuses AirSync's own `CollectionId` (the same tag `Sync`/`Fetch` responses already reference a
         // folder by) rather than a page-specific tag - `WbxmlCodePage.ItemOperations` has no `FolderId` token
         // of its own at all, confirmed against its own tag table.
@@ -328,13 +363,31 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
                 complete = batch.length === 0;
                 break;
             }
+            const deletedUids: string[] = [];
             for (const message of pending) {
+                // A message whose send is in flight is skipped, as restapi's delete refuses it (409).
+                if (hasLiveSendLease(message)) {
+                    failed.add(message.uid);
+                    continue;
+                }
                 try {
                     await this.messageRepo!.delete(message.uid, { ignoreACL: true, user: ctx.user });
-                    deleted++;
+                    deletedUids.push(message.uid);
                 } catch {
                     failed.add(message.uid);
                 }
+            }
+            deleted += deletedUids.length;
+            if (deletedUids.length > 0) {
+                // One entry per batch (at most `batchSize` uids), not one per message: emptying a large folder would
+                // otherwise write thousands of rows for one request.
+                await audit.record({
+                    action: AuditAction.MESSAGE_DELETE,
+                    mailboxUid: folder.mailboxUid,
+                    targetType: "Folder",
+                    targetUid: folderUid,
+                    details: { operation: "EmptyFolderContents", count: deletedUids.length, messageUids: deletedUids },
+                });
             }
         }
 
@@ -432,7 +485,7 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         return element(WbxmlCodePage.ItemOperations, "Move", [textElement(WbxmlCodePage.ItemOperations, "Status", status)]);
     }
 
-    private async fetchAttachment(ctx: EasCommandContext, fileReference: string, remainingBytes: number): Promise<FetchResult> {
+    private async fetchAttachment(ctx: EasCommandContext, audit: EasAuditLog, fileReference: string, remainingBytes: number): Promise<FetchResult> {
         const attachment: Attachment | undefined = await this.attachmentRepo!.findOne(fileReference, { ignoreACL: true });
         if (!attachment) {
             throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
@@ -462,6 +515,13 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         if (data.length > remainingBytes) {
             return tooLarge();
         }
+        await audit.record({
+            action: AuditAction.MESSAGE_CONTENT_ACCESSED,
+            mailboxUid: message.mailboxUid,
+            targetType: "Attachment",
+            targetUid: (attachment as any).uid,
+            details: { messageUid: attachment.messageUid, subject: message.subject, filename: attachment.filename },
+        });
 
         return {
             element: element(WbxmlCodePage.ItemOperations, "Fetch", [

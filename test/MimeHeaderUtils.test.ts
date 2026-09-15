@@ -2,7 +2,15 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { checkComposedOriginators, checkOriginatorHeaders, extractOriginatorHeaders, hasAddressLikeDisplayName, stripHeader } from "../src/MimeHeaderUtils.js";
+import {
+    checkComposedOriginators,
+    checkOriginatorHeaders,
+    extractOriginatorHeaders,
+    hasAddressLikeDisplayName,
+    isPlainAddress,
+    safeDisplayName,
+    stripHeader,
+} from "../src/MimeHeaderUtils.js";
 
 const message = (...headers: string[]): Buffer => Buffer.from([...headers, "To: to@example.com", "", "From: body@example.org"].join("\r\n"));
 const own = (address: string): boolean => ["me@example.com", "alias@example.com"].includes(address.toLowerCase());
@@ -65,6 +73,46 @@ describe("MimeHeaderUtils Tests", () => {
         }
         expect(checkComposedOriginators(message("From: victims:;, me@example.com"), own)).toMatch(/empty group/);
         expect(checkComposedOriginators(message("From: Team: me@example.com;"), own)).toBeUndefined();
+    });
+
+    it("checkComposedOriginators accepts a display name or comment that shows only the sender's own addresses.", () => {
+        for (const headers of [
+            ['From: "me@example.com" <me@example.com>'],
+            ['From: "ME@example.com" <me@example.com>', 'Sender: "alias@example.com" <alias@example.com>'],
+            ["From: me@example.com (alias@example.com)"],
+            ["From: =?utf-8?q?me=40example.com?= <me@example.com>"],
+            ['From: "Me (me@example.com)" <me@example.com>'],
+            ["From: me@example.com: alias@example.com;"],
+        ]) {
+            expect(checkComposedOriginators(message(...headers), own)).toBeUndefined();
+        }
+        for (const headers of [
+            ['From: "me@example.com, ceo@example.org" <me@example.com>'],
+            ['From: "me@example.com" <me@example.com>', 'Sender: "ceo@example.org" <me@example.com>'],
+            ['From: "me＠example.com" <me@example.com>'],
+            ['From: "me@example.com@example.org" <me@example.com>'],
+            ["From: =?utf-8?b?QA==?= <me@example.com>"],
+            ['From: "me@example.com" me@example.com (ceo@example.org'],
+        ]) {
+            expect(checkComposedOriginators(message(...headers), own)).toMatch(/display name or comment contains an address/);
+        }
+    });
+
+    it("safeDisplayName (restapi's) omits names that are blank, carry a line break or control character, or look like an address.", () => {
+        expect(safeDisplayName("  Pat Doe ")).toBe("Pat Doe");
+        // A tab is not a line break.
+        expect(safeDisplayName("Pat\tDoe")).toBe("Pat\tDoe");
+        for (const name of [undefined, 42, "", "   ", "pat@example.com", "Pat ＠ Corp", "Pat ﹫ Corp", "=?utf-8?q?pat=40corp?=", "Pat\nDoe", "Pat\rDoe", `Pat${String.fromCharCode(0x7f)}Doe`]) {
+            expect(safeDisplayName(name)).toBeUndefined();
+        }
+    });
+
+    it("isPlainAddress (restapi's) accepts exactly one bare address of at most 320 characters.", () => {
+        expect(isPlainAddress("pat.doe+tag@example.com")).toBe(true);
+        expect(isPlainAddress(`${"a".repeat(314)}@x.com`)).toBe(true);
+        for (const value of [undefined, "", "pat", "a@x.com, b@y.com", "a@x.com;b@y.com", "Pat <pat@x.com>", "<pat@x.com>", "pat@x.com (c)", '"a b"@x.com', "pat＠x.com", "a@b@c.com", `${"a".repeat(315)}@x.com`]) {
+            expect(isPlainAddress(value)).toBe(false);
+        }
     });
 
     it("hasAddressLikeDisplayName sees addresses in quoted names, nested or unterminated comments, group names and look-alike @ signs.", () => {

@@ -48,6 +48,7 @@ describe("ItemOperationsCommand Tests (guard clause only)", () => {
                 folderRepo: { findOne: vi.fn().mockImplementation(async (uid: string) => (uid === "gone" ? undefined : { uid, mailboxUid: "mbx", type: folderTypes[uid] })) },
                 messageRepo,
                 attachmentRepo: {},
+                mailboxRepo: { findOne: vi.fn().mockResolvedValue({ uid: "mbx", ownerUserUid: "u" }) },
                 blobStore: {},
                 aclUtils: { hasPermission: vi.fn().mockResolvedValue(true) },
                 batchSize: 2,
@@ -72,6 +73,15 @@ describe("ItemOperationsCommand Tests (guard clause only)", () => {
 
             const { command: clean } = build(messages(3), new Set());
             expect(emptyStatus(await clean.handle(ctx(empty())))).toBe("1");
+        });
+
+        it("EmptyFolderContents skips a message whose send lease is live, reporting partial success.", async () => {
+            const rows = messages(3);
+            (rows[1] as any).scheduledSendLeaseExpiresAt = new Date(Date.now() + 60_000);
+            (rows[2] as any).scheduledSendLeaseExpiresAt = new Date(Date.now() - 1000);
+            const { command, messageRepo } = build(rows, new Set());
+            expect(emptyStatus(await command.handle(ctx(empty())))).toBe("17");
+            expect(messageRepo.delete.mock.calls.map(([uid]: any[]) => uid)).toEqual(["m0", "m2"]);
         });
 
         it("EmptyFolderContents deletes at most MAX_EMPTY_FOLDER_BATCHES batches per request, reporting the rest as partial.", async () => {
@@ -148,6 +158,116 @@ describe("ItemOperationsCommand Tests (guard clause only)", () => {
 
             await expect(command.handle(ctx(request))).rejects.toMatchObject({ status: 404 });
             expect(messageRepo.find).not.toHaveBeenCalled();
+        });
+    });
+
+    describe("Round 6: audit of non-owner access", () => {
+        const mailboxes: Record<string, any> = { mbx: { uid: "mbx", ownerUserUid: "u" }, other: { uid: "other", ownerUserUid: "boss" } };
+        const rows: Record<string, any> = {
+            own: { uid: "own", version: 1, folderUid: "f-own", mailboxUid: "mbx", subject: "Mine", bodyBlobKey: "b/own" },
+            theirs: { uid: "theirs", version: 1, folderUid: "f-other", mailboxUid: "other", subject: "Payroll", bodyBlobKey: "b/theirs" },
+            orphan: { uid: "orphan", version: 1, folderUid: "f-gone", mailboxUid: "deleted-mailbox", subject: "Orphan", bodyBlobKey: "b/orphan" },
+        };
+
+        /** A command over in-memory rows whose audit entries go through restapi's real `recordAuditLog()` into `written`. */
+        function buildAudited(folderRows: any[] = []) {
+            const objectFactory = new ObjectFactory(config, Logger());
+            const command = objectFactory.newInstance<ItemOperationsCommandMongo>(ItemOperationsCommandMongo, { initialize: false }) as any;
+            class FakeAuditLogEntry {
+                constructor(values: any) {
+                    Object.assign(this, values);
+                }
+            }
+            const written: any[] = [];
+            vi.spyOn(command._objectFactory, "newInstance").mockResolvedValue({ create: vi.fn(async (entry: any) => written.push(entry)) });
+            let remaining = [...folderRows];
+            Object.assign(command, {
+                auditLogClass: FakeAuditLogEntry,
+                config,
+                folderRepo: { findOne: vi.fn(async (uid: string) => ({ uid, mailboxUid: uid === "f-other" ? "other" : "mbx" })) },
+                messageRepo: {
+                    findOne: vi.fn(async (uid: string) => rows[uid]),
+                    find: vi.fn(async (query: any) => remaining.slice(0, query.limit)),
+                    delete: vi.fn(async (uid: string) => {
+                        remaining = remaining.filter((row) => row.uid !== uid);
+                    }),
+                },
+                attachmentRepo: {
+                    findOne: vi.fn(async (uid: string) => ({ uid, messageUid: uid.replace("att-", ""), filename: "pay.pdf", mimeType: "application/pdf", sizeBytes: 3, blobKey: "a/x" })),
+                },
+                mailboxRepo: { findOne: vi.fn(async (uid: string) => mailboxes[uid]) },
+                blobStore: { get: vi.fn(async () => Buffer.from("abc")) },
+                aclUtils: { hasPermission: vi.fn().mockResolvedValue(true) },
+                batchSize: 2,
+            });
+            return { command, written };
+        }
+        const auditCtx = (children: any[]) =>
+            ({ user: { uid: "u" }, mailboxUid: "mbx", deviceId: "dev-9", request: element(WbxmlCodePage.ItemOperations, "ItemOperations", children) }) as unknown as EasCommandContext;
+        const fetchBody = (serverId: string) =>
+            element(WbxmlCodePage.ItemOperations, "Fetch", [
+                textElement(WbxmlCodePage.ItemOperations, "Store", "Mailbox"),
+                textElement(WbxmlCodePage.AirSync, "ServerId", serverId),
+                element(WbxmlCodePage.ItemOperations, "Options", [element(WbxmlCodePage.AirSyncBase, "BodyPreference", [textElement(WbxmlCodePage.AirSyncBase, "Type", "4")])]),
+            ]);
+        const fetchAttachment = (fileReference: string) =>
+            element(WbxmlCodePage.ItemOperations, "Fetch", [
+                textElement(WbxmlCodePage.ItemOperations, "Store", "Mailbox"),
+                textElement(WbxmlCodePage.AirSyncBase, "FileReference", fileReference),
+            ]);
+
+        it("Records one MESSAGE_CONTENT_ACCESSED entry per fetched body or attachment of a mailbox the caller doesn't own.", async () => {
+            const { command, written } = buildAudited();
+
+            await command.handle(auditCtx([fetchBody("own"), fetchBody("theirs"), fetchBody("orphan"), fetchAttachment("att-theirs"), fetchAttachment("att-own")]));
+
+            expect(written.map((entry) => [entry.action, entry.targetType, entry.targetUid, entry.mailboxUid])).toEqual([
+                ["message.content_accessed", "Message", "theirs", "other"],
+                // A mailbox that can't be found counts as non-owner access.
+                ["message.content_accessed", "Message", "orphan", "deleted-mailbox"],
+                ["message.content_accessed", "Attachment", "att-theirs", "other"],
+            ]);
+            expect(written[0]).toMatchObject({ actorUserUid: "u", details: { protocol: "ActiveSync", command: "ItemOperations", deviceId: "dev-9", subject: "Payroll", bodyType: "4" } });
+            expect(written[2].details).toMatchObject({ messageUid: "theirs", filename: "pay.pdf" });
+            // The other mailbox is looked up once, the caller's own never.
+            expect(command.mailboxRepo.findOne.mock.calls.map(([uid]: any[]) => uid)).toEqual(["other", "deleted-mailbox"]);
+        });
+
+        it("Records nothing for a Fetch answered with Status 11 instead of content.", async () => {
+            const { command, written } = buildAudited();
+            command.maxResponseBytes = 1;
+
+            await command.handle(auditCtx([fetchBody("theirs"), fetchAttachment("att-theirs")]));
+
+            expect(written).toEqual([]);
+        });
+
+        it("Records one MESSAGE_DELETE entry per EmptyFolderContents batch in another owner's folder, and none in the caller's own.", async () => {
+            const folderRows = Array.from({ length: 3 }, (_, i) => ({ uid: `m${i}`, folderUid: "f-other", mailboxUid: "other" }));
+            const empty = (folderUid: string) => element(WbxmlCodePage.ItemOperations, "EmptyFolderContents", [textElement(WbxmlCodePage.AirSync, "CollectionId", folderUid)]);
+
+            const { command, written } = buildAudited(folderRows);
+            await command.handle(auditCtx([empty("f-other")]));
+            expect(written.map((entry) => [entry.action, entry.targetType, entry.targetUid, entry.details.count, entry.details.messageUids])).toEqual([
+                ["message.delete", "Folder", "f-other", 2, ["m0", "m1"]],
+                ["message.delete", "Folder", "f-other", 1, ["m2"]],
+            ]);
+
+            const { command: own, written: ownWritten } = buildAudited(folderRows);
+            await own.handle(auditCtx([empty("f-own")]));
+            expect(ownWritten).toEqual([]);
+        });
+
+        it("Never fails the command when the audit entry can't be written.", async () => {
+            const { command } = buildAudited();
+            vi.spyOn(command._objectFactory, "newInstance").mockRejectedValue(new Error("audit store down"));
+            command.logger = { warn: vi.fn() };
+            command.mailboxRepo.findOne.mockRejectedValue(new Error("db down"));
+
+            const response = await command.handle(auditCtx([fetchBody("theirs")]));
+
+            expect(childText(findChild(findChild(response, "Response")!, "Fetch")!, "Status")).toBe("1");
+            expect(command.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Failed to persist audit log entry.*audit store down/));
         });
     });
 });

@@ -4,6 +4,7 @@
 // test/server-mongo/models/index.ts.
 export {
     AttachmentSQL,
+    AuditLogEntrySQL,
     CalendarEventSQL,
     ContactSQL,
     FolderSQL,

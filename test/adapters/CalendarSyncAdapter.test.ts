@@ -8,7 +8,7 @@
 // ContactsSyncAdapter.test.ts.
 import { WbxmlCodePage } from "../../src/codec/WbxmlCodePages.js";
 import { childText, element, findChild, textElement, type WbxmlElement } from "../../src/codec/WbxmlElement.js";
-import { CalendarSyncAdapter, localDayAndMonth } from "../../src/adapters/CalendarSyncAdapter.js";
+import { CalendarSyncAdapter, localDayAndMonth, MAX_CALENDAR_ATTENDEES } from "../../src/adapters/CalendarSyncAdapter.js";
 import { AttendeeResponseStatus, AttendeeRole, BusyStatus, RecipientType, RecurrenceFrequency } from "@rapidmx/restapi";
 
 const adapter = new CalendarSyncAdapter();
@@ -71,6 +71,13 @@ describe("CalendarSyncAdapter Tests", () => {
             });
         });
 
+        it("Omits an address-like OrganizerName without a mailbox, and refuses an OrganizerEmail that isn't one plain address.", () => {
+            const el = appData([cal("OrganizerEmail", "owner@example.com"), cal("OrganizerName", "payroll@corp.com")]);
+            expect(adapter.fromApplicationData(el).organizer?.displayName).toBeUndefined();
+            expect(() => adapter.fromApplicationData(appData([cal("OrganizerEmail", "a@x.com, b@y.com")]))).toThrow(/OrganizerEmail must be/);
+            expect(adapter.fromApplicationData(appData([cal("OrganizerEmail", "")])).organizer?.address).toBe("");
+        });
+
         it("Parses OrganizerEmail without OrganizerName.", () => {
             const el = appData([cal("OrganizerEmail", "owner@example.com")]);
             expect(adapter.fromApplicationData(el).organizer).toEqual({
@@ -129,6 +136,51 @@ describe("CalendarSyncAdapter Tests", () => {
                     element(WbxmlCodePage.Calendar, "Attendees", [element(WbxmlCodePage.Calendar, "Attendee", [])]),
                 ]);
                 expect(() => adapter.fromApplicationData(el)).toThrow(/missing its required email/i);
+            });
+
+            const attendeesOf = (...emails: string[]) =>
+                appData([element(WbxmlCodePage.Calendar, "Attendees", emails.map((email) => element(WbxmlCodePage.Calendar, "Attendee", [cal("Email", email)])))]);
+
+            it("Refuses an attendee Email that isn't one plain address, on an Add and on a Change.", () => {
+                for (const email of ["a@x.com, b@y.com", "a@x.com b@y.com", "Pat <pat@x.com>", "pat@x.com (boss@y.com)", "group: a@x.com;", "pat＠x.com", "nobody", "a@b@c.com"]) {
+                    expect(() => adapter.fromApplicationData(attendeesOf(email))).toThrow(/single plain email address/);
+                    expect(() => adapter.fromApplicationData(attendeesOf(email), baseEvent())).toThrow(/single plain email address/);
+                }
+            });
+
+            it("On a Change, checks only a changed attendee list, as restapi's REST update does.", () => {
+                const existing: any = {
+                    ...baseEvent(),
+                    attendees: [
+                        { address: "odd address@x.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION },
+                        { address: "b@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION },
+                    ],
+                };
+                // The same addresses re-sent (e.g. with a new status) still save.
+                expect(adapter.fromApplicationData(attendeesOf("odd address@x.com", "b@example.com"), existing).attendees).toHaveLength(2);
+                // Any change to the list checks every address.
+                expect(() => adapter.fromApplicationData(attendeesOf("odd address@x.com"), existing)).toThrow(/single plain email address/);
+            });
+
+            it("Accepts at most MAX_CALENDAR_ATTENDEES attendees, on an Add and on a Change.", () => {
+                const emails = (count: number) => Array.from({ length: count }, (_, i) => `a${i}@example.com`);
+                expect(adapter.fromApplicationData(attendeesOf(...emails(MAX_CALENDAR_ATTENDEES))).attendees).toHaveLength(MAX_CALENDAR_ATTENDEES);
+                expect(() => adapter.fromApplicationData(attendeesOf(...emails(MAX_CALENDAR_ATTENDEES + 1)))).toThrow(/at most 500 attendees/);
+                expect(() => adapter.fromApplicationData(attendeesOf(...emails(MAX_CALENDAR_ATTENDEES + 1)), baseEvent())).toThrow(/at most 500 attendees/);
+            });
+
+            it("Drops an attendee Name that looks like an address, including one kept from the existing attendee.", () => {
+                const el = appData([
+                    element(WbxmlCodePage.Calendar, "Attendees", [
+                        element(WbxmlCodePage.Calendar, "Attendee", [cal("Email", "a@example.com"), cal("Name", "ceo@corp.com")]),
+                        element(WbxmlCodePage.Calendar, "Attendee", [cal("Email", "b@example.com")]),
+                    ]),
+                ]);
+                const existing: any = {
+                    ...baseEvent(),
+                    attendees: [{ address: "b@example.com", displayName: "Line\nbreak", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION }],
+                };
+                expect(adapter.fromApplicationData(el, existing).attendees!.map((attendee) => attendee.displayName)).toEqual([undefined, undefined]);
             });
         });
 
@@ -208,8 +260,16 @@ describe("CalendarSyncAdapter Tests", () => {
         it("Keeps an OrganizerEmail that is one of the mailbox's own addresses on an Add.", () => {
             const partial = adapter.fromApplicationData(appData([cal("OrganizerEmail", "Alias@example.com")]), undefined, mailbox);
             expect(partial.organizer).toEqual({ address: "Alias@example.com", displayName: "Me", type: RecipientType.TO });
-            const named = adapter.fromApplicationData(appData([cal("OrganizerEmail", "me@example.com"), cal("OrganizerName", "Boss Me")]), undefined, mailbox);
-            expect(named.organizer?.displayName).toBe("Boss Me");
+            // The device's OrganizerName is never used: invitations would show it as the sender's name.
+            const named = adapter.fromApplicationData(appData([cal("OrganizerEmail", "me@example.com"), cal("OrganizerName", "payroll@corp.com")]), undefined, mailbox);
+            expect(named.organizer).toEqual({ address: "me@example.com", displayName: "Me", type: RecipientType.TO });
+        });
+
+        it("Omits the mailbox's own display name when it looks like an address or has a line break.", () => {
+            for (const displayName of ["me@example.com", "Me＠example", "=?utf-8?q?ceo=40corp.com?=", "Me\r\nBcc: x", "  "]) {
+                const partial = adapter.fromApplicationData(appData([cal("Subject", "x")]), undefined, { ...mailbox, displayName });
+                expect(partial.organizer).toEqual({ address: "me@example.com", displayName: undefined, type: RecipientType.TO });
+            }
         });
 
         it("Replaces a foreign or missing OrganizerEmail with the mailbox's primary address on an Add.", () => {

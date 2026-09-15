@@ -28,6 +28,9 @@ const ACL_CHECK_CHUNK_SIZE = 25;
  * device's own writes (`echoes`); a full page is reported as a change regardless. */
 const PENDING_CHANGE_SCAN_LIMIT = 5;
 
+/** Most per-folder fallback scans (`scanAfter`) `pendingInClass` runs at once. */
+const FALLBACK_SCAN_CHUNK_SIZE = 25;
+
 /** Folder uids per batched `EasCollectionState` lookup, and folders per batched pending-change check. */
 const STATE_LOOKUP_CHUNK = 500;
 
@@ -303,18 +306,19 @@ export class PingCommand implements EasCommandHandler {
             complete = live.length <= PENDING_BATCH_ROW_LIMIT && deleted.length <= PENDING_BATCH_ROW_LIMIT;
         }
 
-        const changed: string[] = [];
-        for (const state of states) {
-            let pending: boolean | undefined = isListableUid(state.folderUid) ? isPending(state, rows, complete) : undefined;
-            if (pending === undefined) {
-                const scanned = await scanAfter<any>(repo, { folderUid: state.folderUid }, cursorFor(state), PENDING_CHANGE_SCAN_LIMIT);
-                pending = isPending(state, scanned.rows, true) || scanned.more;
-            }
-            if (pending) {
-                changed.push(state.folderUid);
-            }
+        const decided: (boolean | undefined)[] = states.map((state) => (isListableUid(state.folderUid) ? isPending(state, rows, complete) : undefined));
+        // Undecided folders fall back to their own scan, `FALLBACK_SCAN_CHUNK_SIZE` at a time rather than one by one.
+        const undecided: number[] = decided.flatMap((pending, index) => (pending === undefined ? [index] : []));
+        for (let i = 0; i < undecided.length; i += FALLBACK_SCAN_CHUNK_SIZE) {
+            await Promise.all(
+                undecided.slice(i, i + FALLBACK_SCAN_CHUNK_SIZE).map(async (index) => {
+                    const state: EasCollectionState = states[index];
+                    const scanned = await scanAfter<any>(repo, { folderUid: state.folderUid }, cursorFor(state), PENDING_CHANGE_SCAN_LIMIT);
+                    decided[index] = isPending(state, scanned.rows, true) || scanned.more;
+                }),
+            );
         }
-        return changed;
+        return states.filter((_state, index) => decided[index]).map((state) => state.folderUid);
     }
 
     /** Returns the process-wide subscriber client for `url`, connecting it on first use. A failed connect is
