@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.4] - 2026-09-15
+
+### Changed
+- Upgraded restapi
+
+### Fixed
+- Fixed peer dep range for service-core
+
 ## [1.0.0-beta.3] - 2026-09-15
 
 ### Added
@@ -233,7 +241,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Removed unused files
 
-[Unreleased]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.3...HEAD
+[Unreleased]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.4...HEAD
+[1.0.0-beta.4]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.3...v1.0.0-beta.4
 [1.0.0-beta.3]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.2...v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.1...v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/RapidMX/activesync/compare/v1.0.0-beta.0...v1.0.0-beta.1
