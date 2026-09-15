@@ -24,14 +24,14 @@
     "peerDependencies": {
         "@rapidmx/restapi": "0.x",
         "@rapidrest/core": "5.x",
-        "@rapidrest/service-core": "^2.1.0"
+        "@rapidrest/service-core": "2.x"
     },
     "dependencies": {
         "mailparser": "^3.9.23",
         "nodemailer": "^10.0.1"
     },
     "devDependencies": {
-        "@rapidmx/restapi": "^0.9.0",
+        "@rapidmx/restapi": "^0.10.0",
         "@rapidrest/core": "^5.2.2",
         "@rapidrest/service-core": "^2.1.0",
         "@swc/core": "^1.16.2",

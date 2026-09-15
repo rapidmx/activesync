@@ -728,7 +728,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@rapidmx/activesync-plugin@workspace:."
   dependencies:
-    "@rapidmx/restapi": "npm:^0.9.0"
+    "@rapidmx/restapi": "npm:^0.10.0"
     "@rapidrest/core": "npm:^5.2.2"
     "@rapidrest/service-core": "npm:^2.1.0"
     "@swc/core": "npm:^1.16.2"
@@ -766,13 +766,13 @@ __metadata:
   peerDependencies:
     "@rapidmx/restapi": 0.x
     "@rapidrest/core": 5.x
-    "@rapidrest/service-core": ^2.1.0
+    "@rapidrest/service-core": 2.x
   languageName: unknown
   linkType: soft
 
-"@rapidmx/restapi@npm:^0.9.0":
-  version: 0.9.0
-  resolution: "@rapidmx/restapi@npm:0.9.0"
+"@rapidmx/restapi@npm:^0.10.0":
+  version: 0.10.0
+  resolution: "@rapidmx/restapi@npm:0.10.0"
   dependencies:
     "@peculiar/x509": "npm:^2.1.0"
     acme-client: "npm:^5.4.0"
@@ -781,13 +781,14 @@ __metadata:
     nodemailer: "npm:^10.0.1"
     pst-extractor: "npm:^1.12.0"
     sanitize-html: "npm:^2.17.7"
+    semver: "npm:^7.8.5"
   peerDependencies:
     "@aws-sdk/client-s3": 3.x
     "@aws-sdk/client-ses": 3.x
     "@aws-sdk/client-sesv2": 3.x
     "@opensearch-project/opensearch": ">=3.0.0"
     "@rapidrest/core": 5.x
-    "@rapidrest/service-core": 2.x
+    "@rapidrest/service-core": ^2.1.0
     mammoth: ">=1.8.0"
     pdf-parse: ">=1.1.1"
   peerDependenciesMeta:
@@ -803,7 +804,7 @@ __metadata:
       optional: true
     pdf-parse:
       optional: true
-  checksum: 10c0/0ff9735974e9e60c0b3a38c505967b377d323dcf65cdb732b1b124f4c4fff5ac02ec505472cb8f1923d1757b38e9c5791225edb95f0d0c042d19f028717362a5
+  checksum: 10c0/d19871ee146e1824047a6b5cccd8cd0e05257d09919853e41ecd180b279be7d3c0bf4c1889259badd7ab9a33efc7be49d4879210a4067a65c0437178ba6a59bf
   languageName: node
   linkType: hard
 
