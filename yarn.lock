@@ -730,7 +730,7 @@ __metadata:
   dependencies:
     "@rapidmx/restapi": "npm:^0.9.0"
     "@rapidrest/core": "npm:^5.2.2"
-    "@rapidrest/service-core": "npm:^2.0.0"
+    "@rapidrest/service-core": "npm:^2.1.0"
     "@swc/core": "npm:^1.16.2"
     "@types/mailparser": "npm:^3.4.6"
     "@types/nconf": "npm:^0.10.7"
@@ -766,7 +766,7 @@ __metadata:
   peerDependencies:
     "@rapidmx/restapi": 0.x
     "@rapidrest/core": 5.x
-    "@rapidrest/service-core": 2.x
+    "@rapidrest/service-core": ^2.1.0
   languageName: unknown
   linkType: soft
 
@@ -830,9 +830,9 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@rapidrest/service-core@npm:^2.0.0":
-  version: 2.0.0
-  resolution: "@rapidrest/service-core@npm:2.0.0"
+"@rapidrest/service-core@npm:^2.1.0":
+  version: 2.1.0
+  resolution: "@rapidrest/service-core@npm:2.1.0"
   dependencies:
     axios: "npm:^1.20.0"
     dayjs: "npm:^1.11.23"
@@ -862,7 +862,7 @@ __metadata:
       optional: true
     uWebSockets.js:
       optional: true
-  checksum: 10c0/5509e35e6ec4bceca2cde984cf485249bcb19324cd781c543b8bf0ee40cd4428603aaf96c6886adb91e7c0bec5d8d8c254e4ca39ed3a3ba911f6bb676bfa3989
+  checksum: 10c0/4b2a7615d41ff51ca67c17c9506b851a472ce6a51d4d6d04cd7b9c76a7aca38656082247049fd682307efc7bb533ded68be96ce6d9ad125af62b51ad8515d3fa
   languageName: node
   linkType: hard
 

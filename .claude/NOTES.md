@@ -49,6 +49,34 @@ Keep entries terse — this is a reference, not a transcript.
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
 
+### 2026-09-14 (6) — Migrated to `@rapidrest/service-core` 2.1.0
+
+Uncommitted, no version bump. `@rapidmx/restapi` stays at 0.9.0.
+
+- **Deps.** service-core devDependency `^2.0.0` -> `^2.1.0`, peerDependency `2.x` -> `^2.1.0`. The lockfile resolves a
+  single 2.1.0 copy, and restapi 0.9.0 doesn't nest its own.
+- **The full suite passed on 2.1.0 unchanged** (34 files / 778 tests). Checked each 2.1.0 breaking change against `src/`:
+  - `allowExistingACL`: every plugin `create()` uses a fresh uid (DeviceSyncState, collection state, chunks, Sync Add,
+    Sent Items copy). restapi 0.9.0's `findOrCreateWellKnownFolder` seeds `acl.uid = instance.uid` of a new instance,
+    so it doesn't hit `IDENTIFIER_EXISTS`. **No restapi 0.9.0 blocker found.**
+  - `$`/dotted update keys are checked at the top level only: `folderSyncKeys["$foldersync"]` (nested) still saves on
+    both backends.
+  - `$or`: `scanAfter` always builds two non-empty branches.
+  - Truncate cap: the plugin's only `truncate()` (chunks) passes `ignoreACL`, so it isn't capped.
+  - Optimistic locking: `asEntity` is now redundant against service-core 2.1.0, but harmless. It's kept as restapi's
+    copy.
+  - Dates are written as `Date` objects. The plugin reads no push payload fields and has no WebSocket routes or
+    `@RateLimit`.
+- **`ModelUtils.literal()`.** ItemOperations conversation Move (`conversationId`) and MeetingResponse (`icalUid`) now
+  query with `ModelUtils.literal(boundedValue)`. The in-memory exact match stays. Results are the same, except that a
+  parenthesised non-operator value (e.g. `Support(EU)`) is no longer rejected as an unknown operator. Unit tests now
+  expect the literal. Other operator strings (`in(...)` of `isListableUid` uids, `ne(storedUid)`, date cursors) were
+  left alone: they're built from stored values, not escapes.
+- **Pre-existing, not a gate:** `tsc -p tsconfig.test.json` has 17 errors (`newInstance()` returning
+  `T | Promise<T>`, and `MessageMovePlan.reason`). The count is the same before this change.
+- Checks: `yarn lint` and `npx tsc --noEmit -p .` are clean. The full run is 34 files / 778 tests, with coverage
+  100 / 97.66 / 100 / 100 (thresholds met).
+
 ### 2026-09-14 (5) — Round-5 review fixes (sender spoofing, Drafts forgery, query injection, version locks, Redis, chunks)
 
 All 14 findings re-checked against the code and fixed. Uncommitted, no version bump. Builds against

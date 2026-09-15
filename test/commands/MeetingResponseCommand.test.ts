@@ -9,7 +9,7 @@
 // test/routes/{mongo,sql}/EasRoute.test.ts.
 import { createHash } from "crypto";
 import config from "../config.js";
-import { ObjectFactory } from "@rapidrest/service-core";
+import { ModelUtils, ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { AttendeeResponseStatus, AttendeeRole, RecipientType } from "@rapidmx/restapi";
 import { MeetingResponseCommandMongo } from "../../src/commands/mongo/MeetingResponseCommandMongo.js";
@@ -263,7 +263,7 @@ describe("MeetingResponseCommand Tests (isolated)", () => {
         expect(statuses(response)).toEqual(["1", "2", "2", "2"]);
         expect(childText(findChildren(response!, "Result")[0], "CalendarId")).toBe("master");
         expect(calendarEventRepo.find).toHaveBeenCalledWith(
-            expect.objectContaining({ mailboxUid: "mbx-1", icalUid: "ical-1@example.com" }),
+            expect.objectContaining({ mailboxUid: "mbx-1", icalUid: ModelUtils.literal("ical-1@example.com") }),
             expect.objectContaining({ ignoreACL: true }),
         );
 
@@ -322,7 +322,7 @@ describe("MeetingResponseCommand Tests (isolated)", () => {
             const response = await command.handle(ctx(request(reply("3", "invite"))));
 
             expect(statuses(response)).toEqual(["2"]);
-            expect(calendarEventRepo.find.mock.calls[0][0].icalUid).toBe("ne(x)");
+            expect(calendarEventRepo.find.mock.calls[0][0].icalUid).toEqual(ModelUtils.literal("ne(x)"));
             expect(calendarEventRepo.update).not.toHaveBeenCalled();
             expect(calendarEventRepo.delete).not.toHaveBeenCalled();
         });
@@ -335,7 +335,7 @@ describe("MeetingResponseCommand Tests (isolated)", () => {
             const response = await command.handle(ctx(request(reply("1", "invite"))));
 
             expect(statuses(response)).toEqual(["1"]);
-            expect(calendarEventRepo.find.mock.calls[0][0].icalUid).toBe(key);
+            expect(calendarEventRepo.find.mock.calls[0][0].icalUid).toEqual(ModelUtils.literal(key));
             expect(childText(findChild(response!, "Result")!, "CalendarId")).toBe("stored");
         });
 

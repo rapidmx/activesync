@@ -8,7 +8,7 @@
 // clause. Every real Fetch behavior (message body, attachment content, 404/403/400 branches) is exercised via
 // real HTTP+DB requests in test/routes/{mongo,sql}/EasRoute.test.ts.
 import config from "../config.js";
-import { ObjectFactory } from "@rapidrest/service-core";
+import { ModelUtils, ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
 import { ItemOperationsCommandMongo } from "../../src/commands/mongo/ItemOperationsCommandMongo.js";
 import type { EasCommandContext } from "../../src/EasCommandHandler.js";
@@ -112,7 +112,7 @@ describe("ItemOperationsCommand Tests (guard clause only)", () => {
 
             expect(statusOf(await command.handle(ctx(moveTo("ne(conv)"))))).toBe("1");
             expect(messageRepo.update.mock.calls.map(([values]: any[]) => values.uid)).toEqual(["target"]);
-            expect(messageRepo.find.mock.calls[0][0].conversationId).toBe("ne(conv)");
+            expect(messageRepo.find.mock.calls[0][0].conversationId).toEqual(ModelUtils.literal("ne(conv)"));
         });
 
         it("Move looks an over-long ConversationId up by its bounded (hashed) value.", async () => {
@@ -121,7 +121,7 @@ describe("ItemOperationsCommand Tests (guard clause only)", () => {
             const { command, messageRepo } = build([{ uid: "m", version: 1, folderUid: "f1", mailboxUid: "mbx", conversationId: key }], new Set());
 
             expect(statusOf(await command.handle(ctx(moveTo(longId))))).toBe("1");
-            expect(messageRepo.find.mock.calls[0][0].conversationId).toBe(key);
+            expect(messageRepo.find.mock.calls[0][0].conversationId).toEqual(ModelUtils.literal(key));
         });
 
         it("Move refuses Outbox, and Drafts for messages that aren't drafts, cancelling the send of a message leaving Outbox.", async () => {

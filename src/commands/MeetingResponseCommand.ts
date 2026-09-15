@@ -5,7 +5,7 @@
 import * as crypto from "crypto";
 import { simpleParser } from "mailparser";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
-import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ModelUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
 import {
@@ -237,12 +237,13 @@ export abstract class MeetingResponseCommand implements EasCommandHandler {
         if (!icalUid) {
             return undefined;
         }
-        // The UID is sender-controlled: looked up bounded (restapi stores `icalUid` through `boundIndexedValue()`) and
-        // exact-matched in memory, as restapi's `ScanQueueJob.findCalendarEventRows()` does - a UID like `ne(x)` would
-        // otherwise be parsed as a query operator and select (and let a decline delete) a different meeting.
+        // The UID is sender-controlled: looked up bounded (restapi stores `icalUid` through `boundIndexedValue()`) as a
+        // `ModelUtils.literal()`, and exact-matched in memory as restapi's `ScanQueueJob.findCalendarEventRows()` does -
+        // a UID like `ne(x)` must never be parsed as a query operator and select (and let a decline delete) a different
+        // meeting.
         const key: string = boundIndexedValue(icalUid);
         const events: StoredEvent[] = (
-            await this.calendarEventRepo!.find({ mailboxUid: ctx.mailboxUid, icalUid: key, limit: 50 } as any, {
+            await this.calendarEventRepo!.find({ mailboxUid: ctx.mailboxUid, icalUid: ModelUtils.literal(key), limit: 50 } as any, {
                 ignoreACL: true,
                 limit: 50,
             })

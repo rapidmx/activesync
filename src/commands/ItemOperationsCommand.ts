@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { simpleParser } from "mailparser";
 import { ApiError, ObjectDecorators } from "@rapidrest/core";
-import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
+import { ACLAction, ACLUtils, ApiErrorMessages, ApiErrors, ModelUtils, ObjectFactory, RepoUtils } from "@rapidrest/service-core";
 import { BlobStore, RecoverableRepoUtils, type Attachment, type Folder, type FolderType, type Message } from "@rapidmx/restapi";
 import { WbxmlCodePage } from "../codec/WbxmlCodePages.js";
 import { childText, element, findChild, findChildren, opaqueElement, textElement, type WbxmlElement } from "../codec/WbxmlElement.js";
@@ -368,13 +368,13 @@ export abstract class ItemOperationsCommand implements EasCommandHandler {
         }
 
         // The ConversationId is the device's echo of `Message.conversationId`, which comes from sender-controlled
-        // `References`/`In-Reply-To` headers: looked up bounded (as restapi stores it) and exact-matched in memory, so a
-        // value shaped like a query operator (`ne(x)`) can never select other conversations' messages.
+        // `References`/`In-Reply-To` headers: looked up bounded (as restapi stores it) as a `ModelUtils.literal()`, so a
+        // value shaped like a query operator (`ne(x)`) is compared as itself, and still exact-matched in memory.
         const conversationId: string = boundIndexedValue(decodeConversationId(conversationIdEl.opaque));
         // Capped rather than an unbounded `find()` - an unusually long-running thread could otherwise return an
         // unbounded number of rows for one request.
         const messages: Message[] = (
-            await this.messageRepo!.find({ mailboxUid: ctx.mailboxUid, conversationId, limit: this.batchSize } as any, {
+            await this.messageRepo!.find({ mailboxUid: ctx.mailboxUid, conversationId: ModelUtils.literal(conversationId), limit: this.batchSize } as any, {
                 ignoreACL: true,
                 limit: this.batchSize,
             })
